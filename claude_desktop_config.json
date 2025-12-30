@@ -1,0 +1,16 @@
+{
+    "mcpServers": {
+        "incorta-upgrade-agent": {
+            "command": "python3",
+            "args": [
+                "/Users/anasahmed/WorkProjects/Upgrade_Agent/incorta-upgrade-agent/server.py"
+            ],
+            "env": {
+                "CMC_URL": "https://testcluster-1.cloudstaging.incortalabs.com/cmc",
+                "CMC_USER": "admin",
+                "CMC_PASSWORD": "cloud@staging",
+                "CMC_CLUSTER_NAME": "customCluster"
+            }
+        }
+    }
+}
