@@ -1,15 +1,23 @@
 {
     "mcpServers": {
-        "incorta-upgrade-agent": {
-            "command": "python3",
+        "Incorta-Upgrade-Assistant": {
+            "command": "/Users/habiba/Documents/Incorta-Upgrade-Agent/.venv/bin/python3",
             "args": [
-                "/Users/anasahmed/WorkProjects/Upgrade_Agent/incorta-upgrade-agent/server.py"
+                "/Users/habiba/Documents/Incorta-Upgrade-Agent/server.py"
             ],
             "env": {
-                "CMC_URL": "https://testcluster-1.cloudstaging.incortalabs.com/cmc",
-                "CMC_USER": "admin",
-                "CMC_PASSWORD": "cloud@staging",
-                "CMC_CLUSTER_NAME": "customCluster"
+                "CMC_URL": "your_cmc_url/cmc",
+                "CMC_USER": "your_cmc_username",
+                "CMC_PASSWORD": "your_cmc_password",
+                "CMC_CLUSTER_NAME": "your-cluster-name",
+                "QDRANT_URL": "https://2a5d5a1c-e40f-476e-9aeb-3c96bc8c5b22.us-east4-0.gcp.cloud.qdrant.io",
+                "QDRANT_API_KEY": "kZwQ5sN8kJHZKxFdjU-MzZnjqjPjMOTWQPGRFiAMTvMTQGgPZCPhjQ",
+                "INCORTA_ENV_URL": "https://my-incorta.cloud.incorta.com/incorta",
+                "INCORTA_TENANT": "incortaanalytics",
+                "INCORTA_USERNAME": "your_incorta_username",
+                "INCORTA_PASSWORD": "your_incorta_password",
+                "CLOUD_PORTAL_TOKEN": "your_cloud_portal_api_token",
+                "CLOUD_PORTAL_USER_ID": "your_cloud_portal_user_id"
             }
         }
     }

@@ -14,7 +14,19 @@ from langgraph.graph import StateGraph, END
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from clients.cmc_client import CMCClient
-from tools.validation_checks import check_service_status, check_memory_status, generate_report
+from tools.validation_checks import (
+    check_service_status,
+    check_memory_status,
+    check_cluster_configuration,
+    check_infrastructure_services,
+    check_node_topology,
+    check_connectors,
+    check_tenants,
+    check_email_configuration,
+    check_notebook_sqli_status,
+    check_database_migration,
+    generate_report
+)
 
 
 class ValidationState(TypedDict):
@@ -41,18 +53,43 @@ def validate_services(state: ValidationState) -> ValidationState:
     """Node 2: Run all validation checks"""
     if state.get("error"):
         return state
-    
+
     checks = {
+        # Core service checks (already implemented)
         "Service Status": check_service_status(state["cluster_data"]),
         "Memory Status": check_memory_status(state["cluster_data"]),
+
+        # NEW: Cluster configuration settings
+        "Cluster Configuration": check_cluster_configuration(state["cluster_data"]),
+
+        # NEW: Infrastructure services (Requirement D - partial, P)
+        "Infrastructure Services": check_infrastructure_services(state["cluster_data"]),
+
+        # NEW: Node topology (Requirement D - partial)
+        "Node Topology": check_node_topology(state["cluster_data"]),
+
+        # NEW: Connectors (Requirement F - partial)
+        "Connectors": check_connectors(state["cluster_data"]),
+
+        # NEW: Tenants configuration
+        "Tenants": check_tenants(state["cluster_data"]),
+
+        # NEW: Email/SMTP configuration
+        "Email Configuration": check_email_configuration(state["cluster_data"]),
+
+        # NEW: Notebook & SQLi status
+        "Notebook & SQLi": check_notebook_sqli_status(state["cluster_data"]),
+
+        # NEW: Database migration status (Requirement E - partial)
+        "Database Migration": check_database_migration(state["cluster_data"]),
     }
-    
-    # --- ############ more checks here in future ---
-    # checks["Disk Space"] = check_disk_space(state["cluster_data"])
-    # ......
-    # ....
- 
-    
+
+    # --- Future checks that require additional API endpoints ---
+    # checks["Data Source Connectivity"] = check_datasources(state["cluster_data"])  # Req K
+    # checks["Top Workloads"] = check_top_workloads(state["cluster_data"])  # Req M
+    # checks["Scheduled Jobs"] = check_scheduled_jobs(state["cluster_data"])  # Req O
+    # checks["Inspector Tool"] = check_inspector_results(state["cluster_data"])  # Req R
+
     return {**state, "checks": checks}
 
 
