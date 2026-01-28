@@ -13,4 +13,5 @@ cloud_portal_*.json
 # SSH keys
 *.pem
 
-
+# Logs
+logs/
