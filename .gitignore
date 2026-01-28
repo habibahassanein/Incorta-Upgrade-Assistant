@@ -10,4 +10,7 @@ cluster_data_full.json
 # Cloud Portal API data files (may contain sensitive info)
 cloud_portal_*.json
 
+# SSH keys
+*.pem
+
 
