@@ -28,7 +28,7 @@ app = FastMCP("incorta-upgrade-agent", stateless_http=True)
 
 
 @app.tool()
-def run_pre_upgrade_validation(cluster_name: str) -> str:
+def run_pre_upgrade_validation(cluster_name: str | None = None) -> str:
     """
     [STEP 1 - ALWAYS RUN FIRST] Validates Incorta cluster health before upgrade.
     Performs comprehensive pre-upgrade health checks including: service status (Analytics, Loader),
@@ -43,14 +43,18 @@ def run_pre_upgrade_validation(cluster_name: str) -> str:
     Use blockers to determine upgrade risk level (HIGH/MEDIUM/LOW).
 
     Args:
-        cluster_name: CMC cluster name (e.g., 'customCluster'). Use CMC name, not Cloud Portal name.
+        cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
     """
+    if cluster_name is None:
+        cluster_name = os.getenv("CMC_CLUSTER_NAME")
+        if not cluster_name:
+            return "Error: No cluster_name provided and CMC_CLUSTER_NAME env var not set"
     return run_validation(cluster_name)
 
 
 @app.tool()
 def extract_cluster_metadata_tool(
-    cluster_name: str,
+    cluster_name: str | None = None,
     format: Literal["json", "markdown", "both"] = "both"
 ) -> str:
     """
@@ -71,9 +75,13 @@ def extract_cluster_metadata_tool(
     - Risk Assessment: AUTO-CLASSIFY as HIGH/MEDIUM/LOW risk based on blockers
 
     Args:
-        cluster_name: CMC cluster name (e.g., 'customCluster').
+        cluster_name: CMC cluster name. Defaults to CMC_CLUSTER_NAME env var.
         format: Output format - 'json', 'markdown', or 'both' (default).
     """
+    if cluster_name is None:
+        cluster_name = os.getenv("CMC_CLUSTER_NAME")
+        if not cluster_name:
+            return "Error: No cluster_name provided and CMC_CLUSTER_NAME env var not set"
     from clients.cmc_client import CMCClient
     client = CMCClient()
     cluster_data = client.get_cluster(cluster_name)
@@ -209,7 +217,7 @@ def query_upgrade_issues(spark_sql: str) -> str:
 
 @app.tool()
 def get_cloud_metadata(
-    cluster_name: str,
+    cluster_name: str | None = None,
     include_consumption: bool = True,
     include_users: bool = True
 ) -> str:
@@ -228,10 +236,14 @@ def get_cloud_metadata(
     - Upgrade History: Last upgrade timestamp, upgrade patterns
 
     Args:
-        cluster_name: Cloud Portal cluster name (e.g., 'habibascluster').
+        cluster_name: Cloud Portal cluster name. Defaults to CLOUD_PORTAL_CLUSTER_NAME env var.
         include_consumption: Include consumption/cost data (default: True)
         include_users: Include authorized users (default: True)
     """
+    if cluster_name is None:
+        cluster_name = os.getenv("CLOUD_PORTAL_CLUSTER_NAME")
+        if not cluster_name:
+            return "Error: No cluster_name provided and CLOUD_PORTAL_CLUSTER_NAME env var not set"
     user_id = os.getenv("CLOUD_PORTAL_USER_ID")
     if not user_id:
         return "Error: CLOUD_PORTAL_USER_ID environment variable not set"

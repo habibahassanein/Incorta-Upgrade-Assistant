@@ -1,15 +1,18 @@
 {
     "mcpServers": {
         "Incorta-Upgrade-Assistant": {
-            "command": "/Users/habiba/Documents/Incorta-Upgrade-Agent/.venv/bin/python3",
+            "command": "npx",
             "args": [
-                "/Users/habiba/Documents/Incorta-Upgrade-Agent/server.py"
+                "-y",
+                "mcp-remote",
+                "http://localhost:8000/mcp/"
             ],
             "env": {
                 "CMC_URL": "your_cmc_url/cmc",
                 "CMC_USER": "your_cmc_username",
                 "CMC_PASSWORD": "your_cmc_password",
-                "CMC_CLUSTER_NAME": "your-cluster-name",
+                "CMC_CLUSTER_NAME": "customCluster",
+                "CLOUD_PORTAL_CLUSTER_NAME": "habibascluster",
                 "QDRANT_URL": "https://2a5d5a1c-e40f-476e-9aeb-3c96bc8c5b22.us-east4-0.gcp.cloud.qdrant.io",
                 "QDRANT_API_KEY": "kZwQ5sN8kJHZKxFdjU-MzZnjqjPjMOTWQPGRFiAMTvMTQGgPZCPhjQ",
                 "INCORTA_ENV_URL": "https://my-incorta.cloud.incorta.com/incorta",
@@ -22,3 +25,6 @@
         }
     }
 }
+
+
+  
