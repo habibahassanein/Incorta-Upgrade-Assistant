@@ -15,3 +15,6 @@ cloud_portal_*.json
 
 # Logs
 logs/
+
+# Cloud Portal cached OAuth token
+.incorta_cloud_token.json

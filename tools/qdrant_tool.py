@@ -64,7 +64,7 @@ def search_knowledge_base(arguments: Dict[str, Any]) -> dict:
 
     # Search Qdrant
     search_result = qdrant_client.search(
-        collection_name="docs",
+        collection_name="docs2",
         query_vector=("content_vector", query_vector),
         limit=limit,
         with_payload=True

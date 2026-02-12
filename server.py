@@ -244,11 +244,13 @@ def get_cloud_metadata(
         cluster_name = os.getenv("CLOUD_PORTAL_CLUSTER_NAME")
         if not cluster_name:
             return "Error: No cluster_name provided and CLOUD_PORTAL_CLUSTER_NAME env var not set"
-    user_id = os.getenv("CLOUD_PORTAL_USER_ID")
-    if not user_id:
-        return "Error: CLOUD_PORTAL_USER_ID environment variable not set"
-
     cloud_client = CloudPortalClient()
+
+    try:
+        user_id = cloud_client.get_user_id()
+    except RuntimeError as e:
+        return f"Error: {str(e)}"
+
     clusters_info = cloud_client.get_clusters_info(user_id)
 
     our_cluster = None
@@ -373,4 +375,8 @@ def get_cloud_metadata(
 
 
 if __name__ == "__main__":
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    port = int(os.getenv("MCP_PORT", "8000"))
+    app.settings.host = host
+    app.settings.port = port
     app.run(transport="streamable-http")
