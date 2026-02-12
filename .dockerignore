@@ -1,0 +1,14 @@
+.env
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+tests
+*.pem
+.incorta_cloud_token.json
+.python-version
+.claude
+cluster_data_full.json
+cloud_portal_*.json
