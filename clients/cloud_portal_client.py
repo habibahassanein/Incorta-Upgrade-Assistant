@@ -33,7 +33,7 @@ AUTH0_SCOPES = (
 )
 CALLBACK_PORT = int(os.getenv("AUTH0_CALLBACK_PORT", "8910"))
 CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
-TOKEN_CACHE_PATH = Path.home() / ".incorta_cloud_token.json"
+TOKEN_CACHE_PATH = Path(os.getenv("TOKEN_CACHE_PATH", str(Path.home() / ".incorta_cloud_token.json")))
 
 
 class CloudPortalClient:
@@ -41,6 +41,7 @@ class CloudPortalClient:
         self.base_url = f"{CLOUD_PORTAL_URL}/api/v2"
         self.bearer_token = bearer_token or os.getenv("CLOUD_PORTAL_TOKEN")
         self.user_id = os.getenv("CLOUD_PORTAL_USER_ID")
+        self.refresh_token = None
 
         # If no static token provided, try loading from cache
         if not self.bearer_token:
@@ -56,17 +57,21 @@ class CloudPortalClient:
             return
         try:
             data = json.loads(TOKEN_CACHE_PATH.read_text())
+            # Always load refresh token (it has a longer lifetime than access token)
+            self.refresh_token = data.get("refresh_token")
+            if not self.user_id:
+                self.user_id = data.get("user_id")
             token = data.get("access_token")
             if token and not self._is_token_expired(token):
                 self.bearer_token = token
-                if not self.user_id:
-                    self.user_id = data.get("user_id")
         except (json.JSONDecodeError, KeyError):
             pass
 
-    def _save_token(self, token):
+    def _save_token(self, token, refresh_token=None):
         """Cache token to local file and extract user_id from JWT claims."""
         try:
+            # Signature verification skipped: token obtained from Auth0 over HTTPS.
+            # We only read claims (user_id, exp), not verify authenticity.
             claims = jwt.decode(token, options={"verify_signature": False})
             user_id = claims.get("https://namespace/uuid")
             exp = claims.get("exp")
@@ -78,6 +83,7 @@ class CloudPortalClient:
 
         cache_data = {
             "access_token": token,
+            "refresh_token": refresh_token,
             "user_id": user_id,
             "exp": exp,
             "cached_at": int(time.time()),
@@ -88,6 +94,7 @@ class CloudPortalClient:
     def _is_token_expired(token):
         """Check if a JWT token is expired (with 5-minute buffer)."""
         try:
+            # Signature verification skipped: only reading exp claim for expiry check.
             claims = jwt.decode(token, options={"verify_signature": False})
             exp = claims.get("exp")
             if exp is None:
@@ -95,6 +102,164 @@ class CloudPortalClient:
             return time.time() > (exp - 300)  # 5-min buffer
         except jwt.DecodeError:
             return True
+
+    # ------------------------------------------------------------------
+    # Headless environment detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_headless():
+        """Detect if running in a headless environment (Docker, CI, SSH without display)."""
+        if os.getenv("HEADLESS", "").lower() in ("1", "true", "yes"):
+            return True
+        if os.path.exists("/.dockerenv"):
+            return True
+        if os.name == "posix" and not os.getenv("DISPLAY") and not os.getenv("WAYLAND_DISPLAY"):
+            import platform
+            if platform.system() == "Linux":
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Token refresh (headless-compatible)
+    # ------------------------------------------------------------------
+
+    def _refresh_access_token(self):
+        """Use refresh token to get a new access token without browser login.
+
+        Returns True on success, False on failure.
+        """
+        refresh_token = self.refresh_token or os.getenv("CLOUD_PORTAL_REFRESH_TOKEN")
+        if not refresh_token:
+            return False
+
+        try:
+            response = requests.post(
+                f"https://{AUTH0_DOMAIN}/oauth/token",
+                json={
+                    "grant_type": "refresh_token",
+                    "client_id": AUTH0_CLIENT_ID,
+                    "refresh_token": refresh_token,
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+
+            if response.status_code != 200:
+                return False
+
+            data = response.json()
+            new_access_token = data.get("access_token")
+            # Auth0 may rotate the refresh token
+            new_refresh_token = data.get("refresh_token", refresh_token)
+
+            if not new_access_token:
+                return False
+
+            self.bearer_token = new_access_token
+            self.refresh_token = new_refresh_token
+            self._save_token(new_access_token, new_refresh_token)
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Device Code Flow (headless-compatible, multi-user)
+    # ------------------------------------------------------------------
+
+    def device_login(self):
+        """Start Device Authorization Flow — no browser on server needed.
+
+        Requests a device code from Auth0 and returns login instructions.
+        The caller should display the URL + code to the user, then call
+        poll_device_login() to wait for completion.
+
+        Returns:
+            dict: Contains device_code, user_code, verification_uri,
+                  expires_in, and interval for polling.
+
+        Raises:
+            RuntimeError: If the device code request fails (e.g., grant type not enabled).
+        """
+        response = requests.post(
+            f"https://{AUTH0_DOMAIN}/oauth/device/code",
+            json={
+                "client_id": AUTH0_CLIENT_ID,
+                "scope": AUTH0_SCOPES,
+                "audience": AUTH0_AUDIENCE,
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Device code request failed (HTTP {response.status_code}): {response.text}\n"
+                "Ensure the Auth0 client has the 'Device Code' grant type enabled."
+            )
+
+        data = response.json()
+        return {
+            "device_code": data["device_code"],
+            "user_code": data["user_code"],
+            "verification_uri": data.get("verification_uri_complete") or data["verification_uri"],
+            "expires_in": data.get("expires_in", 900),
+            "interval": data.get("interval", 5),
+        }
+
+    def poll_device_login(self, device_code, interval=5, expires_in=900):
+        """Poll Auth0 until the user completes device login.
+
+        Blocks until the user finishes authentication or the code expires.
+
+        Args:
+            device_code: The device_code from device_login().
+            interval: Seconds between poll attempts.
+            expires_in: Maximum time to wait in seconds.
+
+        Returns:
+            str: The bearer token.
+
+        Raises:
+            RuntimeError: If login fails, is denied, or times out.
+        """
+        deadline = time.time() + expires_in
+
+        while time.time() < deadline:
+            time.sleep(interval)
+            response = requests.post(
+                f"https://{AUTH0_DOMAIN}/oauth/token",
+                json={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "device_code": device_code,
+                    "client_id": AUTH0_CLIENT_ID,
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                self.bearer_token = data.get("access_token")
+                self.refresh_token = data.get("refresh_token")
+                if self.bearer_token:
+                    self._save_token(self.bearer_token, self.refresh_token)
+                    return self.bearer_token
+                raise RuntimeError("No access_token in Auth0 token response")
+
+            error = response.json().get("error", "")
+            if error == "authorization_pending":
+                continue
+            elif error == "slow_down":
+                interval += 5
+                continue
+            elif error == "expired_token":
+                raise RuntimeError("Device code expired. Please try logging in again.")
+            elif error == "access_denied":
+                raise RuntimeError("Login was denied by the user.")
+            else:
+                raise RuntimeError(f"Unexpected error during device login: {error}")
+
+        raise RuntimeError("Login timed out. Please try again.")
 
     # ------------------------------------------------------------------
     # OAuth browser login with automatic callback capture
@@ -108,12 +273,21 @@ class CloudPortalClient:
         server which captures the authorization code and exchanges it for
         an access token. Fully automatic — no manual copy/paste needed.
 
+        In headless environments (Docker, CI), raises RuntimeError with
+        instructions to use environment variables instead.
+
         Returns:
             str: The bearer token
 
         Raises:
-            RuntimeError: If login fails or times out
+            RuntimeError: If login fails, times out, or running in headless mode
         """
+        if self._is_headless():
+            raise RuntimeError(
+                "AUTHENTICATION_REQUIRED: No valid token available.\n"
+                "Please call the 'cloud_portal_login' tool first to authenticate."
+            )
+
         state = secrets.token_urlsafe(32)
         redirect_uri = f"http://localhost:{CALLBACK_PORT}/callback"
         auth_code = None
@@ -216,14 +390,16 @@ class CloudPortalClient:
 
         data = token_response.json()
         self.bearer_token = data.get("access_token")
+        self.refresh_token = data.get("refresh_token")
 
         if not self.bearer_token:
             raise RuntimeError("No access_token in Auth0 token response")
 
-        self._save_token(self.bearer_token)
+        self._save_token(self.bearer_token, self.refresh_token)
 
         # Show confirmation with expiry info
         try:
+            # Signature verification skipped: token just obtained from Auth0 token endpoint.
             claims = jwt.decode(self.bearer_token, options={"verify_signature": False})
             exp = claims.get("exp")
             if exp:
@@ -241,7 +417,8 @@ class CloudPortalClient:
 
     def _headers(self):
         if not self.bearer_token or self._is_token_expired(self.bearer_token):
-            self.login()
+            if not self._refresh_access_token():
+                self.login()
         return {
             'Authorization': f'Bearer {self.bearer_token}',
             'Accept': 'application/json'
@@ -263,15 +440,17 @@ class CloudPortalClient:
         if self.user_id:
             return self.user_id
 
-        # Trigger login which extracts user_id from JWT
+        # Try refreshing token first (works in headless environments)
         if not self.bearer_token or self._is_token_expired(self.bearer_token):
-            self.login()
+            if not self._refresh_access_token():
+                self.login()
             if self.user_id:
                 return self.user_id
 
         # Try decoding existing token
         if self.bearer_token:
             try:
+                # Signature verification skipped: only reading user_id claim.
                 claims = jwt.decode(
                     self.bearer_token, options={"verify_signature": False}
                 )
@@ -298,33 +477,55 @@ class CloudPortalClient:
         return r.json()
 
     def get_consumption(self, user_id, instance_uuid):
-        """Get consumption data for an instance"""
+        """Get consumption data for an instance.
+
+        Args:
+            user_id: User UUID from JWT claims.
+            instance_uuid: Instance UUID (NOT name). Use find_cluster_uuid() to resolve.
+        """
         url = f"{self.base_url}/users/{user_id}/instances/{instance_uuid}/consumption"
         r = requests.get(url, headers=self._headers(), timeout=30)
         r.raise_for_status()
         return r.json()
 
     def get_authorized_users(self, user_id, cluster_name):
-        """Get authorized users for a cluster"""
+        """Get authorized users for a cluster.
+
+        Args:
+            user_id: User UUID from JWT claims.
+            cluster_name: Instance name (NOT UUID) as shown in Cloud Portal.
+        """
         url = f"{self.base_url}/users/{user_id}/instances/{cluster_name}/autherizedusers"
         r = requests.get(url, headers=self._headers(), timeout=30)
         r.raise_for_status()
         return r.json()
 
     def get_instance_details(self, user_id, cluster_name):
-        """Get detailed instance information"""
+        """Get detailed instance information.
+
+        Args:
+            user_id: User UUID from JWT claims.
+            cluster_name: Instance name (NOT UUID) as shown in Cloud Portal.
+        """
         url = f"{self.base_url}/users/{user_id}/instances/{cluster_name}"
         r = requests.get(url, headers=self._headers(), timeout=30)
         r.raise_for_status()
         return r.json()
 
-    def find_cluster_uuid(self, user_id, cluster_name):
-        """Helper: Find UUID for a cluster by name"""
-        clusters_info = self.get_clusters_info(user_id)
+    def find_cluster(self, user_id, cluster_name):
+        """Find a cluster's full instance dict by name.
 
+        Returns:
+            dict or None: The full instance dict, or None if not found.
+        """
+        clusters_info = self.get_clusters_info(user_id)
         for item in clusters_info.get("instances", []):
             instance = item.get("instance", {})
             if instance.get("name") == cluster_name:
-                return instance.get("id")
-
+                return instance
         return None
+
+    def find_cluster_uuid(self, user_id, cluster_name):
+        """Helper: Find UUID for a cluster by name."""
+        instance = self.find_cluster(user_id, cluster_name)
+        return instance.get("id") if instance else None

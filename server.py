@@ -4,6 +4,8 @@ import os
 import sys
 from typing import Literal
 
+import requests
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
@@ -17,6 +19,7 @@ from tools.qdrant_tool import search_knowledge_base
 from tools.incorta_tools import query_zendesk, query_jira, get_zendesk_schema, get_jira_schema
 from tools.extract_cluster_metadata import extract_cluster_metadata, format_metadata_report
 from clients.cloud_portal_client import CloudPortalClient
+from workflows.checklist_workflow import run_collect_checklist_data, run_write_checklist_excel
 
 
 app = FastMCP("incorta-upgrade-agent", stateless_http=True)
@@ -216,6 +219,137 @@ def query_upgrade_issues(spark_sql: str) -> str:
 
 
 @app.tool()
+def collect_checklist_data(
+    cmc_cluster_name: str | None = None,
+    cloud_cluster_name: str | None = None,
+    from_version: str = "",
+    to_version: str = "",
+) -> str:
+    """
+    [CHECKLIST PHASE 1 - COLLECT] Collect data for the Pre-Upgrade Checklist.
+    Returns a preview table of all detected values for user review BEFORE writing to Excel.
+
+    HOW TO USE:
+    1. Call this tool with cluster names and version info
+    2. Present the returned preview table to the user
+    3. Ask the user to review and confirm or modify values
+    4. After approval, call write_checklist_excel with the JSON data
+
+    The tool collects data from CMC API, Cloud Portal API, and knowledge base.
+    Items that cannot be auto-detected show as "Not Implemented" or "N/A".
+
+    Args:
+        cmc_cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
+        cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). Defaults to CLOUD_PORTAL_CLUSTER_NAME env var.
+        from_version: Current Incorta version (e.g., '2024.1.0').
+        to_version: Target Incorta version (e.g., '2024.7.0').
+    """
+    cmc_cluster_name = cmc_cluster_name or os.getenv("CMC_CLUSTER_NAME", "")
+    cloud_cluster_name = cloud_cluster_name or os.getenv("CLOUD_PORTAL_CLUSTER_NAME", "")
+
+    if not cmc_cluster_name:
+        return "Error: No CMC cluster name provided. Set CMC_CLUSTER_NAME env var or pass cmc_cluster_name."
+    if not from_version or not to_version:
+        return "Error: Both from_version and to_version are required."
+
+    return run_collect_checklist_data(
+        cmc_cluster_name=cmc_cluster_name,
+        cloud_cluster_name=cloud_cluster_name,
+        from_version=from_version,
+        to_version=to_version,
+    )
+
+
+@app.tool()
+def write_checklist_excel(
+    cell_values_json: str,
+    template_path: str,
+    output_path: str | None = None,
+) -> str:
+    """
+    [CHECKLIST PHASE 2 - WRITE] Write approved checklist values into an Excel template.
+    Call this AFTER collect_checklist_data and user approval.
+
+    Takes the JSON data from collect_checklist_data (potentially modified by the user),
+    copies the Excel template, fills the 'Pre-Upgrade Checklist' sheet, and saves.
+    All other sheets in the workbook are left untouched.
+
+    Args:
+        cell_values_json: JSON string of cell values from collect_checklist_data (the <checklist_data> block).
+        template_path: Path to the Pre-Upgrade Checklist Excel template file.
+        output_path: Path for the filled output file. Defaults to template path with '_filled' suffix.
+    """
+    if not template_path:
+        return "Error: template_path is required."
+    if not os.path.exists(template_path):
+        return f"Error: Template file not found at '{template_path}'"
+
+    if not output_path:
+        base, ext = os.path.splitext(template_path)
+        output_path = f"{base}_filled{ext}"
+
+    try:
+        return run_write_checklist_excel(
+            cell_values_json=cell_values_json,
+            template_path=template_path,
+            output_path=output_path,
+        )
+    except Exception as e:
+        return f"Error writing Excel: {str(e)}"
+
+
+@app.tool()
+def cloud_portal_login() -> str:
+    """
+    [AUTHENTICATION] Log in to Cloud Portal for cloud metadata access.
+    Call this BEFORE get_cloud_metadata if you get an authentication error.
+
+    HOW IT WORKS:
+    1. This tool returns a URL and a code
+    2. Open the URL in your browser
+    3. Enter the code and complete login (including MFA)
+    4. The tool automatically detects when login is complete
+
+    After login, your token is cached and auto-refreshes.
+    You only need to log in once per session (tokens last days/weeks).
+    """
+    cloud_client = CloudPortalClient()
+
+    try:
+        device_info = cloud_client.device_login()
+    except RuntimeError as e:
+        return f"Error: {str(e)}"
+
+    user_code = device_info["user_code"]
+    verification_uri = device_info["verification_uri"]
+    device_code = device_info["device_code"]
+    interval = device_info["interval"]
+    expires_in = device_info["expires_in"]
+
+    instructions = (
+        f"## Cloud Portal Login\n\n"
+        f"**Open this URL in your browser:**\n"
+        f"{verification_uri}\n\n"
+        f"**Enter this code when prompted:**\n"
+        f"### `{user_code}`\n\n"
+        f"Waiting for you to complete login (up to {expires_in // 60} minutes)...\n"
+    )
+
+    try:
+        cloud_client.poll_device_login(device_code, interval, expires_in)
+        user_id = cloud_client.get_user_id()
+        return (
+            f"{instructions}\n"
+            f"Login successful! You are now authenticated.\n"
+            f"- **User ID:** `{user_id}`\n"
+            f"- Token cached and will auto-refresh.\n"
+            f"\nYou can now use `get_cloud_metadata` to query your clusters."
+        )
+    except RuntimeError as e:
+        return f"{instructions}\nLogin failed: {str(e)}"
+
+
+@app.tool()
 def get_cloud_metadata(
     cluster_name: str | None = None,
     include_consumption: bool = True,
@@ -227,6 +361,11 @@ def get_cloud_metadata(
 
     CLUSTER NAMING: This tool uses the Cloud Portal API and requires the Cloud Portal cluster name.
     Example: If Cloud Portal UI shows 'habibascluster', use that name (NOT the CMC name).
+
+    NOTE: Cloud Portal and CMC use different cluster names for the same cluster.
+    - CMC name (e.g., 'customCluster') is used by extract_cluster_metadata_tool
+    - Cloud Portal name (e.g., 'habibascluster') is used by this tool
+    The AI agent should use both tools together and correlate results by context.
 
     NEW DATA AVAILABLE:
     - Consumption & Cost: Daily/monthly power units, usage trends
@@ -249,16 +388,19 @@ def get_cloud_metadata(
     try:
         user_id = cloud_client.get_user_id()
     except RuntimeError as e:
-        return f"Error: {str(e)}"
+        error_msg = str(e)
+        if "AUTHENTICATION_REQUIRED" in error_msg:
+            return (
+                "Error: Not authenticated with Cloud Portal.\n"
+                "Please call the **cloud_portal_login** tool first to log in.\n"
+                "After logging in, retry this tool."
+            )
+        return f"Error: {error_msg}"
 
-    clusters_info = cloud_client.get_clusters_info(user_id)
-
-    our_cluster = None
-    for item in clusters_info.get("instances", []):
-        instance = item.get("instance", {})
-        if instance.get("name") == cluster_name:
-            our_cluster = instance
-            break
+    try:
+        our_cluster = cloud_client.find_cluster(user_id, cluster_name)
+    except (requests.exceptions.HTTPError, RuntimeError) as e:
+        return f"Error: Failed to fetch clusters from Cloud Portal: {str(e)}"
 
     if not our_cluster:
         return f"Error: Cluster '{cluster_name}' not found in Cloud Portal"
@@ -284,15 +426,17 @@ def get_cloud_metadata(
     if include_consumption:
         try:
             consumption = cloud_client.get_consumption(user_id, instance_uuid)
-            total_pu = consumption.get('consumptionAgg', {}).get('totalAgg', 0)
-            daily_data = consumption.get('consumptionAgg', {}).get('total', {}).get('daily', [])
+            consumption_agg = consumption.get('consumptionAgg', {})
+            total_pu = consumption_agg.get('totalAgg', 0)
+            daily_data = consumption_agg.get('total', {}).get('daily', [])
+
+            report_lines.append("## Consumption & Cost")
 
             if daily_data:
                 avg_pu = sum(d.get('powerUnit', 0) for d in daily_data) / len(daily_data)
                 recent_7 = daily_data[-7:] if len(daily_data) >= 7 else daily_data
 
                 report_lines.extend([
-                    "## Consumption & Cost",
                     f"- **Total (This Month):** {total_pu:.6f} Power Units",
                     f"- **Daily Average:** {avg_pu:.6f} PU/day",
                     f"- **Estimated Downtime Cost (4h):** {(avg_pu / 24 * 4):.6f} PU",
@@ -304,8 +448,15 @@ def get_cloud_metadata(
                     date = day.get('startTime', 'Unknown')
                     pu = day.get('powerUnit', 0)
                     report_lines.append(f"  - {date}: {pu:.6f} PU")
+            elif total_pu:
+                report_lines.extend([
+                    f"- **Total (This Month):** {total_pu:.6f} Power Units",
+                    "- *Daily breakdown not available*",
+                ])
+            else:
+                report_lines.append("- No consumption data available for this period.")
 
-                report_lines.append("")
+            report_lines.append("")
 
         except Exception as e:
             report_lines.extend([
