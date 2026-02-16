@@ -309,7 +309,6 @@ def write_checklist_excel(
 def generate_upgrade_readiness_report(
     to_version: str,
     cmc_cluster_name: str | None = None,
-    from_version: str = "",
     cloud_cluster_name: str | None = None,
 ) -> str:
     """
@@ -334,7 +333,6 @@ def generate_upgrade_readiness_report(
     Args:
         to_version: Target Incorta version (e.g., '2024.7.0'). Required.
         cmc_cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
-        from_version: Current Incorta version (e.g., '2024.1.0'). Auto-detected from cluster if empty.
         cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). Auto-inferred from CMC_URL if not provided.
     """
     # Resolve CMC cluster name
@@ -351,7 +349,6 @@ def generate_upgrade_readiness_report(
         return run_readiness_report(
             cmc_cluster_name=cmc_cluster_name,
             to_version=to_version,
-            from_version=from_version,
             cloud_cluster_name=cloud_cluster_name or "",
         )
     except Exception as e:
