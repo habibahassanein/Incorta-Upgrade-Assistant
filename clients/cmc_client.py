@@ -38,9 +38,14 @@ class CMCClient:
         )
         
         if r.status_code not in (200, 201):
-            raise RuntimeError(f"CMC login failed: {r.status_code}")
-        
-        self.token = r.json().get("token")
+            raise RuntimeError(
+                f"CMC login failed (HTTP {r.status_code}). "
+                f"Check CMC_URL, CMC_USER, and CMC_PASSWORD. "
+                f"Response: {r.text[:200]!r}"
+            )
+
+        data = self._parse_json_response(r, "CMC login")
+        self.token = data.get("token")
         if not self.token:
             raise RuntimeError("No token in response")
         
@@ -53,7 +58,29 @@ class CMCClient:
             "Accept": "application/json",
             "Authorization": f"bearer {self.token}",
         }
-    
+
+    def _parse_json_response(self, response, context="CMC API"):
+        """Parse JSON response with clear error messages for common failure modes."""
+        body = response.text.strip()
+        if not body:
+            raise RuntimeError(
+                f"{context} returned an empty response (HTTP {response.status_code}). "
+                f"Check that CMC_URL '{self.url}' is correct and the CMC service is running."
+            )
+        if body.startswith("<!") or body.startswith("<html") or body.startswith("<HTML"):
+            raise RuntimeError(
+                f"{context} returned HTML instead of JSON (HTTP {response.status_code}). "
+                f"This usually means the CMC session expired or the URL is redirecting to a login page. "
+                f"Check CMC_URL, CMC_USER, and CMC_PASSWORD."
+            )
+        try:
+            return response.json()
+        except ValueError as e:
+            raise RuntimeError(
+                f"{context} returned invalid JSON (HTTP {response.status_code}): {e}. "
+                f"Response preview: {body[:200]!r}"
+            )
+
     def get_cluster(self, cluster_name):
         # get full cluster details
         r = requests.get(
@@ -63,7 +90,7 @@ class CMCClient:
             timeout=60,
         )
         r.raise_for_status()
-        return r.json()
+        return self._parse_json_response(r, f"CMC get_cluster '{cluster_name}'")
     
     def get_clusters_brief(self):
         # list all clusters
@@ -74,4 +101,4 @@ class CMCClient:
             timeout=60,
         )
         r.raise_for_status()
-        return r.json()
+        return self._parse_json_response(r, "CMC get_clusters_brief")
