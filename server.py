@@ -18,8 +18,9 @@ from workflows.upgrade_research import research_upgrade_path
 from tools.qdrant_tool import search_knowledge_base
 from tools.incorta_tools import query_zendesk, query_jira, get_zendesk_schema, get_jira_schema
 from tools.extract_cluster_metadata import extract_cluster_metadata, format_metadata_report
-from clients.cloud_portal_client import CloudPortalClient
+from clients.cloud_portal_client import CloudPortalClient, infer_cloud_cluster_name
 from workflows.checklist_workflow import run_collect_checklist_data, run_write_checklist_excel
+from workflows.readiness_report import run_readiness_report
 
 
 app = FastMCP("incorta-upgrade-agent", stateless_http=True)
@@ -87,9 +88,15 @@ def extract_cluster_metadata_tool(
             return "Error: No cluster_name provided and CMC_CLUSTER_NAME env var not set"
     from clients.cmc_client import CMCClient
     client = CMCClient()
-    cluster_data = client.get_cluster(cluster_name)
+    try:
+        cluster_data = client.get_cluster(cluster_name)
+    except (RuntimeError, requests.exceptions.RequestException) as e:
+        return f"Error: Failed to fetch cluster data from CMC: {e}"
 
-    metadata = extract_cluster_metadata(cluster_data)
+    try:
+        metadata = extract_cluster_metadata(cluster_data)
+    except Exception as e:
+        return f"Error: Failed to extract metadata: {e}"
 
     if format == "json":
         return json.dumps(metadata, indent=2)
@@ -299,54 +306,203 @@ def write_checklist_excel(
 
 
 @app.tool()
+def generate_upgrade_readiness_report(
+    to_version: str,
+    cmc_cluster_name: str | None = None,
+    from_version: str = "",
+    cloud_cluster_name: str | None = None,
+) -> str:
+    """
+    [ONE-SHOT REPORT] Generate a comprehensive Upgrade Readiness Report.
+    Orchestrates all data sources (CMC, Cloud Portal, knowledge base, upgrade research)
+    to produce an opinionated readiness assessment with a rating and Excel checklist data.
+
+    This is the recommended single-command way to assess upgrade readiness.
+    It runs ALL other tools internally and produces a unified report.
+
+    OUTPUT INCLUDES:
+    - Overall Readiness Rating: READY / READY WITH CAVEATS / NOT READY
+    - Environment summary (deployment type, DB, topology, versions)
+    - Blockers that must be resolved before upgrade
+    - Warnings to review
+    - Validation checks summary (10 health checks)
+    - Key upgrade considerations (DB migration, HA, version-specific notes)
+    - Version research (release notes, known issues)
+    - Data gaps (if any data sources failed)
+    - Pre-Upgrade Checklist JSON (for write_checklist_excel)
+
+    Args:
+        to_version: Target Incorta version (e.g., '2024.7.0'). Required.
+        cmc_cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
+        from_version: Current Incorta version (e.g., '2024.1.0'). Auto-detected from cluster if empty.
+        cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). Auto-inferred from CMC_URL if not provided.
+    """
+    # Resolve CMC cluster name
+    if cmc_cluster_name is None:
+        cmc_cluster_name = os.getenv("CMC_CLUSTER_NAME")
+        if not cmc_cluster_name:
+            return "Error: No cmc_cluster_name provided and CMC_CLUSTER_NAME env var not set."
+
+    # Resolve Cloud Portal cluster name: explicit → env var → inferred from CMC_URL
+    if cloud_cluster_name is None:
+        cloud_cluster_name = os.getenv("CLOUD_PORTAL_CLUSTER_NAME") or infer_cloud_cluster_name()
+
+    try:
+        return run_readiness_report(
+            cmc_cluster_name=cmc_cluster_name,
+            to_version=to_version,
+            from_version=from_version,
+            cloud_cluster_name=cloud_cluster_name or "",
+        )
+    except Exception as e:
+        return f"Error generating readiness report: {str(e)}"
+
+
+# Module-level state for the non-blocking login flow.
+# Tracks a single pending Authorization Code + PKCE login.
+_login_state = {
+    "active": False,
+    "event": None,           # threading.Event — set when callback received
+    "auth_code_holder": None, # {"code": str|None, "error": str|None}
+    "code_verifier": None,
+    "redirect_uri": None,
+    "authorize_url": None,
+    "server": None,           # HTTPServer instance
+    "server_thread": None,    # Background daemon thread
+    "client": None,           # CloudPortalClient instance
+}
+
+
+def _cleanup_login_state():
+    """Reset the module-level login state and stop any running server."""
+    if _login_state.get("server"):
+        try:
+            _login_state["server"].server_close()
+        except Exception:
+            pass
+    _login_state.update({
+        "active": False,
+        "event": None,
+        "auth_code_holder": None,
+        "code_verifier": None,
+        "redirect_uri": None,
+        "authorize_url": None,
+        "server": None,
+        "server_thread": None,
+        "client": None,
+    })
+
+
+@app.tool()
 def cloud_portal_login() -> str:
     """
-    [AUTHENTICATION] Log in to Cloud Portal for cloud metadata access.
-    Call this BEFORE get_cloud_metadata if you get an authentication error.
+    [AUTHENTICATION] Log in to the Cloud Portal via browser-based OAuth.
+    Returns a login URL for the user to visit. After authentication, the token
+    is cached and subsequent Cloud Portal API calls will work automatically.
 
-    HOW IT WORKS:
-    1. This tool returns a URL and a code
-    2. Open the URL in your browser
-    3. Enter the code and complete login (including MFA)
-    4. The tool automatically detects when login is complete
+    WHEN TO USE: Call this when get_cloud_metadata returns an authentication error.
+    The user must visit the returned URL in their browser to complete login.
 
-    After login, your token is cached and auto-refreshes.
-    You only need to log in once per session (tokens last days/weeks).
+    Args:
+        public_url: The public URL of this MCP server (e.g. your Cloudflare tunnel URL).
+                    Defaults to MCP_PUBLIC_URL env var.
     """
     cloud_client = CloudPortalClient()
 
+    # 1. Check if already authenticated with a valid token
+    if cloud_client.bearer_token and not cloud_client._is_token_expired(cloud_client.bearer_token):
+        _cleanup_login_state()
+        try:
+            user_id = cloud_client.get_user_id()
+        except RuntimeError:
+            user_id = "unknown"
+        return (
+            "## Already Authenticated\n\n"
+            f"- **User ID:** `{user_id}`\n"
+            "- Token is still valid.\n"
+            "\nYou can use `get_cloud_metadata` directly."
+        )
+
+    # 2. Try silent refresh (no browser needed)
+    if cloud_client._refresh_access_token():
+        _cleanup_login_state()
+        try:
+            user_id = cloud_client.get_user_id()
+        except RuntimeError:
+            user_id = "unknown"
+        return (
+            "## Token Refreshed\n\n"
+            f"- **User ID:** `{user_id}`\n"
+            "- Token refreshed successfully (no browser login needed).\n"
+            "\nYou can use `get_cloud_metadata` directly."
+        )
+
+    # 3. If a login flow is active, check for completion
+    if _login_state["active"]:
+        event = _login_state["event"]
+        if event and event.is_set():
+            # Callback received — exchange code for token
+            holder = _login_state["auth_code_holder"]
+            code_verifier = _login_state["code_verifier"]
+            redirect_uri = _login_state["redirect_uri"]
+            client = _login_state["client"] or cloud_client
+
+            if holder.get("error"):
+                err = holder["error"]
+                _cleanup_login_state()
+                return f"## Login Failed\n\n{err}"
+
+            auth_code = holder.get("code")
+            if not auth_code:
+                _cleanup_login_state()
+                return "## Login Failed\n\nNo authorization code received."
+
+            _cleanup_login_state()
+
+            try:
+                client.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
+                user_id = client.get_user_id()
+                return (
+                    f"## Cloud Portal Login Successful\n\n"
+                    f"- **User ID:** `{user_id}`\n"
+                    f"- Token cached and will auto-refresh.\n"
+                    f"\nYou can now use `get_cloud_metadata` to query your clusters."
+                )
+            except RuntimeError as e:
+                return f"## Login Failed\n\nToken exchange error: {str(e)}"
+        else:
+            # Still waiting for user to complete login
+            return (
+                f"## Login In Progress\n\n"
+                f"Still waiting for you to complete login.\n\n"
+                f"**Open this URL if you haven't already:**\n"
+                f"{_login_state['authorize_url']}\n\n"
+                f"After completing login in the browser, call this tool again."
+            )
+
+    # 4. No active flow — start a new one
     try:
-        device_info = cloud_client.device_login()
+        login_info = cloud_client.login_for_mcp()
     except RuntimeError as e:
-        return f"Error: {str(e)}"
+        return f"## Login Error\n\n{str(e)}"
 
-    user_code = device_info["user_code"]
-    verification_uri = device_info["verification_uri"]
-    device_code = device_info["device_code"]
-    interval = device_info["interval"]
-    expires_in = device_info["expires_in"]
+    # Store state for subsequent calls
+    _login_state["active"] = True
+    _login_state["event"] = login_info["event"]
+    _login_state["auth_code_holder"] = login_info["auth_code_holder"]
+    _login_state["code_verifier"] = login_info["code_verifier"]
+    _login_state["redirect_uri"] = login_info["redirect_uri"]
+    _login_state["authorize_url"] = login_info["authorize_url"]
+    _login_state["server"] = login_info["server"]
+    _login_state["server_thread"] = login_info["server_thread"]
+    _login_state["client"] = cloud_client
 
-    instructions = (
+    return (
         f"## Cloud Portal Login\n\n"
         f"**Open this URL in your browser:**\n"
-        f"{verification_uri}\n\n"
-        f"**Enter this code when prompted:**\n"
-        f"### `{user_code}`\n\n"
-        f"Waiting for you to complete login (up to {expires_in // 60} minutes)...\n"
+        f"{login_info['authorize_url']}\n\n"
+        f"Complete login (including MFA if required), then **call this tool again** to confirm.\n"
     )
-
-    try:
-        cloud_client.poll_device_login(device_code, interval, expires_in)
-        user_id = cloud_client.get_user_id()
-        return (
-            f"{instructions}\n"
-            f"Login successful! You are now authenticated.\n"
-            f"- **User ID:** `{user_id}`\n"
-            f"- Token cached and will auto-refresh.\n"
-            f"\nYou can now use `get_cloud_metadata` to query your clusters."
-        )
-    except RuntimeError as e:
-        return f"{instructions}\nLogin failed: {str(e)}"
 
 
 @app.tool()
@@ -380,9 +536,9 @@ def get_cloud_metadata(
         include_users: Include authorized users (default: True)
     """
     if cluster_name is None:
-        cluster_name = os.getenv("CLOUD_PORTAL_CLUSTER_NAME")
+        cluster_name = os.getenv("CLOUD_PORTAL_CLUSTER_NAME") or infer_cloud_cluster_name()
         if not cluster_name:
-            return "Error: No cluster_name provided and CLOUD_PORTAL_CLUSTER_NAME env var not set"
+            return "Error: No cluster_name provided. Set CLOUD_PORTAL_CLUSTER_NAME env var or ensure CMC_URL is configured."
     cloud_client = CloudPortalClient()
 
     try:
