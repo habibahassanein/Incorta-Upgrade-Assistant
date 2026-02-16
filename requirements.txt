@@ -13,6 +13,9 @@ python-dotenv
 # JWT decoding (for Auth0 token parsing)
 PyJWT
 
+# Excel file generation (for checklist export)
+openpyxl
+
 # Semantic search (Qdrant)
 qdrant-client==1.12.0
 sentence-transformers

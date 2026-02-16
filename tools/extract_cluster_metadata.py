@@ -394,8 +394,11 @@ def detect_tenant_storage(cluster_name: str, client) -> Dict[str, Any]:
         )
         
         if r.status_code == 200:
+            body = r.text.strip()
+            if not body or body.startswith("<!") or body.startswith("<html") or body.startswith("<HTML"):
+                return {"error": "Tenants API returned non-JSON response", "status": "failed"}
             tenants = r.json()
-            
+
             tenant_details = []
             unlimited_count = 0
             
@@ -457,6 +460,9 @@ def detect_integrations(cluster_name: str, client) -> Dict[str, Any]:
         )
         
         if r.status_code == 200:
+            body = r.text.strip()
+            if not body or body.startswith("<!") or body.startswith("<html") or body.startswith("<HTML"):
+                return {"error": "Config API returned non-JSON response", "status": "failed"}
             data = r.json()
             config_items = data.get("config", [])
             
