@@ -3,7 +3,7 @@ name: Build and Deploy Dev MCP
 on:
   push:
     branches:
-      - development
+      - master
 
 jobs:
   build-and-deploy:
