@@ -25,9 +25,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Auth0 configuration (defaults for staging, overridable via env)
+# Auth0 configuration for Cloud Admin Portal (overridable via env)
 AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "auth-staging.incortalabs.com")
-AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID", "1H6oWlDKORKc6BmiYWSjECS8Zq6XesV8")
+AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID", "0jXCrcpFe6PDm6sIMxDi7hunFCWeRLpt")
+AUTH0_CLIENT_SECRET = os.getenv("AUTH0_CLIENT_SECRET", "51qdw-oPivTMn210wZqx0ff9VcdsdDj-zY1z4BMdMJ6gh1TZIYO6NsNBIHdjH1Op")
 AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "https://cloud.server/api/")
 AUTH0_SCOPES = (
     "openid profile email "
@@ -35,7 +36,7 @@ AUTH0_SCOPES = (
     "offline_access"
 )
 CALLBACK_PORT = int(os.getenv("AUTH0_CALLBACK_PORT", "8910"))
-CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
+CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cp-cloudstaging.incortalabs.com")
 TOKEN_CACHE_PATH = Path(os.getenv("TOKEN_CACHE_PATH", str(Path.home() / ".incorta_cloud_token.json")))
 
 
@@ -77,6 +78,10 @@ class CloudPortalClient:
             return
         try:
             data = json.loads(TOKEN_CACHE_PATH.read_text())
+            # Reject tokens cached for a different Auth0 client
+            if data.get("client_id") and data.get("client_id") != AUTH0_CLIENT_ID:
+                TOKEN_CACHE_PATH.unlink(missing_ok=True)
+                return
             # Always load refresh token (it has a longer lifetime than access token)
             self.refresh_token = data.get("refresh_token")
             if not self.user_id:
@@ -105,6 +110,7 @@ class CloudPortalClient:
             "access_token": token,
             "refresh_token": refresh_token,
             "user_id": user_id,
+            "client_id": AUTH0_CLIENT_ID,
             "exp": exp,
             "cached_at": int(time.time()),
         }
@@ -174,6 +180,7 @@ class CloudPortalClient:
                 json={
                     "grant_type": "refresh_token",
                     "client_id": AUTH0_CLIENT_ID,
+                    "client_secret": AUTH0_CLIENT_SECRET,
                     "refresh_token": refresh_token,
                 },
                 headers={"Content-Type": "application/json"},
@@ -267,6 +274,7 @@ class CloudPortalClient:
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                     "device_code": device_code,
                     "client_id": AUTH0_CLIENT_ID,
+                    "client_secret": AUTH0_CLIENT_SECRET,
                 },
                 headers={"Content-Type": "application/json"},
                 timeout=30,
@@ -408,12 +416,13 @@ class CloudPortalClient:
         if server_error:
             raise RuntimeError(f"Cloud Portal login failed: {server_error}")
 
-        # Exchange authorization code for access token (with PKCE code_verifier)
+        # Exchange authorization code for access token (with PKCE + client_secret)
         token_response = requests.post(
             f"https://{AUTH0_DOMAIN}/oauth/token",
             json={
                 "grant_type": "authorization_code",
                 "client_id": AUTH0_CLIENT_ID,
+                "client_secret": AUTH0_CLIENT_SECRET,
                 "code": auth_code,
                 "redirect_uri": redirect_uri,
                 "code_verifier": code_verifier,
@@ -597,6 +606,7 @@ class CloudPortalClient:
             json={
                 "grant_type": "authorization_code",
                 "client_id": AUTH0_CLIENT_ID,
+                "client_secret": AUTH0_CLIENT_SECRET,
                 "code": auth_code,
                 "redirect_uri": redirect_uri,
                 "code_verifier": code_verifier,
@@ -739,3 +749,40 @@ class CloudPortalClient:
         """Helper: Find UUID for a cluster by name."""
         instance = self.find_cluster(user_id, cluster_name)
         return instance.get("id") if instance else None
+
+    def search_instances(self, cluster_name):
+        """Search for instances by name using Cloud Admin Portal API.
+
+        Uses GET /api/v2/instances?search=NAME — no user_id required.
+
+        Args:
+            cluster_name: Instance name to search for (e.g., 'habibascluster').
+
+        Returns:
+            dict or None: The matching instance dict, or None if not found.
+        """
+        url = f"{self.base_url}/instances"
+        r = requests.get(
+            url,
+            headers=self._headers(),
+            params={"search": cluster_name},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        # Handle list or wrapped response formats
+        instances = data if isinstance(data, list) else data.get("instances", data.get("data", []))
+
+        # Find exact name match
+        for instance in instances:
+            inst = instance.get("instance", instance) if isinstance(instance, dict) else instance
+            if inst.get("name") == cluster_name:
+                return inst
+
+        # Fall back to first result if search returned matches
+        if instances:
+            first = instances[0]
+            return first.get("instance", first) if isinstance(first, dict) else first
+
+        return None
