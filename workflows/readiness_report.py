@@ -123,8 +123,7 @@ def collect_cloud_data(state: ReadinessState) -> ReadinessState:
         from clients.cloud_portal_client import CloudPortalClient
 
         cloud_client = CloudPortalClient()
-        user_id = cloud_client.get_user_id()
-        cluster = cloud_client.find_cluster(user_id, cloud_cluster_name)
+        cluster = cloud_client.search_instances(cloud_cluster_name)
 
         if not cluster:
             errors.append(f"Cloud cluster '{cloud_cluster_name}' not found in Cloud Portal")

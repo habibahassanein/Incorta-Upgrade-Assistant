@@ -458,10 +458,14 @@ def cloud_portal_login() -> str:
 
             try:
                 client.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
-                user_id = client.get_user_id()
+                try:
+                    user_id = client.get_user_id()
+                except RuntimeError:
+                    user_id = None
+                user_line = f"- **User ID:** `{user_id}`\n" if user_id else ""
                 return (
                     f"## Cloud Portal Login Successful\n\n"
-                    f"- **User ID:** `{user_id}`\n"
+                    f"{user_line}"
                     f"- Token cached and will auto-refresh.\n"
                     f"\nYou can now use `get_cloud_metadata` to query your clusters."
                 )
@@ -539,7 +543,15 @@ def get_cloud_metadata(
     cloud_client = CloudPortalClient()
 
     try:
-        user_id = cloud_client.get_user_id()
+        our_cluster = cloud_client.search_instances(cluster_name)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 401:
+            return (
+                "Error: Not authenticated with Cloud Portal.\n"
+                "Please call the **cloud_portal_login** tool first to log in.\n"
+                "After logging in, retry this tool."
+            )
+        return f"Error: Failed to search instances from Cloud Portal: {str(e)}"
     except RuntimeError as e:
         error_msg = str(e)
         if "AUTHENTICATION_REQUIRED" in error_msg:
@@ -549,11 +561,6 @@ def get_cloud_metadata(
                 "After logging in, retry this tool."
             )
         return f"Error: {error_msg}"
-
-    try:
-        our_cluster = cloud_client.find_cluster(user_id, cluster_name)
-    except (requests.exceptions.HTTPError, RuntimeError) as e:
-        return f"Error: Failed to fetch clusters from Cloud Portal: {str(e)}"
 
     if not our_cluster:
         return f"Error: Cluster '{cluster_name}' not found in Cloud Portal"
@@ -576,8 +583,18 @@ def get_cloud_metadata(
         "",
     ]
 
+    # Lazy-load user_id only for consumption/users (these still use user-scoped endpoints)
+    user_id = None
+    if include_consumption or include_users:
+        try:
+            user_id = cloud_client.get_user_id()
+        except RuntimeError:
+            user_id = None
+
     if include_consumption:
         try:
+            if not user_id:
+                raise RuntimeError("User ID not available — cannot fetch consumption data")
             consumption = cloud_client.get_consumption(user_id, instance_uuid)
             consumption_agg = consumption.get('consumptionAgg', {})
             total_pu = consumption_agg.get('totalAgg', 0)
@@ -620,6 +637,8 @@ def get_cloud_metadata(
 
     if include_users:
         try:
+            if not user_id:
+                raise RuntimeError("User ID not available — cannot fetch user data")
             users_data = cloud_client.get_authorized_users(user_id, cluster_name)
             users_list = users_data.get('authorizedUserRoles', [])
 
