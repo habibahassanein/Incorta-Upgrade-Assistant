@@ -2,9 +2,10 @@
 Cloud Portal API Client
 Provides access to cloud-specific metadata, consumption tracking, and user management.
 
-Authentication: Uses OAuth Authorization Code flow with a local callback server.
-When no valid token is available, opens the browser for Cloud Portal login (with MFA),
-captures the token automatically via localhost callback, and caches it locally.
+Authentication: Uses OAuth Authorization Code + PKCE flow via the Cloud Admin Portal.
+When no valid token is available, the user opens a login URL in their browser,
+completes authentication (including MFA), then pastes the redirect URL back.
+Tokens are cached locally and auto-refresh via refresh tokens.
 """
 
 import base64
@@ -12,10 +13,8 @@ import hashlib
 import json
 import os
 import secrets
-import threading
 import time
 import webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs
 
@@ -35,7 +34,6 @@ AUTH0_SCOPES = (
     "read:cluster create:cluster update:cluster delete:cluster manage:cluster "
     "offline_access"
 )
-CALLBACK_PORT = int(os.getenv("AUTH0_CALLBACK_PORT", "8910"))
 CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cp-cloudstaging.incortalabs.com")
 TOKEN_CACHE_PATH = Path(os.getenv("TOKEN_CACHE_PATH", str(Path.home() / ".incorta_cloud_token.json")))
 
@@ -312,9 +310,9 @@ class CloudPortalClient:
         """Authenticate via browser-based OAuth Authorization Code flow.
 
         Opens the Cloud Portal login page in the browser. After the user
-        completes login (including MFA), Auth0 redirects to a local callback
-        server which captures the authorization code and exchanges it for
-        an access token. Fully automatic — no manual copy/paste needed.
+        completes login (including MFA), Auth0 redirects back to the Cloud
+        Portal. The user copies the redirect URL from the browser and pastes
+        it here, so we can extract the authorization code and exchange it.
 
         In headless environments (Docker, CI), raises RuntimeError with
         instructions to use environment variables instead.
@@ -334,62 +332,9 @@ class CloudPortalClient:
         state = secrets.token_urlsafe(32)
         code_verifier = self._generate_code_verifier()
         code_challenge = self._generate_code_challenge(code_verifier)
-        redirect_uri = f"http://localhost:{CALLBACK_PORT}/callback"
-        auth_code = None
-        server_error = None
+        redirect_uri = CLOUD_PORTAL_URL
 
-        class CallbackHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                nonlocal auth_code, server_error
-                parsed = urlparse(self.path)
-                params = parse_qs(parsed.query)
-
-                if parsed.path != "/callback":
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-
-                # Validate state parameter
-                returned_state = params.get("state", [None])[0]
-                if returned_state != state:
-                    server_error = "State mismatch — possible CSRF attack"
-                    self._send_html(400, "Login failed: state mismatch.")
-                    return
-
-                # Check for errors from Auth0
-                error = params.get("error", [None])[0]
-                if error:
-                    error_desc = params.get("error_description", [error])[0]
-                    server_error = error_desc
-                    self._send_html(400, f"Login failed: {error_desc}")
-                    return
-
-                code = params.get("code", [None])[0]
-                if not code:
-                    server_error = "No authorization code in callback"
-                    self._send_html(400, "Login failed: no code received.")
-                    return
-
-                auth_code = code
-                self._send_html(200,
-                    "Login successful! You can close this tab and return to your terminal."
-                )
-
-            def _send_html(self, status, message):
-                self.send_response(status)
-                self.send_header("Content-Type", "text/html")
-                self.end_headers()
-                html = f"<html><body><h2>{message}</h2></body></html>"
-                self.wfile.write(html.encode())
-
-            def log_message(self, format, *args):
-                pass  # Suppress request logs
-
-        # Start local callback server
-        server = HTTPServer(("localhost", CALLBACK_PORT), CallbackHandler)
-        server.timeout = 120  # 2-minute timeout for user to complete login
-
-        # Build Auth0 authorize URL (with PKCE for SPA client compatibility)
+        # Build Auth0 authorize URL (with PKCE + client_secret)
         authorize_params = {
             "response_type": "code",
             "client_id": AUTH0_CLIENT_ID,
@@ -404,17 +349,30 @@ class CloudPortalClient:
 
         print(f"\nOpening browser for Cloud Portal login...")
         print(f"If the browser doesn't open, visit:\n{authorize_url}\n")
-        print("Waiting for login (up to 2 minutes)...")
         webbrowser.open(authorize_url)
 
-        # Wait for callback
-        while auth_code is None and server_error is None:
-            server.handle_request()
+        print("After completing login, copy the FULL URL from your browser's address bar")
+        print("(it will look like: https://cp-cloudstaging.incortalabs.com?code=...&state=...)\n")
+        redirect_url = input("Paste the URL here: ").strip()
 
-        server.server_close()
+        if not redirect_url:
+            raise RuntimeError("No URL provided.")
 
-        if server_error:
-            raise RuntimeError(f"Cloud Portal login failed: {server_error}")
+        # Extract code from the pasted URL
+        parsed = urlparse(redirect_url)
+        params = parse_qs(parsed.query)
+
+        error = params.get("error", [None])[0]
+        if error:
+            error_desc = params.get("error_description", [error])[0]
+            raise RuntimeError(f"Cloud Portal login failed: {error_desc}")
+
+        auth_code = params.get("code", [None])[0]
+        if not auth_code:
+            raise RuntimeError(
+                "No authorization code found in the URL. "
+                "Make sure you copied the full URL from the browser address bar."
+            )
 
         # Exchange authorization code for access token (with PKCE + client_secret)
         token_response = requests.post(
@@ -448,7 +406,6 @@ class CloudPortalClient:
 
         # Show confirmation with expiry info
         try:
-            # Signature verification skipped: token just obtained from Auth0 token endpoint.
             claims = jwt.decode(self.bearer_token, options={"verify_signature": False})
             exp = claims.get("exp")
             if exp:
@@ -461,115 +418,32 @@ class CloudPortalClient:
         return self.bearer_token
 
     # ------------------------------------------------------------------
-    # Non-blocking OAuth login for MCP tool use
+    # Two-step OAuth login for MCP tool use
     # ------------------------------------------------------------------
 
-    def login_for_mcp(self):
-        """Start Authorization Code + PKCE flow for MCP tool use.
+    def start_login_flow(self):
+        """Start Authorization Code + PKCE flow for MCP tool use (step 1).
 
-        Does NOT open a browser. Returns the authorize URL for the MCP tool
-        to display, plus internal state for a background callback server.
-
-        The MCP tool calls this once, returns the URL to the user, then on a
-        subsequent call checks event.is_set() to see if the user completed login.
+        Generates the authorize URL and PKCE parameters. Does NOT open a
+        browser — the MCP tool returns the URL to the user.
 
         Returns:
             dict with keys:
                 - authorize_url (str): URL the user must open in their browser
-                - event (threading.Event): Set when callback is received
-                - auth_code_holder (dict): {"code": str|None, "error": str|None}
-                - code_verifier (str): PKCE code verifier for token exchange
-                - redirect_uri (str): The callback URI
-                - server (HTTPServer): The callback server (for cleanup)
-                - server_thread (threading.Thread): Background thread
-
-        Raises:
-            RuntimeError: If the callback server cannot start (port in use).
+                - code_verifier (str): PKCE code verifier (needed for step 2)
+                - redirect_uri (str): The redirect URI used
         """
-        state = secrets.token_urlsafe(32)
         code_verifier = self._generate_code_verifier()
         code_challenge = self._generate_code_challenge(code_verifier)
-        redirect_uri = f"http://localhost:{CALLBACK_PORT}/callback"
+        redirect_uri = CLOUD_PORTAL_URL
 
-        auth_code_holder = {"code": None, "error": None}
-        login_complete = threading.Event()
-
-        class CallbackHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                parsed = urlparse(self.path)
-                params = parse_qs(parsed.query)
-
-                if parsed.path != "/callback":
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-
-                # Validate state parameter
-                returned_state = params.get("state", [None])[0]
-                if returned_state != state:
-                    auth_code_holder["error"] = "State mismatch — possible CSRF attack"
-                    self._send_html(400, "Login failed: state mismatch.")
-                    login_complete.set()
-                    return
-
-                # Check for errors from Auth0
-                error = params.get("error", [None])[0]
-                if error:
-                    error_desc = params.get("error_description", [error])[0]
-                    auth_code_holder["error"] = error_desc
-                    self._send_html(400, f"Login failed: {error_desc}")
-                    login_complete.set()
-                    return
-
-                code = params.get("code", [None])[0]
-                if not code:
-                    auth_code_holder["error"] = "No authorization code in callback"
-                    self._send_html(400, "Login failed: no code received.")
-                    login_complete.set()
-                    return
-
-                auth_code_holder["code"] = code
-                self._send_html(200,
-                    "Login successful! You can close this tab and return to Claude."
-                )
-                login_complete.set()
-
-            def _send_html(self, status, message):
-                self.send_response(status)
-                self.send_header("Content-Type", "text/html")
-                self.end_headers()
-                html = f"<html><body><h2>{message}</h2></body></html>"
-                self.wfile.write(html.encode())
-
-            def log_message(self, format, *args):
-                pass  # Suppress request logs
-
-        # Start HTTP server
-        try:
-            server = HTTPServer(("localhost", CALLBACK_PORT), CallbackHandler)
-        except OSError as e:
-            raise RuntimeError(
-                f"Cannot start callback server on port {CALLBACK_PORT}: {e}. "
-                f"Check if another process is using port {CALLBACK_PORT}."
-            )
-        server.timeout = 1  # Short timeout so we can check the Event regularly
-
-        def serve_until_done():
-            """Run the HTTP server until the callback is received."""
-            while not login_complete.is_set():
-                server.handle_request()
-
-        server_thread = threading.Thread(target=serve_until_done, daemon=True)
-        server_thread.start()
-
-        # Build authorize URL with PKCE
         authorize_params = {
             "response_type": "code",
             "client_id": AUTH0_CLIENT_ID,
             "redirect_uri": redirect_uri,
             "audience": AUTH0_AUDIENCE,
             "scope": AUTH0_SCOPES,
-            "state": state,
+            "state": secrets.token_urlsafe(32),
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
@@ -577,18 +451,52 @@ class CloudPortalClient:
 
         return {
             "authorize_url": authorize_url,
-            "event": login_complete,
-            "auth_code_holder": auth_code_holder,
             "code_verifier": code_verifier,
             "redirect_uri": redirect_uri,
-            "server": server,
-            "server_thread": server_thread,
         }
+
+    def complete_login_flow(self, redirect_url, code_verifier, redirect_uri):
+        """Complete Authorization Code + PKCE flow (step 2).
+
+        Extracts the authorization code from the redirect URL and exchanges
+        it for an access token.
+
+        Args:
+            redirect_url: The full URL from the browser after login
+                (e.g., https://cp-cloudstaging.incortalabs.com?code=...&state=...)
+            code_verifier: The PKCE code verifier from start_login_flow()
+            redirect_uri: The redirect URI from start_login_flow()
+
+        Returns:
+            str: The bearer token
+
+        Raises:
+            RuntimeError: If the URL is invalid or token exchange fails
+        """
+        if not redirect_url:
+            raise RuntimeError("No URL provided.")
+
+        parsed = urlparse(redirect_url)
+        params = parse_qs(parsed.query)
+
+        error = params.get("error", [None])[0]
+        if error:
+            error_desc = params.get("error_description", [error])[0]
+            raise RuntimeError(f"Cloud Portal login failed: {error_desc}")
+
+        auth_code = params.get("code", [None])[0]
+        if not auth_code:
+            raise RuntimeError(
+                "No authorization code found in the URL. "
+                "Make sure you copied the full URL from the browser address bar."
+            )
+
+        return self.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
 
     def exchange_code_for_token(self, auth_code, redirect_uri, code_verifier):
         """Exchange an authorization code for an access token (with PKCE).
 
-        Used by the MCP tool after the callback server captures the auth code.
+        Used by the MCP tool after extracting the auth code from the redirect URL.
 
         Args:
             auth_code: The authorization code from the callback.
