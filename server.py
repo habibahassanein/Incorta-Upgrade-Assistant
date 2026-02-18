@@ -355,54 +355,44 @@ def generate_upgrade_readiness_report(
         return f"Error generating readiness report: {str(e)}"
 
 
-# Module-level state for the non-blocking login flow.
-# Tracks a single pending Authorization Code + PKCE login.
+# Module-level state for the two-step login flow.
+# Stores PKCE parameters between step 1 (get URL) and step 2 (paste redirect URL).
 _login_state = {
     "active": False,
-    "event": None,           # threading.Event — set when callback received
-    "auth_code_holder": None, # {"code": str|None, "error": str|None}
     "code_verifier": None,
     "redirect_uri": None,
     "authorize_url": None,
-    "server": None,           # HTTPServer instance
-    "server_thread": None,    # Background daemon thread
     "client": None,           # CloudPortalClient instance
 }
 
 
 def _cleanup_login_state():
-    """Reset the module-level login state and stop any running server."""
-    if _login_state.get("server"):
-        try:
-            _login_state["server"].server_close()
-        except Exception:
-            pass
+    """Reset the module-level login state."""
     _login_state.update({
         "active": False,
-        "event": None,
-        "auth_code_holder": None,
         "code_verifier": None,
         "redirect_uri": None,
         "authorize_url": None,
-        "server": None,
-        "server_thread": None,
         "client": None,
     })
 
 
 @app.tool()
-def cloud_portal_login() -> str:
+def cloud_portal_login(redirect_url: str | None = None) -> str:
     """
     [AUTHENTICATION] Log in to the Cloud Portal via browser-based OAuth.
-    Returns a login URL for the user to visit. After authentication, the token
-    is cached and subsequent Cloud Portal API calls will work automatically.
+
+    TWO-STEP FLOW:
+    1. Call with NO arguments → returns a login URL for the user to visit.
+    2. After login, the browser redirects to a URL like:
+       https://cp-cloudstaging.incortalabs.com?code=...&state=...
+       Call again with redirect_url=<that URL> to complete authentication.
 
     WHEN TO USE: Call this when get_cloud_metadata returns an authentication error.
-    The user must visit the returned URL in their browser to complete login.
 
     Args:
-        public_url: The public URL of this MCP server (e.g. your Cloudflare tunnel URL).
-                    Defaults to MCP_PUBLIC_URL env var.
+        redirect_url: The full URL from the browser after completing login.
+                      Leave empty on first call to get the login URL.
     """
     cloud_client = CloudPortalClient()
 
@@ -434,71 +424,66 @@ def cloud_portal_login() -> str:
             "\nYou can use `get_cloud_metadata` directly."
         )
 
-    # 3. If a login flow is active, check for completion
-    if _login_state["active"]:
-        event = _login_state["event"]
-        if event and event.is_set():
-            # Callback received — exchange code for token
-            holder = _login_state["auth_code_holder"]
-            code_verifier = _login_state["code_verifier"]
-            redirect_uri = _login_state["redirect_uri"]
-            client = _login_state["client"] or cloud_client
-
-            if holder.get("error"):
-                err = holder["error"]
-                _cleanup_login_state()
-                return f"## Login Failed\n\n{err}"
-
-            auth_code = holder.get("code")
-            if not auth_code:
-                _cleanup_login_state()
-                return "## Login Failed\n\nNo authorization code received."
-
-            _cleanup_login_state()
-
-            try:
-                client.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
-                user_id = client.get_user_id()
-                return (
-                    f"## Cloud Portal Login Successful\n\n"
-                    f"- **User ID:** `{user_id}`\n"
-                    f"- Token cached and will auto-refresh.\n"
-                    f"\nYou can now use `get_cloud_metadata` to query your clusters."
-                )
-            except RuntimeError as e:
-                return f"## Login Failed\n\nToken exchange error: {str(e)}"
-        else:
-            # Still waiting for user to complete login
+    # 3. Step 2: User provided the redirect URL — complete the flow
+    if redirect_url:
+        if not _login_state["active"]:
             return (
-                f"## Login In Progress\n\n"
-                f"Still waiting for you to complete login.\n\n"
-                f"**Open this URL if you haven't already:**\n"
-                f"{_login_state['authorize_url']}\n\n"
-                f"After completing login in the browser, call this tool again."
+                "## Login Error\n\n"
+                "No login flow is in progress. Call this tool without arguments first "
+                "to get a login URL."
             )
 
-    # 4. No active flow — start a new one
+        client = _login_state["client"] or cloud_client
+        code_verifier = _login_state["code_verifier"]
+        redir_uri = _login_state["redirect_uri"]
+        _cleanup_login_state()
+
+        try:
+            client.complete_login_flow(redirect_url, code_verifier, redir_uri)
+            try:
+                user_id = client.get_user_id()
+            except RuntimeError:
+                user_id = None
+            user_line = f"- **User ID:** `{user_id}`\n" if user_id else ""
+            return (
+                f"## Cloud Portal Login Successful\n\n"
+                f"{user_line}"
+                f"- Token cached and will auto-refresh.\n"
+                f"\nYou can now use `get_cloud_metadata` to query your clusters."
+            )
+        except RuntimeError as e:
+            return f"## Login Failed\n\n{str(e)}"
+
+    # 4. Step 1: Start a new login flow — return the authorize URL
+    if _login_state["active"]:
+        # Flow already started, return the same URL
+        return (
+            f"## Login In Progress\n\n"
+            f"**Open this URL in your browser:**\n"
+            f"{_login_state['authorize_url']}\n\n"
+            f"After completing login, copy the **full URL** from your browser's address bar\n"
+            f"(it will look like: `https://cp-cloudstaging.incortalabs.com?code=...&state=...`)\n\n"
+            f"Then call this tool again with `redirect_url` set to that URL."
+        )
+
     try:
-        login_info = cloud_client.login_for_mcp()
+        login_info = cloud_client.start_login_flow()
     except RuntimeError as e:
         return f"## Login Error\n\n{str(e)}"
 
-    # Store state for subsequent calls
     _login_state["active"] = True
-    _login_state["event"] = login_info["event"]
-    _login_state["auth_code_holder"] = login_info["auth_code_holder"]
     _login_state["code_verifier"] = login_info["code_verifier"]
     _login_state["redirect_uri"] = login_info["redirect_uri"]
     _login_state["authorize_url"] = login_info["authorize_url"]
-    _login_state["server"] = login_info["server"]
-    _login_state["server_thread"] = login_info["server_thread"]
     _login_state["client"] = cloud_client
 
     return (
         f"## Cloud Portal Login\n\n"
         f"**Open this URL in your browser:**\n"
         f"{login_info['authorize_url']}\n\n"
-        f"Complete login (including MFA if required), then **call this tool again** to confirm.\n"
+        f"After completing login (including MFA), copy the **full URL** from your browser's address bar\n"
+        f"(it will look like: `https://cp-cloudstaging.incortalabs.com?code=...&state=...`)\n\n"
+        f"Then call this tool again with `redirect_url` set to that URL."
     )
 
 
@@ -539,7 +524,15 @@ def get_cloud_metadata(
     cloud_client = CloudPortalClient()
 
     try:
-        user_id = cloud_client.get_user_id()
+        our_cluster = cloud_client.search_instances(cluster_name)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 401:
+            return (
+                "Error: Not authenticated with Cloud Portal.\n"
+                "Please call the **cloud_portal_login** tool first to log in.\n"
+                "After logging in, retry this tool."
+            )
+        return f"Error: Failed to search instances from Cloud Portal: {str(e)}"
     except RuntimeError as e:
         error_msg = str(e)
         if "AUTHENTICATION_REQUIRED" in error_msg:
@@ -549,11 +542,6 @@ def get_cloud_metadata(
                 "After logging in, retry this tool."
             )
         return f"Error: {error_msg}"
-
-    try:
-        our_cluster = cloud_client.find_cluster(user_id, cluster_name)
-    except (requests.exceptions.HTTPError, RuntimeError) as e:
-        return f"Error: Failed to fetch clusters from Cloud Portal: {str(e)}"
 
     if not our_cluster:
         return f"Error: Cluster '{cluster_name}' not found in Cloud Portal"
@@ -576,8 +564,18 @@ def get_cloud_metadata(
         "",
     ]
 
+    # Lazy-load user_id only for consumption/users (these still use user-scoped endpoints)
+    user_id = None
+    if include_consumption or include_users:
+        try:
+            user_id = cloud_client.get_user_id()
+        except RuntimeError:
+            user_id = None
+
     if include_consumption:
         try:
+            if not user_id:
+                raise RuntimeError("User ID not available — cannot fetch consumption data")
             consumption = cloud_client.get_consumption(user_id, instance_uuid)
             consumption_agg = consumption.get('consumptionAgg', {})
             total_pu = consumption_agg.get('totalAgg', 0)
@@ -620,6 +618,8 @@ def get_cloud_metadata(
 
     if include_users:
         try:
+            if not user_id:
+                raise RuntimeError("User ID not available — cannot fetch user data")
             users_data = cloud_client.get_authorized_users(user_id, cluster_name)
             users_list = users_data.get('authorizedUserRoles', [])
 
