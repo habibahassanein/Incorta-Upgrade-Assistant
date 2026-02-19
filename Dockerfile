@@ -24,4 +24,13 @@ EXPOSE 8080
 ENV MCP_HOST=0.0.0.0
 ENV MCP_PORT=8080
 
+# Signal headless environment so Cloud Portal auth fails fast
+# instead of blocking for 2 minutes waiting for a browser callback
+ENV HEADLESS=true
+
+# Persist the Cloud Portal token cache in the mounted volume
+# so it survives container restarts
+ENV TOKEN_CACHE_PATH=/app/data/.incorta_cloud_token.json
+RUN mkdir -p /app/data
+
 CMD ["python", "server.py"]

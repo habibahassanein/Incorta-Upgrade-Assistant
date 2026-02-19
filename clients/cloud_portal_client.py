@@ -2,10 +2,9 @@
 Cloud Portal API Client
 Provides access to cloud-specific metadata, consumption tracking, and user management.
 
-Authentication: Uses OAuth Authorization Code + PKCE flow via the Cloud Portal.
-For local use, a localhost callback server captures the auth code automatically.
-For remote (MCP tool) use, Auth0 redirects to a configurable callback URL.
-Tokens are cached locally and auto-refresh via refresh tokens.
+Authentication: Uses OAuth Authorization Code flow with a local callback server.
+When no valid token is available, opens the browser for Cloud Portal login (with MFA),
+captures the token automatically via localhost callback, and caches it locally.
 """
 
 import base64
@@ -200,6 +199,104 @@ class CloudPortalClient:
             return False
 
     # ------------------------------------------------------------------
+    # Device Code Flow (headless-compatible, multi-user)
+    # ------------------------------------------------------------------
+
+    def device_login(self):
+        """Start Device Authorization Flow — no browser on server needed.
+
+        Requests a device code from Auth0 and returns login instructions.
+        The caller should display the URL + code to the user, then call
+        poll_device_login() to wait for completion.
+
+        Returns:
+            dict: Contains device_code, user_code, verification_uri,
+                  expires_in, and interval for polling.
+
+        Raises:
+            RuntimeError: If the device code request fails (e.g., grant type not enabled).
+        """
+        response = requests.post(
+            f"https://{AUTH0_DOMAIN}/oauth/device/code",
+            json={
+                "client_id": AUTH0_CLIENT_ID,
+                "scope": AUTH0_SCOPES,
+                "audience": AUTH0_AUDIENCE,
+            },
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Device code request failed (HTTP {response.status_code}): {response.text}\n"
+                "Ensure the Auth0 client has the 'Device Code' grant type enabled."
+            )
+
+        data = response.json()
+        return {
+            "device_code": data["device_code"],
+            "user_code": data["user_code"],
+            "verification_uri": data.get("verification_uri_complete") or data["verification_uri"],
+            "expires_in": data.get("expires_in", 900),
+            "interval": data.get("interval", 5),
+        }
+
+    def poll_device_login(self, device_code, interval=5, expires_in=900):
+        """Poll Auth0 until the user completes device login.
+
+        Blocks until the user finishes authentication or the code expires.
+
+        Args:
+            device_code: The device_code from device_login().
+            interval: Seconds between poll attempts.
+            expires_in: Maximum time to wait in seconds.
+
+        Returns:
+            str: The bearer token.
+
+        Raises:
+            RuntimeError: If login fails, is denied, or times out.
+        """
+        deadline = time.time() + expires_in
+
+        while time.time() < deadline:
+            time.sleep(interval)
+            response = requests.post(
+                f"https://{AUTH0_DOMAIN}/oauth/token",
+                json={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "device_code": device_code,
+                    "client_id": AUTH0_CLIENT_ID,
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                self.bearer_token = data.get("access_token")
+                self.refresh_token = data.get("refresh_token")
+                if self.bearer_token:
+                    self._save_token(self.bearer_token, self.refresh_token)
+                    return self.bearer_token
+                raise RuntimeError("No access_token in Auth0 token response")
+
+            error = response.json().get("error", "")
+            if error == "authorization_pending":
+                continue
+            elif error == "slow_down":
+                interval += 5
+                continue
+            elif error == "expired_token":
+                raise RuntimeError("Device code expired. Please try logging in again.")
+            elif error == "access_denied":
+                raise RuntimeError("Login was denied by the user.")
+            else:
+                raise RuntimeError(f"Unexpected error during device login: {error}")
+
+        raise RuntimeError("Login timed out. Please try again.")
+
+    # ------------------------------------------------------------------
     # OAuth browser login with automatic callback capture
     # ------------------------------------------------------------------
 
@@ -342,6 +439,7 @@ class CloudPortalClient:
 
         # Show confirmation with expiry info
         try:
+            # Signature verification skipped: token just obtained from Auth0 token endpoint.
             claims = jwt.decode(self.bearer_token, options={"verify_signature": False})
             exp = claims.get("exp")
             if exp:
@@ -354,15 +452,53 @@ class CloudPortalClient:
         return self.bearer_token
 
     # ------------------------------------------------------------------
-    # Non-blocking OAuth login for MCP tool use (localhost callback)
+    # Non-blocking OAuth login for MCP tool use
     # ------------------------------------------------------------------
+
+    def build_authorize_url(self, redirect_uri: str):
+        """Build an OAuth Authorization Code + PKCE authorize URL.
+
+        Use this when the callback will be handled externally (e.g., by a
+        custom route on the MCP server itself). No local HTTP server is started.
+
+        Args:
+            redirect_uri: The redirect URI Auth0 will send the code to.
+
+        Returns:
+            dict with keys:
+                - authorize_url (str): URL the user must open in their browser
+                - state (str): CSRF state token (caller must store and validate)
+                - code_verifier (str): PKCE code verifier for token exchange
+                - redirect_uri (str): The redirect URI used
+        """
+        state = secrets.token_urlsafe(32)
+        code_verifier = self._generate_code_verifier()
+        code_challenge = self._generate_code_challenge(code_verifier)
+
+        authorize_params = {
+            "response_type": "code",
+            "client_id": AUTH0_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "audience": AUTH0_AUDIENCE,
+            "scope": AUTH0_SCOPES,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        authorize_url = f"https://{AUTH0_DOMAIN}/authorize?{urlencode(authorize_params)}"
+
+        return {
+            "authorize_url": authorize_url,
+            "state": state,
+            "code_verifier": code_verifier,
+            "redirect_uri": redirect_uri,
+        }
 
     def login_for_mcp(self):
         """Start Authorization Code + PKCE flow for MCP tool use.
 
         Does NOT open a browser. Returns the authorize URL for the MCP tool
-        to display, plus internal state for a background callback server
-        on localhost.
+        to display, plus internal state for a background callback server.
 
         The MCP tool calls this once, returns the URL to the user, then on a
         subsequent call checks event.is_set() to see if the user completed login.
@@ -479,90 +615,10 @@ class CloudPortalClient:
             "server_thread": server_thread,
         }
 
-    # ------------------------------------------------------------------
-    # Two-step OAuth login for remote MCP (tunnel callback)
-    # ------------------------------------------------------------------
-
-    def start_login_flow(self, redirect_uri=None):
-        """Start Authorization Code + PKCE flow with a configurable redirect URI.
-
-        Used by server.py for the remote auto-callback mode where the
-        redirect URI is the tunnel URL (e.g., https://{tunnel}/callback).
-        Also serves as a fallback URL-paste flow when redirect_uri is
-        set to CLOUD_PORTAL_URL.
-
-        Args:
-            redirect_uri: Override the redirect URI. If None, uses CLOUD_PORTAL_URL.
-
-        Returns:
-            dict with keys:
-                - authorize_url (str): URL the user must open in their browser
-                - code_verifier (str): PKCE code verifier (needed for token exchange)
-                - redirect_uri (str): The redirect URI used
-                - state (str): CSRF state parameter
-        """
-        code_verifier = self._generate_code_verifier()
-        code_challenge = self._generate_code_challenge(code_verifier)
-        redirect_uri = redirect_uri or CLOUD_PORTAL_URL
-        state = secrets.token_urlsafe(32)
-
-        authorize_params = {
-            "response_type": "code",
-            "client_id": AUTH0_CLIENT_ID,
-            "redirect_uri": redirect_uri,
-            "audience": AUTH0_AUDIENCE,
-            "scope": AUTH0_SCOPES,
-            "state": state,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-        }
-        authorize_url = f"https://{AUTH0_DOMAIN}/authorize?{urlencode(authorize_params)}"
-
-        return {
-            "authorize_url": authorize_url,
-            "code_verifier": code_verifier,
-            "redirect_uri": redirect_uri,
-            "state": state,
-        }
-
-    def complete_login_flow(self, redirect_url, code_verifier, redirect_uri):
-        """Complete Authorization Code + PKCE flow by extracting code from URL.
-
-        Used as a fallback when the automatic callback can't be used.
-
-        Args:
-            redirect_url: The full URL from the browser after login
-            code_verifier: The PKCE code verifier from start_login_flow()
-            redirect_uri: The redirect URI from start_login_flow()
-
-        Returns:
-            str: The bearer token
-
-        Raises:
-            RuntimeError: If the URL is invalid or token exchange fails
-        """
-        if not redirect_url:
-            raise RuntimeError("No URL provided.")
-
-        parsed = urlparse(redirect_url)
-        params = parse_qs(parsed.query)
-
-        error = params.get("error", [None])[0]
-        if error:
-            error_desc = params.get("error_description", [error])[0]
-            raise RuntimeError(f"Cloud Portal login failed: {error_desc}")
-
-        auth_code = params.get("code", [None])[0]
-        if not auth_code:
-            raise RuntimeError(
-                "No authorization code found in the URL. "
-                "Make sure you copied the full URL from the browser address bar."
-            )
-
-        return self.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
-
     def exchange_code_for_token(self, auth_code, redirect_uri, code_verifier):
         """Exchange an authorization code for an access token (with PKCE).
+
+        Used by the MCP tool after the callback server captures the auth code.
 
         Args:
             auth_code: The authorization code from the callback.
@@ -659,7 +715,7 @@ class CloudPortalClient:
         )
 
     # ------------------------------------------------------------------
-    # API methods
+    # API methods (unchanged)
     # ------------------------------------------------------------------
 
     def get_clusters_info(self, user_id):
