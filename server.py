@@ -1,5 +1,7 @@
 
+import asyncio
 import json
+import logging
 import os
 import sys
 from typing import Literal
@@ -12,6 +14,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import HTMLResponse
 
 from workflows.pre_upgrade_validation import run_validation
 from workflows.upgrade_research import research_upgrade_path
@@ -22,8 +26,99 @@ from clients.cloud_portal_client import CloudPortalClient, infer_cloud_cluster_n
 from workflows.checklist_workflow import run_collect_checklist_data, run_write_checklist_excel
 from workflows.readiness_report import run_readiness_report
 
+logger = logging.getLogger(__name__)
+
 
 app = FastMCP("incorta-upgrade-agent", stateless_http=True)
+
+
+# ==========================================
+# TUNNEL URL AUTO-DETECTION
+# ==========================================
+
+def _detect_tunnel_url() -> str | None:
+    """Auto-detect the Cloudflare quick tunnel public URL.
+
+    Tries these sources in order:
+    1. MCP_PUBLIC_URL env var (explicit override)
+    2. cloudflared metrics API at http://localhost:2000/quicktunnel
+    3. Returns None (triggers fallback to localhost callback)
+    """
+    explicit = os.getenv("MCP_PUBLIC_URL")
+    if explicit:
+        return explicit.rstrip("/")
+
+    metrics_host = os.getenv("CLOUDFLARED_METRICS_HOST", "http://localhost:2000")
+    try:
+        resp = requests.get(f"{metrics_host}/quicktunnel", timeout=3)
+        if resp.status_code == 200:
+            hostname = resp.json().get("hostname")
+            if hostname:
+                url = f"https://{hostname}"
+                logger.info(f"Auto-detected tunnel URL: {url}")
+                return url
+    except Exception:
+        pass
+
+    return None
+
+
+# Detect once at import time
+_tunnel_url: str | None = _detect_tunnel_url()
+
+
+# ==========================================
+# OAUTH CALLBACK ROUTE (for remote/tunnel deployments)
+# ==========================================
+
+_callback_data: dict = {}
+_callback_event: asyncio.Event | None = None
+
+
+@app.custom_route("/callback", methods=["GET"])
+async def oauth_callback(request: Request):
+    """Handle Auth0 OAuth redirect callback.
+
+    Auth0 redirects here after user login:
+      GET /callback?code=AUTH_CODE&state=STATE
+
+    Extracts the code and signals the waiting login flow.
+    """
+    global _callback_data, _callback_event
+
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    error_description = request.query_params.get("error_description", "")
+
+    if error:
+        _callback_data = {"error": error, "error_description": error_description}
+        if _callback_event:
+            _callback_event.set()
+        return HTMLResponse(
+            "<html><body><h2>Login Failed</h2>"
+            f"<p>{error_description or error}</p>"
+            "<p>You can close this tab.</p></body></html>",
+            status_code=400,
+        )
+
+    if not code:
+        return HTMLResponse(
+            "<html><body><h2>Error</h2>"
+            "<p>No authorization code received.</p></body></html>",
+            status_code=400,
+        )
+
+    _callback_data = {"code": code, "state": state}
+    if _callback_event:
+        _callback_event.set()
+
+    return HTMLResponse(
+        "<html><body>"
+        "<h2>Login Successful!</h2>"
+        "<p>You can close this tab and return to your MCP client.</p>"
+        "</body></html>"
+    )
 
 
 # ==========================================
@@ -355,48 +450,77 @@ def generate_upgrade_readiness_report(
         return f"Error generating readiness report: {str(e)}"
 
 
-# Module-level state for the two-step login flow.
-# Stores PKCE parameters between step 1 (get URL) and step 2 (paste redirect URL).
+# ==========================================
+# CLOUD PORTAL LOGIN (automatic callback + fallback)
+# ==========================================
+
+# Module-level state for login flow
 _login_state = {
     "active": False,
+    "mode": None,             # "localhost" | "tunnel" | "manual"
     "code_verifier": None,
     "redirect_uri": None,
     "authorize_url": None,
+    "state": None,            # CSRF state for tunnel callback
     "client": None,           # CloudPortalClient instance
+    # Localhost callback fields (only used in localhost mode)
+    "event": None,            # threading.Event
+    "auth_code_holder": None, # {"code": str|None, "error": str|None}
+    "server": None,           # HTTPServer instance
+    "server_thread": None,    # Background daemon thread
 }
 
 
 def _cleanup_login_state():
-    """Reset the module-level login state."""
+    """Reset the module-level login state and stop any running server."""
+    global _callback_event, _callback_data
+    if _login_state.get("server"):
+        try:
+            _login_state["server"].server_close()
+        except Exception:
+            pass
     _login_state.update({
         "active": False,
+        "mode": None,
         "code_verifier": None,
         "redirect_uri": None,
         "authorize_url": None,
+        "state": None,
         "client": None,
+        "event": None,
+        "auth_code_holder": None,
+        "server": None,
+        "server_thread": None,
     })
+    _callback_event = None
+    _callback_data = {}
 
 
 @app.tool()
-def cloud_portal_login(redirect_url: str | None = None) -> str:
+async def cloud_portal_login(redirect_url: str | None = None) -> str:
     """
     [AUTHENTICATION] Log in to the Cloud Portal via browser-based OAuth.
 
-    TWO-STEP FLOW:
-    1. Call with NO arguments → returns a login URL for the user to visit.
-    2. After login, the browser redirects to a URL like:
-       https://cp-cloudstaging.incortalabs.com?code=...&state=...
-       Call again with redirect_url=<that URL> to complete authentication.
+    AUTOMATIC MODE (default):
+    Call with no arguments. The tool detects whether to use a localhost callback
+    (local dev) or tunnel callback (remote deployment) and handles login
+    automatically after you open the URL in your browser.
+
+    MANUAL FALLBACK:
+    If auto-callback fails, the tool falls back to a two-step flow where you
+    paste the redirect URL back.
 
     WHEN TO USE: Call this when get_cloud_metadata returns an authentication error.
 
     Args:
-        redirect_url: The full URL from the browser after completing login.
-                      Leave empty on first call to get the login URL.
+        redirect_url: (Manual fallback only) The full URL from browser after login.
+                      Leave empty for automatic mode.
     """
+    global _callback_event, _callback_data, _tunnel_url
+
     cloud_client = CloudPortalClient()
 
-    # 1. Check if already authenticated with a valid token
+    # 1. Already authenticated?
     if cloud_client.bearer_token and not cloud_client._is_token_expired(cloud_client.bearer_token):
         _cleanup_login_state()
         try:
@@ -410,7 +534,7 @@ def cloud_portal_login(redirect_url: str | None = None) -> str:
             "\nYou can use `get_cloud_metadata` directly."
         )
 
-    # 2. Try silent refresh (no browser needed)
+    # 2. Try silent refresh
     if cloud_client._refresh_access_token():
         _cleanup_login_state()
         try:
@@ -424,13 +548,12 @@ def cloud_portal_login(redirect_url: str | None = None) -> str:
             "\nYou can use `get_cloud_metadata` directly."
         )
 
-    # 3. Step 2: User provided the redirect URL — complete the flow
+    # 3. Manual step 2: User provided redirect URL (fallback)
     if redirect_url:
         if not _login_state["active"]:
             return (
                 "## Login Error\n\n"
-                "No login flow is in progress. Call this tool without arguments first "
-                "to get a login URL."
+                "No login flow is in progress. Call this tool without arguments first."
             )
 
         client = _login_state["client"] or cloud_client
@@ -449,40 +572,201 @@ def cloud_portal_login(redirect_url: str | None = None) -> str:
                 f"## Cloud Portal Login Successful\n\n"
                 f"{user_line}"
                 f"- Token cached and will auto-refresh.\n"
-                f"\nYou can now use `get_cloud_metadata` to query your clusters."
+                f"\nYou can now use `get_cloud_metadata`."
             )
         except RuntimeError as e:
             return f"## Login Failed\n\n{str(e)}"
 
-    # 4. Step 1: Start a new login flow — return the authorize URL
+    # 4. Check if a login flow is already active
     if _login_state["active"]:
-        # Flow already started, return the same URL
+        mode = _login_state["mode"]
+
+        # --- Localhost callback: check if callback arrived ---
+        if mode == "localhost":
+            event = _login_state["event"]
+            if event and event.is_set():
+                holder = _login_state["auth_code_holder"]
+                code_verifier = _login_state["code_verifier"]
+                redirect_uri = _login_state["redirect_uri"]
+                client = _login_state["client"] or cloud_client
+
+                if holder.get("error"):
+                    err = holder["error"]
+                    _cleanup_login_state()
+                    return f"## Login Failed\n\n{err}"
+
+                auth_code = holder.get("code")
+                if not auth_code:
+                    _cleanup_login_state()
+                    return "## Login Failed\n\nNo authorization code received."
+
+                _cleanup_login_state()
+
+                try:
+                    client.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
+                    try:
+                        user_id = client.get_user_id()
+                    except RuntimeError:
+                        user_id = None
+                    user_line = f"- **User ID:** `{user_id}`\n" if user_id else ""
+                    return (
+                        f"## Cloud Portal Login Successful\n\n"
+                        f"{user_line}"
+                        f"- Token cached and will auto-refresh.\n"
+                        f"\nYou can now use `get_cloud_metadata`."
+                    )
+                except RuntimeError as e:
+                    return f"## Login Failed\n\nToken exchange error: {str(e)}"
+            else:
+                return (
+                    f"## Login In Progress (localhost callback)\n\n"
+                    f"Still waiting for you to complete login.\n\n"
+                    f"**Open this URL if you haven't already:**\n"
+                    f"{_login_state['authorize_url']}\n\n"
+                    f"After completing login, the callback will be captured automatically.\n"
+                    f"Call this tool again to check status."
+                )
+
+        # --- Tunnel callback: check if /callback route received the code ---
+        elif mode == "tunnel":
+            if _callback_data.get("code"):
+                # Callback already arrived
+                auth_code = _callback_data["code"]
+                received_state = _callback_data.get("state")
+                expected_state = _login_state["state"]
+                code_verifier = _login_state["code_verifier"]
+                redirect_uri = _login_state["redirect_uri"]
+                client = _login_state["client"] or cloud_client
+                _cleanup_login_state()
+
+                if received_state != expected_state:
+                    return "## Login Failed\n\nState mismatch — possible CSRF attack."
+
+                try:
+                    client.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
+                    try:
+                        user_id = client.get_user_id()
+                    except RuntimeError:
+                        user_id = None
+                    user_line = f"- **User ID:** `{user_id}`\n" if user_id else ""
+                    return (
+                        f"## Cloud Portal Login Successful (tunnel callback)\n\n"
+                        f"{user_line}"
+                        f"- Token cached and will auto-refresh.\n"
+                        f"\nYou can now use `get_cloud_metadata`."
+                    )
+                except RuntimeError as e:
+                    return f"## Login Failed\n\nToken exchange error: {str(e)}"
+            elif _callback_data.get("error"):
+                err = _callback_data.get("error_description", _callback_data["error"])
+                _cleanup_login_state()
+                return f"## Login Failed\n\n{err}"
+            else:
+                # Wait a bit for the callback
+                if _callback_event:
+                    try:
+                        await asyncio.wait_for(_callback_event.wait(), timeout=120)
+                        # Callback arrived — recurse to process it
+                        return await cloud_portal_login()
+                    except asyncio.TimeoutError:
+                        return (
+                            f"## Login In Progress (tunnel callback)\n\n"
+                            f"Still waiting for callback.\n\n"
+                            f"**Open this URL if you haven't already:**\n"
+                            f"{_login_state['authorize_url']}\n\n"
+                            f"Call this tool again to check status, or provide `redirect_url` manually."
+                        )
+
+        # --- Manual mode ---
+        else:
+            return (
+                f"## Login In Progress (manual mode)\n\n"
+                f"**Open this URL in your browser:**\n"
+                f"{_login_state['authorize_url']}\n\n"
+                f"After login, copy the **full URL** from your browser's address bar\n"
+                f"and call this tool again with `redirect_url` set to that URL."
+            )
+
+    # 5. No active flow — start a new one
+    # Re-detect tunnel URL in case it changed
+    if not _tunnel_url:
+        _tunnel_url = _detect_tunnel_url()
+
+    # Try tunnel callback first (works for remote deployments)
+    if _tunnel_url:
+        redirect_uri = f"{_tunnel_url}/callback"
+        login_info = cloud_client.start_login_flow(redirect_uri=redirect_uri)
+
+        _callback_data = {}
+        _callback_event = asyncio.Event()
+
+        _login_state.update({
+            "active": True,
+            "mode": "tunnel",
+            "code_verifier": login_info["code_verifier"],
+            "redirect_uri": login_info["redirect_uri"],
+            "authorize_url": login_info["authorize_url"],
+            "state": login_info["state"],
+            "client": cloud_client,
+        })
+
         return (
-            f"## Login In Progress\n\n"
+            f"## Cloud Portal Login (tunnel callback)\n\n"
             f"**Open this URL in your browser:**\n"
-            f"{_login_state['authorize_url']}\n\n"
-            f"After completing login, copy the **full URL** from your browser's address bar\n"
-            f"(it will look like: `https://cp-cloudstaging.incortalabs.com?code=...&state=...`)\n\n"
-            f"Then call this tool again with `redirect_url` set to that URL."
+            f"{login_info['authorize_url']}\n\n"
+            f"After completing login (including MFA), authentication will complete "
+            f"automatically via callback.\n"
+            f"Call this tool again to check status."
         )
 
+    # Try localhost callback (works for local dev)
     try:
-        login_info = cloud_client.start_login_flow()
-    except RuntimeError as e:
-        return f"## Login Error\n\n{str(e)}"
+        login_info = cloud_client.login_for_mcp()
 
-    _login_state["active"] = True
-    _login_state["code_verifier"] = login_info["code_verifier"]
-    _login_state["redirect_uri"] = login_info["redirect_uri"]
-    _login_state["authorize_url"] = login_info["authorize_url"]
-    _login_state["client"] = cloud_client
+        _login_state.update({
+            "active": True,
+            "mode": "localhost",
+            "code_verifier": login_info["code_verifier"],
+            "redirect_uri": login_info["redirect_uri"],
+            "authorize_url": login_info["authorize_url"],
+            "client": cloud_client,
+            "event": login_info["event"],
+            "auth_code_holder": login_info["auth_code_holder"],
+            "server": login_info["server"],
+            "server_thread": login_info["server_thread"],
+        })
+
+        return (
+            f"## Cloud Portal Login (localhost callback)\n\n"
+            f"**Open this URL in your browser:**\n"
+            f"{login_info['authorize_url']}\n\n"
+            f"After completing login (including MFA), the callback will be captured "
+            f"automatically on localhost:{os.getenv('AUTH0_CALLBACK_PORT', '8910')}.\n"
+            f"Call this tool again to check status."
+        )
+    except RuntimeError:
+        pass
+
+    # Fallback: manual URL-paste mode
+    login_info = cloud_client.start_login_flow()
+
+    _login_state.update({
+        "active": True,
+        "mode": "manual",
+        "code_verifier": login_info["code_verifier"],
+        "redirect_uri": login_info["redirect_uri"],
+        "authorize_url": login_info["authorize_url"],
+        "state": login_info["state"],
+        "client": cloud_client,
+    })
 
     return (
-        f"## Cloud Portal Login\n\n"
+        f"## Cloud Portal Login (manual mode)\n\n"
+        f"Automatic callback not available.\n\n"
         f"**Open this URL in your browser:**\n"
         f"{login_info['authorize_url']}\n\n"
-        f"After completing login (including MFA), copy the **full URL** from your browser's address bar\n"
-        f"(it will look like: `https://cp-cloudstaging.incortalabs.com?code=...&state=...`)\n\n"
+        f"After completing login, copy the **full URL** from your browser's address bar\n"
+        f"(it will look like: `https://cloudstaging.incortalabs.com?code=...&state=...`)\n\n"
         f"Then call this tool again with `redirect_url` set to that URL."
     )
 
@@ -524,15 +808,7 @@ def get_cloud_metadata(
     cloud_client = CloudPortalClient()
 
     try:
-        our_cluster = cloud_client.search_instances(cluster_name)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 401:
-            return (
-                "Error: Not authenticated with Cloud Portal.\n"
-                "Please call the **cloud_portal_login** tool first to log in.\n"
-                "After logging in, retry this tool."
-            )
-        return f"Error: Failed to search instances from Cloud Portal: {str(e)}"
+        user_id = cloud_client.get_user_id()
     except RuntimeError as e:
         error_msg = str(e)
         if "AUTHENTICATION_REQUIRED" in error_msg:
@@ -542,6 +818,17 @@ def get_cloud_metadata(
                 "After logging in, retry this tool."
             )
         return f"Error: {error_msg}"
+
+    try:
+        our_cluster = cloud_client.find_cluster(user_id, cluster_name)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 401:
+            return (
+                "Error: Not authenticated with Cloud Portal.\n"
+                "Please call the **cloud_portal_login** tool first to log in.\n"
+                "After logging in, retry this tool."
+            )
+        return f"Error: Failed to fetch cluster data from Cloud Portal: {str(e)}"
 
     if not our_cluster:
         return f"Error: Cluster '{cluster_name}' not found in Cloud Portal"
@@ -564,18 +851,8 @@ def get_cloud_metadata(
         "",
     ]
 
-    # Lazy-load user_id only for consumption/users (these still use user-scoped endpoints)
-    user_id = None
-    if include_consumption or include_users:
-        try:
-            user_id = cloud_client.get_user_id()
-        except RuntimeError:
-            user_id = None
-
     if include_consumption:
         try:
-            if not user_id:
-                raise RuntimeError("User ID not available — cannot fetch consumption data")
             consumption = cloud_client.get_consumption(user_id, instance_uuid)
             consumption_agg = consumption.get('consumptionAgg', {})
             total_pu = consumption_agg.get('totalAgg', 0)
@@ -618,8 +895,6 @@ def get_cloud_metadata(
 
     if include_users:
         try:
-            if not user_id:
-                raise RuntimeError("User ID not available — cannot fetch user data")
             users_data = cloud_client.get_authorized_users(user_id, cluster_name)
             users_list = users_data.get('authorizedUserRoles', [])
 
