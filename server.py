@@ -269,10 +269,13 @@ def collect_checklist_data(
     )
 
 
+_DEFAULT_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "pre_upgrade_checklist.xlsx")
+
+
 @app.tool()
 def write_checklist_excel(
     cell_values_json: str,
-    template_path: str,
+    template_path: str | None = None,
     output_path: str | None = None,
 ) -> str:
     """
@@ -285,11 +288,11 @@ def write_checklist_excel(
 
     Args:
         cell_values_json: JSON string of cell values from collect_checklist_data (the <checklist_data> block).
-        template_path: Path to the Pre-Upgrade Checklist Excel template file.
+        template_path: Path to the Pre-Upgrade Checklist Excel template file. Defaults to the bundled template.
         output_path: Path for the filled output file. Defaults to template path with '_filled' suffix.
     """
     if not template_path:
-        return "Error: template_path is required."
+        template_path = _DEFAULT_TEMPLATE_PATH
     if not os.path.exists(template_path):
         return f"Error: Template file not found at '{template_path}'"
 
