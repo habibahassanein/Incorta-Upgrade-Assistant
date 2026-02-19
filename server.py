@@ -5,6 +5,8 @@ import sys
 from typing import Literal
 
 import requests
+from starlette.requests import Request
+from starlette.responses import HTMLResponse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -358,17 +360,29 @@ def generate_upgrade_readiness_report(
         return f"Error generating readiness report: {str(e)}"
 
 
-# Module-level state for the non-blocking login flow.
-# Tracks a single pending Authorization Code + PKCE login.
+# Module-level state for the non-blocking login flows.
+# Tracks either a pending Authorization Code + PKCE login (local)
+# or a Device Code flow (headless/deployed).
 _login_state = {
     "active": False,
+    "flow": None,             # "public", "browser", or "device"
+    # Public + browser flow state
+    "state": None,            # CSRF state token
     "event": None,           # threading.Event — set when callback received
     "auth_code_holder": None, # {"code": str|None, "error": str|None}
     "code_verifier": None,
     "redirect_uri": None,
     "authorize_url": None,
-    "server": None,           # HTTPServer instance
-    "server_thread": None,    # Background daemon thread
+    "server": None,           # HTTPServer instance (browser flow only)
+    "server_thread": None,    # Background daemon thread (browser flow only)
+    # Device flow state
+    "device_code": None,
+    "verification_uri": None,
+    "user_code": None,
+    "device_expires_in": None,
+    "device_interval": None,
+    "device_started_at": None,
+    # Shared
     "client": None,           # CloudPortalClient instance
 }
 
@@ -382,6 +396,8 @@ def _cleanup_login_state():
             pass
     _login_state.update({
         "active": False,
+        "flow": None,
+        "state": None,
         "event": None,
         "auth_code_holder": None,
         "code_verifier": None,
@@ -389,8 +405,76 @@ def _cleanup_login_state():
         "authorize_url": None,
         "server": None,
         "server_thread": None,
+        "device_code": None,
+        "verification_uri": None,
+        "user_code": None,
+        "device_expires_in": None,
+        "device_interval": None,
+        "device_started_at": None,
         "client": None,
     })
+
+
+@app.custom_route("/callback", methods=["GET"])
+async def oauth_callback(request: Request) -> HTMLResponse:
+    """OAuth Authorization Code callback handler.
+
+    Receives the redirect from Auth0 after user login, validates state,
+    exchanges the code for a token, and completes the login flow.
+    Used when MCP_PUBLIC_URL is set (deployed/Cloudflare tunnel environment).
+    """
+    from clients.cloud_portal_client import CloudPortalClient as _CPC
+    params = dict(request.query_params)
+    returned_state = params.get("state")
+    error = params.get("error")
+    code = params.get("code")
+
+    def _html(status: int, title: str, body: str) -> HTMLResponse:
+        content = (
+            f"<html><head><title>{title}</title>"
+            "<style>body{{font-family:sans-serif;max-width:600px;margin:60px auto;text-align:center}}"
+            "h2{{color:#333}}p{{color:#666}}</style></head>"
+            f"<body><h2>{title}</h2><p>{body}</p></body></html>"
+        )
+        return HTMLResponse(content=content, status_code=status)
+
+    if not _login_state["active"] or _login_state.get("flow") != "public":
+        return _html(400, "Login Error", "No active login flow. Please start login from Claude again.")
+
+    expected_state = _login_state.get("state")
+    if returned_state != expected_state:
+        _cleanup_login_state()
+        return _html(400, "Login Failed", "State mismatch — possible CSRF attack. Please try again.")
+
+    if error:
+        error_desc = params.get("error_description", error)
+        _login_state["auth_code_holder"] = {"code": None, "error": error_desc}
+        if _login_state.get("event"):
+            _login_state["event"].set()
+        return _html(400, "Login Failed", f"{error_desc}")
+
+    if not code:
+        _login_state["auth_code_holder"] = {"code": None, "error": "No authorization code received"}
+        if _login_state.get("event"):
+            _login_state["event"].set()
+        return _html(400, "Login Failed", "No authorization code received. Please try again.")
+
+    # Exchange code for token immediately in the callback
+    client = _login_state.get("client") or _CPC()
+    code_verifier = _login_state["code_verifier"]
+    redirect_uri = _login_state["redirect_uri"]
+    try:
+        client.exchange_code_for_token(code, redirect_uri, code_verifier)
+        _login_state["auth_code_holder"] = {"code": code, "error": None}
+        if _login_state.get("event"):
+            _login_state["event"].set()
+        return _html(200, "Login Successful",
+                     "You are now logged in. You can close this tab and return to Claude.")
+    except RuntimeError as e:
+        _login_state["auth_code_holder"] = {"code": None, "error": str(e)}
+        if _login_state.get("event"):
+            _login_state["event"].set()
+        return _html(500, "Login Failed", f"Token exchange failed: {e}")
 
 
 @app.tool()
@@ -403,10 +487,14 @@ def cloud_portal_login() -> str:
     WHEN TO USE: Call this when get_cloud_metadata returns an authentication error.
     The user must visit the returned URL in their browser to complete login.
 
-    Args:
-        public_url: The public URL of this MCP server (e.g. your Cloudflare tunnel URL).
-                    Defaults to MCP_PUBLIC_URL env var.
+    Supports three environments automatically:
+    - Deployed with MCP_PUBLIC_URL set: redirect goes to {MCP_PUBLIC_URL}/callback
+    - Local development: redirect goes to localhost:8910/callback
+    - Headless fallback: Device Code Flow (no callback server needed)
+
+    Call this tool again after completing login to confirm.
     """
+    import time as _time
     cloud_client = CloudPortalClient()
 
     # 1. Check if already authenticated with a valid token
@@ -439,69 +527,220 @@ def cloud_portal_login() -> str:
 
     # 3. If a login flow is active, check for completion
     if _login_state["active"]:
-        event = _login_state["event"]
-        if event and event.is_set():
-            # Callback received — exchange code for token
-            holder = _login_state["auth_code_holder"]
-            code_verifier = _login_state["code_verifier"]
-            redirect_uri = _login_state["redirect_uri"]
+        flow = _login_state.get("flow")
+
+        if flow == "device":
+            # Poll device code flow once
+            device_code = _login_state["device_code"]
             client = _login_state["client"] or cloud_client
+            started_at = _login_state["device_started_at"] or 0
+            expires_in = _login_state["device_expires_in"] or 900
 
-            if holder.get("error"):
-                err = holder["error"]
+            if _time.time() > started_at + expires_in:
                 _cleanup_login_state()
-                return f"## Login Failed\n\n{err}"
-
-            auth_code = holder.get("code")
-            if not auth_code:
-                _cleanup_login_state()
-                return "## Login Failed\n\nNo authorization code received."
-
-            _cleanup_login_state()
+                return (
+                    "## Login Expired\n\n"
+                    "The device code has expired. Call this tool again to start a new login."
+                )
 
             try:
-                client.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
-                user_id = client.get_user_id()
-                return (
-                    f"## Cloud Portal Login Successful\n\n"
-                    f"- **User ID:** `{user_id}`\n"
-                    f"- Token cached and will auto-refresh.\n"
-                    f"\nYou can now use `get_cloud_metadata` to query your clusters."
+                from clients.cloud_portal_client import AUTH0_DOMAIN, AUTH0_CLIENT_ID
+                response = requests.post(
+                    f"https://{AUTH0_DOMAIN}/oauth/token",
+                    json={
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                        "device_code": device_code,
+                        "client_id": AUTH0_CLIENT_ID,
+                    },
+                    headers={"Content-Type": "application/json"},
+                    timeout=15,
                 )
-            except RuntimeError as e:
-                return f"## Login Failed\n\nToken exchange error: {str(e)}"
-        else:
-            # Still waiting for user to complete login
-            return (
-                f"## Login In Progress\n\n"
-                f"Still waiting for you to complete login.\n\n"
-                f"**Open this URL if you haven't already:**\n"
-                f"{_login_state['authorize_url']}\n\n"
-                f"After completing login in the browser, call this tool again."
-            )
 
-    # 4. No active flow — start a new one
+                if response.status_code == 200:
+                    data = response.json()
+                    access_token = data.get("access_token")
+                    refresh_token = data.get("refresh_token")
+                    if access_token:
+                        client.bearer_token = access_token
+                        client.refresh_token = refresh_token
+                        client._save_token(access_token, refresh_token)
+                        _cleanup_login_state()
+                        try:
+                            user_id = client.get_user_id()
+                        except RuntimeError:
+                            user_id = "unknown"
+                        return (
+                            f"## Cloud Portal Login Successful\n\n"
+                            f"- **User ID:** `{user_id}`\n"
+                            f"- Token cached and will auto-refresh.\n"
+                            f"\nYou can now use `get_cloud_metadata` to query your clusters."
+                        )
+
+                error = response.json().get("error", "")
+                if error == "authorization_pending":
+                    return (
+                        f"## Login In Progress\n\n"
+                        f"Still waiting for you to complete login.\n\n"
+                        f"1. Visit: **{_login_state['verification_uri']}**\n"
+                        f"2. Enter code: **`{_login_state['user_code']}`**\n\n"
+                        f"After approving, call this tool again to confirm."
+                    )
+                elif error == "slow_down":
+                    return (
+                        f"## Login In Progress\n\n"
+                        f"Please wait a moment before calling again.\n\n"
+                        f"1. Visit: **{_login_state['verification_uri']}**\n"
+                        f"2. Enter code: **`{_login_state['user_code']}`**"
+                    )
+                elif error in ("expired_token", "access_denied"):
+                    _cleanup_login_state()
+                    return f"## Login Failed\n\n{error.replace('_', ' ').capitalize()}. Call this tool again to restart."
+                else:
+                    _cleanup_login_state()
+                    return f"## Login Failed\n\nUnexpected error: {error}. Call this tool again to restart."
+
+            except Exception as e:
+                return f"## Login Check Failed\n\n{str(e)}\n\nCall this tool again to retry."
+
+        elif flow in ("public", "browser"):
+            # Check if the callback route (public) or local server (browser) completed
+            event = _login_state.get("event")
+            holder = _login_state.get("auth_code_holder") or {}
+
+            if event and event.is_set():
+                if holder.get("error"):
+                    err = holder["error"]
+                    _cleanup_login_state()
+                    return f"## Login Failed\n\n{err}"
+
+                # For "public" flow, token was already exchanged in the /callback route
+                if flow == "public":
+                    _cleanup_login_state()
+                    try:
+                        # Reload client to pick up the saved token
+                        fresh_client = CloudPortalClient()
+                        user_id = fresh_client.get_user_id()
+                    except RuntimeError:
+                        user_id = "unknown"
+                    return (
+                        f"## Cloud Portal Login Successful\n\n"
+                        f"- **User ID:** `{user_id}`\n"
+                        f"- Token cached and will auto-refresh.\n"
+                        f"\nYou can now use `get_cloud_metadata` to query your clusters."
+                    )
+
+                # "browser" flow: exchange code now
+                auth_code = holder.get("code")
+                if not auth_code:
+                    _cleanup_login_state()
+                    return "## Login Failed\n\nNo authorization code received."
+
+                client = _login_state.get("client") or cloud_client
+                code_verifier = _login_state["code_verifier"]
+                redirect_uri = _login_state["redirect_uri"]
+                _cleanup_login_state()
+
+                try:
+                    client.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
+                    user_id = client.get_user_id()
+                    return (
+                        f"## Cloud Portal Login Successful\n\n"
+                        f"- **User ID:** `{user_id}`\n"
+                        f"- Token cached and will auto-refresh.\n"
+                        f"\nYou can now use `get_cloud_metadata` to query your clusters."
+                    )
+                except RuntimeError as e:
+                    return f"## Login Failed\n\nToken exchange error: {str(e)}"
+            else:
+                # Still waiting
+                authorize_url = _login_state.get("authorize_url", "")
+                return (
+                    f"## Login In Progress\n\n"
+                    f"Still waiting for you to complete login.\n\n"
+                    f"**Open this URL if you haven't already:**\n"
+                    f"{authorize_url}\n\n"
+                    f"After completing login in the browser, call this tool again."
+                )
+
+    # 4. No active flow — determine which flow to use and start it
+    public_url = os.getenv("MCP_PUBLIC_URL", "").rstrip("/")
+
+    if public_url:
+        # Deployed with Cloudflare tunnel: use public callback URL
+        redirect_uri = f"{public_url}/callback"
+        login_info = cloud_client.build_authorize_url(redirect_uri)
+        event = __import__("threading").Event()
+
+        _login_state.update({
+            "active": True,
+            "flow": "public",
+            "state": login_info["state"],
+            "code_verifier": login_info["code_verifier"],
+            "redirect_uri": redirect_uri,
+            "authorize_url": login_info["authorize_url"],
+            "auth_code_holder": {"code": None, "error": None},
+            "event": event,
+            "client": cloud_client,
+        })
+
+        return (
+            f"## Cloud Portal Login\n\n"
+            f"**Open this URL in your browser to log in:**\n"
+            f"{login_info['authorize_url']}\n\n"
+            f"After completing login, **call this tool again** to confirm."
+        )
+
+    if not cloud_client._is_headless():
+        # Local development: use localhost callback server
+        try:
+            login_info = cloud_client.login_for_mcp()
+        except RuntimeError as e:
+            return f"## Login Error\n\n{str(e)}"
+
+        _login_state.update({
+            "active": True,
+            "flow": "browser",
+            "event": login_info["event"],
+            "auth_code_holder": login_info["auth_code_holder"],
+            "code_verifier": login_info["code_verifier"],
+            "redirect_uri": login_info["redirect_uri"],
+            "authorize_url": login_info["authorize_url"],
+            "server": login_info["server"],
+            "server_thread": login_info["server_thread"],
+            "client": cloud_client,
+        })
+
+        return (
+            f"## Cloud Portal Login\n\n"
+            f"**Open this URL in your browser:**\n"
+            f"{login_info['authorize_url']}\n\n"
+            f"Complete login (including MFA if required), then **call this tool again** to confirm.\n"
+        )
+
+    # Headless fallback: Device Code Flow
     try:
-        login_info = cloud_client.login_for_mcp()
+        device_info = cloud_client.device_login()
     except RuntimeError as e:
         return f"## Login Error\n\n{str(e)}"
 
-    # Store state for subsequent calls
-    _login_state["active"] = True
-    _login_state["event"] = login_info["event"]
-    _login_state["auth_code_holder"] = login_info["auth_code_holder"]
-    _login_state["code_verifier"] = login_info["code_verifier"]
-    _login_state["redirect_uri"] = login_info["redirect_uri"]
-    _login_state["authorize_url"] = login_info["authorize_url"]
-    _login_state["server"] = login_info["server"]
-    _login_state["server_thread"] = login_info["server_thread"]
-    _login_state["client"] = cloud_client
+    _login_state.update({
+        "active": True,
+        "flow": "device",
+        "device_code": device_info["device_code"],
+        "verification_uri": device_info["verification_uri"],
+        "user_code": device_info["user_code"],
+        "device_expires_in": device_info["expires_in"],
+        "device_interval": device_info["interval"],
+        "device_started_at": _time.time(),
+        "client": cloud_client,
+    })
 
     return (
-        f"## Cloud Portal Login\n\n"
-        f"**Open this URL in your browser:**\n"
-        f"{login_info['authorize_url']}\n\n"
-        f"Complete login (including MFA if required), then **call this tool again** to confirm.\n"
+        f"## Cloud Portal Login (Device Code)\n\n"
+        f"**Step 1:** Open this URL in your browser:\n"
+        f"{device_info['verification_uri']}\n\n"
+        f"**Step 2:** The code is pre-filled in the URL above. Just approve the login.\n\n"
+        f"After approving, **call this tool again** to confirm login."
     )
 
 
