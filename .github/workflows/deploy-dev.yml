@@ -26,26 +26,7 @@ jobs:
 
       # --- Full rebuild (only when Dockerfile or requirements.txt change) ---
 
-      - name: Set up Docker Buildx
-        if: steps.deps.outputs.changed == 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to DockerHub
-        if: steps.deps.outputs.changed == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        if: steps.deps.outputs.changed == 'true'
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/incorta-upgrade-agent:latest
-
-      - name: Deploy new image to VM
+      - name: Full rebuild and redeploy on VM
         if: steps.deps.outputs.changed == 'true'
         uses: appleboy/ssh-action@v1
         with:
@@ -54,19 +35,30 @@ jobs:
           key: ${{ secrets.VM_SSH_KEY }}
           port: ${{ secrets.VM_PORT }}
           script: |
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/incorta-upgrade-agent:latest
-            docker stop incorta-upgrade-agent || true
-            docker rm incorta-upgrade-agent || true
-            mkdir -p /opt/incorta-upgrade-agent/data
-            docker run -d --name incorta-upgrade-agent -p 8000:8080 \
-              --env-file ${{ secrets.ENV_FILE_PATH }} \
-              -v /opt/incorta-upgrade-agent/app:/app \
-              -v /opt/incorta-upgrade-agent/data:/app/data \
-              ${{ secrets.DOCKERHUB_USERNAME }}/incorta-upgrade-agent:latest
-            # Seed the volume with the latest code
-            docker cp incorta-upgrade-agent:/app/. /opt/incorta-upgrade-agent/app/ 2>/dev/null || true
-            cd /opt/incorta-upgrade-agent/app && git init && git remote add origin https://github.com/${{ github.repository }}.git 2>/dev/null || true
-            cd /opt/incorta-upgrade-agent/app && git fetch origin master && git reset --hard origin/master
+            # Pull latest code
+            cd /opt/incorta-upgrade-assistant
+            if [ ! -d .git ]; then
+              git init
+              git remote add origin https://github.com/${{ github.repository }}.git
+            fi
+            git fetch origin master
+            git reset --hard origin/master
+
+            # Build new image
+            docker build -t incorta-upgrade-assistant:latest .
+
+            # Stop and remove old container
+            docker stop incorta-upgrade-assistant || true
+            docker rm incorta-upgrade-assistant || true
+
+            # Start new container with same env vars and port
+            mkdir -p /opt/incorta-upgrade-assistant/data
+            docker run -d --name incorta-upgrade-assistant \
+              --restart unless-stopped \
+              -p 9094:8080 \
+              --env-file /opt/incorta-upgrade-assistant/.env \
+              -v /opt/incorta-upgrade-assistant/data:/app/data \
+              incorta-upgrade-assistant:latest
 
       # --- Hot reload (code-only changes, no Docker rebuild) ---
 
@@ -79,17 +71,15 @@ jobs:
           key: ${{ secrets.VM_SSH_KEY }}
           port: ${{ secrets.VM_PORT }}
           script: |
-            # Pull latest code into the mounted volume
-            cd /opt/incorta-upgrade-agent/app
-
-            # Initialize git repo if first run
+            # Pull latest code
+            cd /opt/incorta-upgrade-assistant
             if [ ! -d .git ]; then
               git init
               git remote add origin https://github.com/${{ github.repository }}.git
             fi
-
             git fetch origin master
             git reset --hard origin/master
 
-            # Restart the container to pick up changes
-            docker restart incorta-upgrade-agent
+            # Copy updated code into the running container and restart
+            docker cp /opt/incorta-upgrade-assistant/. incorta-upgrade-assistant:/app/
+            docker restart incorta-upgrade-assistant
