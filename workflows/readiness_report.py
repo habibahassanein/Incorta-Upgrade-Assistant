@@ -149,7 +149,12 @@ def collect_cloud_data(state: ReadinessState) -> ReadinessState:
             "min_executors": cluster.get("minExecutors"),
             "max_executors": cluster.get("maxExecutors"),
         }
-        return {**state, "cloud_metadata": cloud_meta}
+        # Auto-detect from_version from cloud build if not already provided
+        from_version = state.get("from_version", "")
+        if not from_version and cloud_meta.get("build"):
+            from_version = cloud_meta["build"]
+
+        return {**state, "cloud_metadata": cloud_meta, "from_version": from_version}
     except Exception as e:
         errors.append(f"Cloud data collection failed: {e}")
         return {**state, "cloud_metadata": {}, "errors": errors}
@@ -476,9 +481,9 @@ def _build_workflow():
     workflow.add_node("assess", assess_readiness)
     workflow.add_node("report", generate_report)
 
-    workflow.set_entry_point("collect_cmc")
-    workflow.add_edge("collect_cmc", "collect_cloud")
-    workflow.add_edge("collect_cloud", "collect_knowledge")
+    workflow.set_entry_point("collect_cloud")
+    workflow.add_edge("collect_cloud", "collect_cmc")
+    workflow.add_edge("collect_cmc", "collect_knowledge")
     workflow.add_edge("collect_knowledge", "collect_research")
     workflow.add_edge("collect_research", "collect_checklist")
     workflow.add_edge("collect_checklist", "assess")
@@ -495,7 +500,6 @@ def _build_workflow():
 def run_readiness_report(
     cmc_cluster_name: str,
     to_version: str,
-    from_version: str = "",
     cloud_cluster_name: str = "",
 ) -> str:
     """Run the full readiness report workflow.
@@ -503,7 +507,6 @@ def run_readiness_report(
     Args:
         cmc_cluster_name: CMC cluster name (e.g., 'customCluster')
         to_version: Target Incorta version (e.g., '2024.7.0')
-        from_version: Current version (optional, auto-detected if empty)
         cloud_cluster_name: Cloud Portal cluster name (optional, inferred from CMC_URL)
 
     Returns:
@@ -512,7 +515,7 @@ def run_readiness_report(
     initial_state = {
         "cmc_cluster_name": cmc_cluster_name,
         "cloud_cluster_name": cloud_cluster_name,
-        "from_version": from_version,
+        "from_version": "",  # Auto-detected from Cloud Portal in collect_cloud node
         "to_version": to_version,
         "cluster_data": {},
         "cluster_metadata": {},

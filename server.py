@@ -353,7 +353,6 @@ def generate_upgrade_readiness_report(
         return run_readiness_report(
             cmc_cluster_name=cmc_cluster_name,
             to_version=to_version,
-            from_version=from_version,
             cloud_cluster_name=cloud_cluster_name or "",
         )
     except Exception as e:
