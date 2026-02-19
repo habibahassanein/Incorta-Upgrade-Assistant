@@ -455,6 +455,45 @@ class CloudPortalClient:
     # Non-blocking OAuth login for MCP tool use
     # ------------------------------------------------------------------
 
+    def build_authorize_url(self, redirect_uri: str):
+        """Build an OAuth Authorization Code + PKCE authorize URL.
+
+        Use this when the callback will be handled externally (e.g., by a
+        custom route on the MCP server itself). No local HTTP server is started.
+
+        Args:
+            redirect_uri: The redirect URI Auth0 will send the code to.
+
+        Returns:
+            dict with keys:
+                - authorize_url (str): URL the user must open in their browser
+                - state (str): CSRF state token (caller must store and validate)
+                - code_verifier (str): PKCE code verifier for token exchange
+                - redirect_uri (str): The redirect URI used
+        """
+        state = secrets.token_urlsafe(32)
+        code_verifier = self._generate_code_verifier()
+        code_challenge = self._generate_code_challenge(code_verifier)
+
+        authorize_params = {
+            "response_type": "code",
+            "client_id": AUTH0_CLIENT_ID,
+            "redirect_uri": redirect_uri,
+            "audience": AUTH0_AUDIENCE,
+            "scope": AUTH0_SCOPES,
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+        authorize_url = f"https://{AUTH0_DOMAIN}/authorize?{urlencode(authorize_params)}"
+
+        return {
+            "authorize_url": authorize_url,
+            "state": state,
+            "code_verifier": code_verifier,
+            "redirect_uri": redirect_uri,
+        }
+
     def login_for_mcp(self):
         """Start Authorization Code + PKCE flow for MCP tool use.
 

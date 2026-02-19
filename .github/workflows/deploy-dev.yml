@@ -57,9 +57,11 @@ jobs:
             docker pull ${{ secrets.DOCKERHUB_USERNAME }}/incorta-upgrade-agent:latest
             docker stop incorta-upgrade-agent || true
             docker rm incorta-upgrade-agent || true
+            mkdir -p /opt/incorta-upgrade-agent/data
             docker run -d --name incorta-upgrade-agent -p 8000:8080 \
               --env-file ${{ secrets.ENV_FILE_PATH }} \
               -v /opt/incorta-upgrade-agent/app:/app \
+              -v /opt/incorta-upgrade-agent/data:/app/data \
               ${{ secrets.DOCKERHUB_USERNAME }}/incorta-upgrade-agent:latest
             # Seed the volume with the latest code
             docker cp incorta-upgrade-agent:/app/. /opt/incorta-upgrade-agent/app/ 2>/dev/null || true
