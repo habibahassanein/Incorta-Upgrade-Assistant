@@ -34,13 +34,13 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           port: ${{ secrets.VM_PORT }}
+          envs: GITHUB_TOKEN,GITHUB_REPOSITORY
           script: |
-            # Pull latest code
+            # Pull latest code (use token for private repo access)
             cd /opt/incorta-upgrade-assistant
-            if [ ! -d .git ]; then
-              git init
-              git remote add origin https://github.com/${{ github.repository }}.git
-            fi
+            git init 2>/dev/null || true
+            git remote remove origin 2>/dev/null || true
+            git remote add origin https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
             git fetch origin master
             git reset --hard origin/master
 
@@ -70,13 +70,13 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           port: ${{ secrets.VM_PORT }}
+          envs: GITHUB_TOKEN,GITHUB_REPOSITORY
           script: |
-            # Pull latest code
+            # Pull latest code (use token for private repo access)
             cd /opt/incorta-upgrade-assistant
-            if [ ! -d .git ]; then
-              git init
-              git remote add origin https://github.com/${{ github.repository }}.git
-            fi
+            git init 2>/dev/null || true
+            git remote remove origin 2>/dev/null || true
+            git remote add origin https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
             git fetch origin master
             git reset --hard origin/master
 
