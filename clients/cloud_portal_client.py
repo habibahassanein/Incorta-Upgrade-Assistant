@@ -35,7 +35,7 @@ AUTH0_SCOPES = (
     "offline_access"
 )
 CALLBACK_PORT = int(os.getenv("AUTH0_CALLBACK_PORT", "8910"))
-CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cp-cloudstaging.incortalabs.com")
+CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
 TOKEN_CACHE_PATH = Path(os.getenv("TOKEN_CACHE_PATH", str(Path.home() / ".incorta_cloud_token.json")))
 
 
