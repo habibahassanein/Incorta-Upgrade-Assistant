@@ -16,12 +16,11 @@ load_dotenv()
 from mcp.server.fastmcp import FastMCP
 
 from workflows.pre_upgrade_validation import run_validation
-from workflows.upgrade_research import research_upgrade_path
 from tools.qdrant_tool import search_knowledge_base
 from tools.incorta_tools import query_zendesk, query_jira, get_zendesk_schema, get_jira_schema
 from tools.extract_cluster_metadata import extract_cluster_metadata, format_metadata_report
 from clients.cloud_portal_client import CloudPortalClient, infer_cloud_cluster_name
-from workflows.checklist_workflow import run_collect_checklist_data, run_write_checklist_excel
+from workflows.checklist_workflow import run_write_checklist_excel
 from workflows.readiness_report import run_readiness_report
 
 
@@ -108,25 +107,6 @@ def extract_cluster_metadata_tool(
         markdown_report = format_metadata_report(metadata)
         json_data = json.dumps(metadata, indent=2)
         return f"{markdown_report}\n\n---\n\n## Raw Metadata (JSON)\n\n```json\n{json_data}\n```"
-
-
-@app.tool()
-def research_upgrade_path_tool(from_version: str, to_version: str) -> str:
-    """
-    [STEP 2 - VERSION RESEARCH] Research upgrade path between two Incorta versions.
-    Uses semantic search to find release notes, known issues, and community experiences.
-
-    CRITICAL: For customer-specific recommendations, use 'search_upgrade_knowledge' multiple times instead
-    to build a SEQUENTIAL path ordered by RELEASE DATE (not version number).
-    Example: 2024.1.x (Jan) comes BEFORE 2024.7.x (Oct) even though 7 > 1.
-
-    USE THIS TOOL FOR: Quick research of a single upgrade path (non-customer-specific).
-
-    Args:
-        from_version: Current Incorta version (e.g., '2024.1.0')
-        to_version: Target Incorta version (e.g., '2024.7.0')
-    """
-    return research_upgrade_path(from_version, to_version)
 
 
 @app.tool()
@@ -227,48 +207,6 @@ def query_upgrade_issues(spark_sql: str) -> str:
     return json.dumps(result, indent=2)
 
 
-@app.tool()
-def collect_checklist_data(
-    cmc_cluster_name: str | None = None,
-    cloud_cluster_name: str | None = None,
-    from_version: str = "",
-    to_version: str = "",
-) -> str:
-    """
-    [CHECKLIST PHASE 1 - COLLECT] Collect data for the Pre-Upgrade Checklist.
-    Returns a preview table of all detected values for user review BEFORE writing to Excel.
-
-    HOW TO USE:
-    1. Call this tool with cluster names and version info
-    2. Present the returned preview table to the user
-    3. Ask the user to review and confirm or modify values
-    4. After approval, call write_checklist_excel with the JSON data
-
-    The tool collects data from CMC API, Cloud Portal API, and knowledge base.
-    Items that cannot be auto-detected show as "Not Implemented" or "N/A".
-
-    Args:
-        cmc_cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
-        cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). Defaults to CLOUD_PORTAL_CLUSTER_NAME env var.
-        from_version: Current Incorta version (e.g., '2024.1.0').
-        to_version: Target Incorta version (e.g., '2024.7.0').
-    """
-    cmc_cluster_name = cmc_cluster_name or os.getenv("CMC_CLUSTER_NAME", "")
-    cloud_cluster_name = cloud_cluster_name or os.getenv("CLOUD_PORTAL_CLUSTER_NAME", "")
-
-    if not cmc_cluster_name:
-        return "Error: No CMC cluster name provided. Set CMC_CLUSTER_NAME env var or pass cmc_cluster_name."
-    if not from_version or not to_version:
-        return "Error: Both from_version and to_version are required."
-
-    return run_collect_checklist_data(
-        cmc_cluster_name=cmc_cluster_name,
-        cloud_cluster_name=cloud_cluster_name,
-        from_version=from_version,
-        to_version=to_version,
-    )
-
-
 _DEFAULT_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "pre_upgrade_checklist.xlsx")
 
 
@@ -279,9 +217,9 @@ def write_checklist_excel(
 ) -> str:
     """
     [CHECKLIST PHASE 2 - WRITE] Write approved checklist values into an Excel template.
-    Call this AFTER collect_checklist_data and user approval.
+    Call this with the `<checklist_data>` JSON block from `generate_upgrade_readiness_report`.
 
-    Takes the JSON data from collect_checklist_data (potentially modified by the user),
+    Takes the JSON data embedded in the readiness report output (potentially modified by the user),
     fills the bundled 'Pre-Upgrade Checklist' template, and returns the result as a
     base64-encoded Excel file. Claude Desktop will offer it as a download — no file
     paths or VM access needed.
@@ -289,7 +227,7 @@ def write_checklist_excel(
     All other sheets in the workbook are left untouched.
 
     Args:
-        cell_values_json: JSON string of cell values from collect_checklist_data (the <checklist_data> block).
+        cell_values_json: JSON string of cell values from generate_upgrade_readiness_report (the <checklist_data> block).
         filename: Suggested filename for the downloaded file. Defaults to 'pre_upgrade_checklist_filled.xlsx'.
     """
     template_path = _DEFAULT_TEMPLATE_PATH

@@ -1,9 +1,8 @@
 """
 Pre-Upgrade Checklist Workflow
 
-Two-phase workflow for filling the Pre-Upgrade Checklist Excel template:
-1. collect phase: gathers data from CMC, Cloud Portal, and knowledge base
-2. write phase: writes approved cell values into an Excel template copy
+Workflow for filling the Pre-Upgrade Checklist Excel template.
+Writes approved cell values (from generate_upgrade_readiness_report) into an Excel template copy.
 
 Only the "Pre-Upgrade Checklist" sheet is modified. All other sheets are untouched.
 """
@@ -15,8 +14,6 @@ import shutil
 import sys
 import tempfile
 from typing import TypedDict
-
-from langgraph.graph import StateGraph, END
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -42,127 +39,7 @@ class ChecklistState(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# Node 1: Collect CMC data (metadata + validation checks)
-# ---------------------------------------------------------------------------
-
-def collect_cmc_data(state: ChecklistState) -> ChecklistState:
-    """Fetch cluster data from CMC, extract metadata, and run validation checks."""
-    errors = list(state.get("errors", []))
-    try:
-        from clients.cmc_client import CMCClient
-        from tools.extract_cluster_metadata import extract_cluster_metadata
-        from tools.validation_checks import (
-            check_service_status,
-            check_memory_status,
-            check_cluster_configuration,
-            check_infrastructure_services,
-            check_node_topology,
-            check_connectors,
-            check_tenants,
-            check_email_configuration,
-            check_notebook_sqli_status,
-            check_database_migration,
-        )
-
-        client = CMCClient()
-        cluster_data = client.get_cluster(state["cmc_cluster_name"])
-
-        metadata = extract_cluster_metadata(cluster_data)
-
-        checks = {
-            "Service Status": check_service_status(cluster_data),
-            "Memory Status": check_memory_status(cluster_data),
-            "Cluster Configuration": check_cluster_configuration(cluster_data),
-            "Infrastructure Services": check_infrastructure_services(cluster_data),
-            "Node Topology": check_node_topology(cluster_data),
-            "Connectors": check_connectors(cluster_data),
-            "Tenants": check_tenants(cluster_data),
-            "Email Configuration": check_email_configuration(cluster_data),
-            "Notebook & SQLi": check_notebook_sqli_status(cluster_data),
-            "Database Migration": check_database_migration(cluster_data),
-        }
-
-        return {**state, "cluster_metadata": metadata, "validation_checks": checks}
-    except Exception as e:
-        errors.append(f"CMC data collection failed: {str(e)}")
-        return {**state, "cluster_metadata": {}, "validation_checks": {}, "errors": errors}
-
-
-# ---------------------------------------------------------------------------
-# Node 2: Collect Cloud Portal data
-# ---------------------------------------------------------------------------
-
-def collect_cloud_data(state: ChecklistState) -> ChecklistState:
-    """Fetch cloud metadata from Cloud Portal API. Fault-tolerant."""
-    errors = list(state.get("errors", []))
-
-    if not state.get("cloud_cluster_name"):
-        errors.append("Cloud cluster name not provided — skipping cloud data")
-        return {**state, "cloud_metadata": {}, "errors": errors}
-
-    try:
-        from clients.cloud_portal_client import CloudPortalClient
-
-        cloud_client = CloudPortalClient()
-        user_id = cloud_client.get_user_id()
-        cluster = cloud_client.find_cluster(user_id, state["cloud_cluster_name"])
-
-        if not cluster:
-            errors.append(f"Cloud cluster '{state['cloud_cluster_name']}' not found")
-            return {**state, "cloud_metadata": {}, "errors": errors}
-
-        cloud_meta = {
-            "spark_version": cluster.get("incortaSparkVersion"),
-            "python_version": cluster.get("pythonVersion"),
-            "build": cluster.get("customBuild"),
-            "build_id": cluster.get("customBuildID"),
-            "platform": cluster.get("platform"),
-            "region": cluster.get("region"),
-            "status": cluster.get("status"),
-            "data_size_gb": cluster.get("dsize"),
-            "loader_size_gb": cluster.get("dsizeLoader"),
-            "cmc_size_gb": cluster.get("dsizeCmc"),
-            "available_disk_gb": cluster.get("availableDisk"),
-            "consumed_data_gb": cluster.get("consumedData"),
-            "data_agent_enabled": cluster.get("enableDataAgent", False),
-            "min_executors": cluster.get("minExecutors"),
-            "max_executors": cluster.get("maxExecutors"),
-        }
-
-        return {**state, "cloud_metadata": cloud_meta}
-    except Exception as e:
-        errors.append(f"Cloud data collection failed: {str(e)}")
-        return {**state, "cloud_metadata": {}, "errors": errors}
-
-
-# ---------------------------------------------------------------------------
-# Node 3: Collect upgrade knowledge
-# ---------------------------------------------------------------------------
-
-def collect_upgrade_knowledge(state: ChecklistState) -> ChecklistState:
-    """Search knowledge base for upgrade considerations between versions."""
-    errors = list(state.get("errors", []))
-
-    from_v = state.get("from_version", "")
-    to_v = state.get("to_version", "")
-    if not from_v or not to_v:
-        return {**state, "upgrade_knowledge": []}
-
-    try:
-        from tools.qdrant_tool import search_knowledge_base
-
-        query = f"upgrade considerations from {from_v} to {to_v}"
-        result = search_knowledge_base({"query": query, "limit": 10})
-        knowledge = result.get("results", []) if isinstance(result, dict) else []
-
-        return {**state, "upgrade_knowledge": knowledge}
-    except Exception as e:
-        errors.append(f"Upgrade knowledge search failed: {str(e)}")
-        return {**state, "upgrade_knowledge": [], "errors": errors}
-
-
-# ---------------------------------------------------------------------------
-# Node 4: Map collected data to cell values
+# Map collected data to cell values (used internally by readiness_report.py)
 # ---------------------------------------------------------------------------
 
 def map_data_to_cells(state: ChecklistState) -> ChecklistState:
@@ -364,102 +241,7 @@ def map_data_to_cells(state: ChecklistState) -> ChecklistState:
 
 
 # ---------------------------------------------------------------------------
-# Build collection workflow (nodes 1-4)
-# ---------------------------------------------------------------------------
-
-def _build_collect_workflow():
-    workflow = StateGraph(ChecklistState)
-    workflow.add_node("collect_cmc", collect_cmc_data)
-    workflow.add_node("collect_cloud", collect_cloud_data)
-    workflow.add_node("collect_knowledge", collect_upgrade_knowledge)
-    workflow.add_node("map_cells", map_data_to_cells)
-
-    workflow.set_entry_point("collect_cmc")
-    workflow.add_edge("collect_cmc", "collect_cloud")
-    workflow.add_edge("collect_cloud", "collect_knowledge")
-    workflow.add_edge("collect_knowledge", "map_cells")
-    workflow.add_edge("map_cells", END)
-
-    return workflow.compile()
-
-
-_collect_workflow = _build_collect_workflow()
-
-
-# ---------------------------------------------------------------------------
-# Public entry: Phase 1 — collect data and return preview
-# ---------------------------------------------------------------------------
-
-def run_collect_checklist_data(
-    cmc_cluster_name: str,
-    cloud_cluster_name: str,
-    from_version: str,
-    to_version: str,
-) -> str:
-    """Run collection workflow and return markdown preview + JSON cell values.
-
-    Returns a string with:
-    - Markdown table preview of all detected values
-    - JSON block of cell_values for passing to write_checklist_excel
-    """
-    initial_state = {
-        "cmc_cluster_name": cmc_cluster_name,
-        "cloud_cluster_name": cloud_cluster_name,
-        "from_version": from_version,
-        "to_version": to_version,
-        "template_path": "",
-        "output_path": "",
-        "cluster_metadata": {},
-        "validation_checks": {},
-        "cloud_metadata": {},
-        "upgrade_knowledge": [],
-        "cell_values": {},
-        "errors": [],
-        "report": "",
-    }
-
-    result = _collect_workflow.invoke(initial_state)
-
-    cell_values = result.get("cell_values", {})
-    errors = result.get("errors", [])
-
-    # Build markdown preview table
-    lines = [
-        "## Pre-Upgrade Checklist — Collected Data\n",
-        "| Row | Attribute | Detected Value | Status |",
-        "|-----|-----------|----------------|--------|",
-    ]
-
-    for row_num in sorted(cell_values.keys()):
-        cell = cell_values[row_num]
-        attr = cell.get("attribute", "")
-        value = cell.get("B", "").replace("\n", " | ")[:120]
-        status = cell.get("C", "")
-        lines.append(f"| {row_num} | {attr} | {value} | {status} |")
-
-    not_impl_count = sum(1 for c in cell_values.values() if c.get("B") == "Not Implemented")
-    failed_count = sum(1 for c in cell_values.values() if c.get("C") in ("Failed", "N/A"))
-
-    lines.append("")
-    lines.append(f"**Total rows filled:** {len(cell_values)}")
-    lines.append(f"**Not Implemented:** {not_impl_count}")
-    if failed_count:
-        lines.append(f"**Could not auto-detect:** {failed_count}")
-    if errors:
-        lines.append(f"\n**Errors during collection:**")
-        for e in errors:
-            lines.append(f"- {e}")
-
-    # Append JSON for the write phase
-    # Convert int keys to strings for JSON serialization
-    serializable = {str(k): v for k, v in cell_values.items()}
-    lines.append(f"\n---\n\n<checklist_data>\n{json.dumps(serializable, indent=2)}\n</checklist_data>")
-
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Public entry: Phase 2 — write approved values to Excel, return as base64
+# Public entry: Write approved values to Excel, return as base64
 # ---------------------------------------------------------------------------
 
 def run_write_checklist_excel(
