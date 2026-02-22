@@ -33,9 +33,67 @@ app = FastMCP("incorta-upgrade-agent", stateless_http=True)
 
 
 @app.tool()
+def generate_upgrade_readiness_report(
+    to_version: str,
+    cmc_cluster_name: str | None = None,
+    from_version: str = "",
+    cloud_cluster_name: str | None = None,
+) -> str:
+    """
+    [CORE - RUN FIRST] Generate a comprehensive Upgrade Readiness Report.
+    Orchestrates all data sources (CMC, Cloud Portal, knowledge base, upgrade research)
+    to produce an opinionated readiness assessment with a rating and Excel checklist data.
+
+    This is the recommended single-command way to assess upgrade readiness.
+    It runs ALL other tools internally and produces a unified report.
+
+    PREREQUISITES: For complete Cloud Portal data (Spark/Python versions, disk sizes,
+    Data Agent status, and auto-detected current version), call `cloud_portal_login`
+    first. Without it, these fields will appear as N/A in the report.
+
+    OUTPUT INCLUDES:
+    - Overall Readiness Rating: READY / READY WITH CAVEATS / NOT READY
+    - Environment summary (deployment type, DB, topology, versions)
+    - Blockers that must be resolved before upgrade
+    - Warnings to review
+    - Validation checks summary (10 health checks)
+    - Key upgrade considerations (DB migration, HA, version-specific notes)
+    - Version research (release notes, known issues)
+    - Data gaps (if any data sources failed)
+    - Pre-Upgrade Checklist JSON (for write_checklist_excel)
+
+    NEXT STEP: After getting this report, pass the <checklist_data> JSON block
+    at the bottom to `write_checklist_excel` to download the filled Excel checklist.
+
+    Args:
+        to_version: Target Incorta version (e.g., '2024.7.0'). Required.
+        cmc_cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
+        from_version: Current Incorta version (e.g., '2024.1.0'). Auto-detected from cluster if empty.
+        cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). Auto-inferred from CMC_URL if not provided.
+    """
+    # Resolve CMC cluster name
+    if cmc_cluster_name is None:
+        cmc_cluster_name = os.getenv("CMC_CLUSTER_NAME")
+        if not cmc_cluster_name:
+            return "Error: No cmc_cluster_name provided and CMC_CLUSTER_NAME env var not set."
+
+    # Resolve Cloud Portal cluster name: explicit → env var → inferred from CMC_URL
+    if cloud_cluster_name is None:
+        cloud_cluster_name = os.getenv("CLOUD_PORTAL_CLUSTER_NAME") or infer_cloud_cluster_name()
+
+    try:
+        return run_readiness_report(
+            cmc_cluster_name=cmc_cluster_name,
+            to_version=to_version,
+            cloud_cluster_name=cloud_cluster_name or "",
+        )
+    except Exception as e:
+        return f"Error generating readiness report: {str(e)}"
+
+@app.tool()
 def run_pre_upgrade_validation(cluster_name: str | None = None) -> str:
     """
-    [STEP 1 - ALWAYS RUN FIRST] Validates Incorta cluster health before upgrade.
+    [HEALTH CHECK] Validates Incorta cluster health before upgrade.
     Performs comprehensive pre-upgrade health checks including: service status (Analytics, Loader),
     memory usage, node topology, infrastructure services (Spark, Zookeeper, DB), connectors, tenants,
     email configuration, and database migration status.
@@ -54,157 +112,11 @@ def run_pre_upgrade_validation(cluster_name: str | None = None) -> str:
         cluster_name = os.getenv("CMC_CLUSTER_NAME")
         if not cluster_name:
             return "Error: No cluster_name provided and CMC_CLUSTER_NAME env var not set"
-    return run_validation(cluster_name)
-
-
-@app.tool()
-def extract_cluster_metadata_tool(
-    cluster_name: str | None = None,
-    format: Literal["json", "markdown", "both"] = "both"
-) -> str:
-    """
-    [AUTO-DETECTION] Automatically extracts upgrade-relevant metadata from cluster data.
-    Eliminates need to ask user questions - infers everything from CMC cluster JSON!
-
-    CLUSTER NAMING: This tool uses the CMC API and requires the CMC cluster name.
-    Example: If CMC shows 'customCluster', use that name (NOT the Cloud Portal name like 'habibascluster').
-
-    AUTO-DETECTS (No User Input Needed):
-    - Deployment Type: Cloud (GCP/AWS/Azure) vs On-Premises (from storage path)
-    - Database Type: MySQL/Oracle/PostgreSQL + migration requirements
-    - Topology: Typical (1 node) vs Clustered/Custom (2+ nodes), HA status
-    - Features: Notebook, Spark, SQLi, Kyuubi enabled/disabled status
-    - Infrastructure: Spark mode (K8s/External/Embedded), Zookeeper (External/Embedded)
-    - Service Status: All service states (Analytics, Loader, Notebook, SQLi)
-    - Connectors: List of enabled connectors
-    - Risk Assessment: AUTO-CLASSIFY as HIGH/MEDIUM/LOW risk based on blockers
-
-    Args:
-        cluster_name: CMC cluster name. Defaults to CMC_CLUSTER_NAME env var.
-        format: Output format - 'json', 'markdown', or 'both' (default).
-    """
-    if cluster_name is None:
-        cluster_name = os.getenv("CMC_CLUSTER_NAME")
-        if not cluster_name:
-            return "Error: No cluster_name provided and CMC_CLUSTER_NAME env var not set"
-    from clients.cmc_client import CMCClient
-    client = CMCClient()
     try:
-        cluster_data = client.get_cluster(cluster_name)
-    except (RuntimeError, requests.exceptions.RequestException) as e:
-        return f"Error: Failed to fetch cluster data from CMC: {e}"
-
-    try:
-        metadata = extract_cluster_metadata(cluster_data)
+        return run_validation(cluster_name)
     except Exception as e:
-        return f"Error: Failed to extract metadata: {e}"
+        return f"Error running pre-upgrade validation: {str(e)}"
 
-    if format == "json":
-        return json.dumps(metadata, indent=2)
-    elif format == "markdown":
-        return format_metadata_report(metadata)
-    else:  # "both" is default
-        markdown_report = format_metadata_report(metadata)
-        json_data = json.dumps(metadata, indent=2)
-        return f"{markdown_report}\n\n---\n\n## Raw Metadata (JSON)\n\n```json\n{json_data}\n```"
-
-
-@app.tool()
-def search_upgrade_knowledge(query: str, limit: int = 10) -> str:
-    """
-    [GRANULAR VERSION SEARCH] Search Incorta documentation, community, and support articles.
-    Primary tool for building customer-specific upgrade recommendations.
-
-    REQUIRED SEARCHES FOR CUSTOMER UPGRADES:
-    1. START: 'Incorta Release Support Policy' - Get ALL versions with release dates
-    2. BUILD PATH: Identify ALL versions between current -> target (ordered by release date)
-    3. FOR EACH VERSION: Search '[VERSION] release notes', '[VERSION] upgrade considerations'
-    4. DEPENDENCIES: '[VERSION] python version', '[VERSION] spark version'
-    5. TRANSITIONS: 'upgrade from [V1] to [V2]' for critical version jumps
-
-    Args:
-        query: Search query (e.g., 'Incorta Release Support Policy', '2024.7.0 release notes')
-        limit: Number of results to return (default: 10)
-    """
-    result = search_knowledge_base({"query": query, "limit": limit})
-    return json.dumps(result, indent=2)
-
-
-@app.tool()
-def get_zendesk_schema_tool() -> str:
-    """
-    [STEP 3A - BEFORE CUSTOMER TICKETS] Get Zendesk schema to understand available fields.
-    Call this BEFORE querying customer tickets to see table structure.
-
-    KEY TABLES FOR UPGRADES:
-    - ticket (44 cols): Main ticket data - id, subject, priority, status, organization_id
-    - ticket_customfields_v (15 cols): Severity, Deployment_Type, Release, Fixed_in
-    - Ticket_Current_Release (2 cols): ticket_id, custom_field_value (current version)
-    - Ticket_Target_Release (2 cols): ticket_id, custom_field_value (target version)
-    - organization (15 cols): Customer data - id, name, region
-    - ticket_jira_links (5 cols): Zendesk <-> Jira linkage
-    """
-    result = get_zendesk_schema({"fetch_schema": True})
-    return json.dumps(result, indent=2)
-
-
-@app.tool()
-def query_upgrade_tickets(spark_sql: str) -> str:
-    """
-    [STEP 3B - CUSTOMER ISSUES] Query Zendesk for customer-reported support tickets.
-    Essential for customer-specific upgrade recommendations. Schema: ZendeskTickets
-
-    Example query for customer's open issues:
-    SELECT t.id, t.subject, t.priority, t.status, tcf.Severity, o.name AS customer_name
-    FROM ZendeskTickets.ticket t
-    JOIN ZendeskTickets.organization o ON t.organization_id = o.id
-    LEFT JOIN ZendeskTickets.ticket_customfields_v tcf ON t.id = tcf.ticket_id
-    WHERE o.name LIKE '%[CUSTOMER_NAME]%'
-    AND t.status IN ('open', 'pending', 'hold')
-    ORDER BY t.priority DESC LIMIT 50
-
-    Args:
-        spark_sql: Spark SQL query to execute on ZendeskTickets schema
-    """
-    result = query_zendesk({"spark_sql": spark_sql})
-    return json.dumps(result, indent=2)
-
-
-@app.tool()
-def get_jira_schema_tool() -> str:
-    """
-    [STEP 4A - BEFORE JIRA QUERIES] Get Jira schema to understand available fields.
-    Call this BEFORE querying bugs/features to see table structure.
-
-    KEY TABLES FOR UPGRADES:
-    - Issues (324 cols): Main issue data - Key, Summary, StatusName, PriorityName, Customer
-    - IssueFixVersions (10 cols): Which versions fix each issue
-    - IssueAffectedVersions (8 cols): Versions affected by bugs
-    - IssueLinks (11 cols): Issue relationships
-    - IssueComponents (7 cols): Product areas
-    """
-    result = get_jira_schema({"fetch_schema": True})
-    return json.dumps(result, indent=2)
-
-
-@app.tool()
-def query_upgrade_issues(spark_sql: str) -> str:
-    """
-    [STEP 4B - BUG TRACKING & FIXES] Query Jira for engineering bugs, features, and fixes.
-    Critical for determining if customer's issues are fixed in target version. Schema: Jira_F
-
-    Example query for bugs fixed in target version:
-    SELECT i.Key, i.Summary, i.StatusName, ifv.Name AS fix_version
-    FROM Jira_F.Issues i
-    JOIN Jira_F.IssueFixVersions ifv ON i.Key = ifv.IssueKey
-    WHERE ifv.Name = '[TARGET_VERSION]' AND i.IssueTypeName = 'Bug'
-    ORDER BY i.PriorityName DESC LIMIT 100
-
-    Args:
-        spark_sql: Spark SQL query to execute on Jira_F schema
-    """
-    result = query_jira({"spark_sql": spark_sql})
-    return json.dumps(result, indent=2)
 
 
 _DEFAULT_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "pre_upgrade_checklist.xlsx")
@@ -216,7 +128,7 @@ def write_checklist_excel(
     filename: str = "pre_upgrade_checklist_filled.xlsx",
 ) -> str:
     """
-    [CHECKLIST PHASE 2 - WRITE] Write approved checklist values into an Excel template.
+    [EXCEL OUTPUT] Write approved checklist values into an Excel template.
     Call this with the `<checklist_data>` JSON block from `generate_upgrade_readiness_report`.
 
     Takes the JSON data embedded in the readiness report output (potentially modified by the user),
@@ -248,57 +160,6 @@ def write_checklist_excel(
     except Exception as e:
         return json.dumps({"error": f"Error writing Excel: {str(e)}"})
 
-
-@app.tool()
-def generate_upgrade_readiness_report(
-    to_version: str,
-    cmc_cluster_name: str | None = None,
-    from_version: str = "",
-    cloud_cluster_name: str | None = None,
-) -> str:
-    """
-    [ONE-SHOT REPORT] Generate a comprehensive Upgrade Readiness Report.
-    Orchestrates all data sources (CMC, Cloud Portal, knowledge base, upgrade research)
-    to produce an opinionated readiness assessment with a rating and Excel checklist data.
-
-    This is the recommended single-command way to assess upgrade readiness.
-    It runs ALL other tools internally and produces a unified report.
-
-    OUTPUT INCLUDES:
-    - Overall Readiness Rating: READY / READY WITH CAVEATS / NOT READY
-    - Environment summary (deployment type, DB, topology, versions)
-    - Blockers that must be resolved before upgrade
-    - Warnings to review
-    - Validation checks summary (10 health checks)
-    - Key upgrade considerations (DB migration, HA, version-specific notes)
-    - Version research (release notes, known issues)
-    - Data gaps (if any data sources failed)
-    - Pre-Upgrade Checklist JSON (for write_checklist_excel)
-
-    Args:
-        to_version: Target Incorta version (e.g., '2024.7.0'). Required.
-        cmc_cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
-        from_version: Current Incorta version (e.g., '2024.1.0'). Auto-detected from cluster if empty.
-        cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). Auto-inferred from CMC_URL if not provided.
-    """
-    # Resolve CMC cluster name
-    if cmc_cluster_name is None:
-        cmc_cluster_name = os.getenv("CMC_CLUSTER_NAME")
-        if not cmc_cluster_name:
-            return "Error: No cmc_cluster_name provided and CMC_CLUSTER_NAME env var not set."
-
-    # Resolve Cloud Portal cluster name: explicit → env var → inferred from CMC_URL
-    if cloud_cluster_name is None:
-        cloud_cluster_name = os.getenv("CLOUD_PORTAL_CLUSTER_NAME") or infer_cloud_cluster_name()
-
-    try:
-        return run_readiness_report(
-            cmc_cluster_name=cmc_cluster_name,
-            to_version=to_version,
-            cloud_cluster_name=cloud_cluster_name or "",
-        )
-    except Exception as e:
-        return f"Error generating readiness report: {str(e)}"
 
 
 # Module-level state for the non-blocking login flows.
@@ -421,19 +282,23 @@ async def oauth_callback(request: Request) -> HTMLResponse:
 @app.tool()
 def cloud_portal_login() -> str:
     """
-    [AUTHENTICATION] Log in to the Cloud Portal via browser-based OAuth.
-    Returns a login URL for the user to visit. After authentication, the token
-    is cached and subsequent Cloud Portal API calls will work automatically.
+    [CLOUD AUTH] Log in to the Cloud Portal via browser-based OAuth.
 
-    WHEN TO USE: Call this when get_cloud_metadata returns an authentication error.
-    The user must visit the returned URL in their browser to complete login.
+    TWO-STEP PROCESS:
+      Step 1: Call this tool — you receive a login URL. Open it in your browser and complete login.
+      Step 2: Call this tool again — it confirms login and caches the token for future calls.
+
+    After authentication, the token is cached and subsequent Cloud Portal API calls
+    will work automatically (including inside generate_upgrade_readiness_report).
+
+    WHEN TO USE: Call this BEFORE generate_upgrade_readiness_report for cloud deployments.
+    Without it, Spark/Python versions, disk sizes, and Data Agent status will be N/A.
+    Also call this when get_cloud_metadata returns an authentication error.
 
     Supports three environments automatically:
     - Deployed with MCP_PUBLIC_URL set: redirect goes to {MCP_PUBLIC_URL}/callback
     - Local development: redirect goes to localhost:8910/callback
     - Headless fallback: Device Code Flow (no callback server needed)
-
-    Call this tool again after completing login to confirm.
     """
     import time as _time
     cloud_client = CloudPortalClient()
@@ -692,7 +557,7 @@ def get_cloud_metadata(
     include_users: bool = True
 ) -> str:
     """
-    [CLOUD-SPECIFIC DATA] Get cloud metadata from Cloud Portal API.
+    [CLOUD DATA] Get cloud metadata from Cloud Portal API.
     Provides data NOT available in CMC API. Call AFTER extract_cluster_metadata.
 
     CLUSTER NAMING: This tool uses the Cloud Portal API and requires the Cloud Portal cluster name.
@@ -859,6 +724,157 @@ def get_cloud_metadata(
     ])
 
     return "\n".join(report_lines)
+
+
+
+@app.tool()
+def extract_cluster_metadata_tool(
+    cluster_name: str | None = None,
+    format: Literal["json", "markdown", "both"] = "both"
+) -> str:
+    """
+    [CLUSTER METADATA] Automatically extracts upgrade-relevant metadata from cluster data.
+    Eliminates need to ask user questions - infers everything from CMC cluster JSON!
+
+    CLUSTER NAMING: This tool uses the CMC API and requires the CMC cluster name.
+    Example: If CMC shows 'customCluster', use that name (NOT the Cloud Portal name like 'habibascluster').
+
+    AUTO-DETECTS (No User Input Needed):
+    - Deployment Type: Cloud (GCP/AWS/Azure) vs On-Premises (from storage path)
+    - Database Type: MySQL/Oracle/PostgreSQL + migration requirements
+    - Topology: Typical (1 node) vs Clustered/Custom (2+ nodes), HA status
+    - Features: Notebook, Spark, SQLi, Kyuubi enabled/disabled status
+    - Infrastructure: Spark mode (K8s/External/Embedded), Zookeeper (External/Embedded)
+    - Service Status: All service states (Analytics, Loader, Notebook, SQLi)
+    - Connectors: List of enabled connectors
+    - Risk Assessment: AUTO-CLASSIFY as HIGH/MEDIUM/LOW risk based on blockers
+
+    Args:
+        cluster_name: CMC cluster name. Defaults to CMC_CLUSTER_NAME env var.
+        format: Output format - 'json', 'markdown', or 'both' (default).
+    """
+    if cluster_name is None:
+        cluster_name = os.getenv("CMC_CLUSTER_NAME")
+        if not cluster_name:
+            return "Error: No cluster_name provided and CMC_CLUSTER_NAME env var not set"
+    from clients.cmc_client import CMCClient
+    client = CMCClient()
+    try:
+        cluster_data = client.get_cluster(cluster_name)
+    except (RuntimeError, requests.exceptions.RequestException) as e:
+        return f"Error: Failed to fetch cluster data from CMC: {e}"
+
+    try:
+        metadata = extract_cluster_metadata(cluster_data)
+    except Exception as e:
+        return f"Error: Failed to extract metadata: {e}"
+
+    if format == "json":
+        return json.dumps(metadata, indent=2)
+    elif format == "markdown":
+        return format_metadata_report(metadata)
+    else:  # "both" is default
+        markdown_report = format_metadata_report(metadata)
+        json_data = json.dumps(metadata, indent=2)
+        return f"{markdown_report}\n\n---\n\n## Raw Metadata (JSON)\n\n```json\n{json_data}\n```"
+
+
+@app.tool()
+def search_upgrade_knowledge(query: str, limit: int = 10) -> str:
+    """
+    [MANUAL RESEARCH] Search Incorta documentation, community, and support articles.
+    Primary tool for building customer-specific upgrade recommendations.
+
+    REQUIRED SEARCHES FOR CUSTOMER UPGRADES:
+    1. START: 'Incorta Release Support Policy' - Get ALL versions with release dates
+    2. BUILD PATH: Identify ALL versions between current -> target (ordered by release date)
+    3. FOR EACH VERSION: Search '[VERSION] release notes', '[VERSION] upgrade considerations'
+    4. DEPENDENCIES: '[VERSION] python version', '[VERSION] spark version'
+    5. TRANSITIONS: 'upgrade from [V1] to [V2]' for critical version jumps
+
+    Args:
+        query: Search query (e.g., 'Incorta Release Support Policy', '2024.7.0 release notes')
+        limit: Number of results to return (default: 10)
+    """
+    result = search_knowledge_base({"query": query, "limit": limit})
+    return json.dumps(result, indent=2)
+
+
+@app.tool()
+def get_zendesk_schema_tool() -> str:
+    """
+    [CUSTOMER TICKETS - SCHEMA] Get Zendesk schema to understand available fields.
+    Call this BEFORE querying customer tickets to see table structure.
+
+    KEY TABLES FOR UPGRADES:
+    - ticket (44 cols): Main ticket data - id, subject, priority, status, organization_id
+    - ticket_customfields_v (15 cols): Severity, Deployment_Type, Release, Fixed_in
+    - Ticket_Current_Release (2 cols): ticket_id, custom_field_value (current version)
+    - Ticket_Target_Release (2 cols): ticket_id, custom_field_value (target version)
+    - organization (15 cols): Customer data - id, name, region
+    - ticket_jira_links (5 cols): Zendesk <-> Jira linkage
+    """
+    result = get_zendesk_schema({"fetch_schema": True})
+    return json.dumps(result, indent=2)
+
+
+@app.tool()
+def query_upgrade_tickets(spark_sql: str) -> str:
+    """
+    [CUSTOMER TICKETS - QUERY] Query Zendesk for customer-reported support tickets.
+    Essential for customer-specific upgrade recommendations. Schema: ZendeskTickets
+
+    Example query for customer's open issues:
+    SELECT t.id, t.subject, t.priority, t.status, tcf.Severity, o.name AS customer_name
+    FROM ZendeskTickets.ticket t
+    JOIN ZendeskTickets.organization o ON t.organization_id = o.id
+    LEFT JOIN ZendeskTickets.ticket_customfields_v tcf ON t.id = tcf.ticket_id
+    WHERE o.name LIKE '%[CUSTOMER_NAME]%'
+    AND t.status IN ('open', 'pending', 'hold')
+    ORDER BY t.priority DESC LIMIT 50
+
+    Args:
+        spark_sql: Spark SQL query to execute on ZendeskTickets schema
+    """
+    result = query_zendesk({"spark_sql": spark_sql})
+    return json.dumps(result, indent=2)
+
+
+@app.tool()
+def get_jira_schema_tool() -> str:
+    """
+    [BUG TRACKING - SCHEMA] Get Jira schema to understand available fields.
+    Call this BEFORE querying bugs/features to see table structure.
+
+    KEY TABLES FOR UPGRADES:
+    - Issues (324 cols): Main issue data - Key, Summary, StatusName, PriorityName, Customer
+    - IssueFixVersions (10 cols): Which versions fix each issue
+    - IssueAffectedVersions (8 cols): Versions affected by bugs
+    - IssueLinks (11 cols): Issue relationships
+    - IssueComponents (7 cols): Product areas
+    """
+    result = get_jira_schema({"fetch_schema": True})
+    return json.dumps(result, indent=2)
+
+
+@app.tool()
+def query_upgrade_issues(spark_sql: str) -> str:
+    """
+    [BUG TRACKING - QUERY] Query Jira for engineering bugs, features, and fixes.
+    Critical for determining if customer's issues are fixed in target version. Schema: Jira_F
+
+    Example query for bugs fixed in target version:
+    SELECT i.Key, i.Summary, i.StatusName, ifv.Name AS fix_version
+    FROM Jira_F.Issues i
+    JOIN Jira_F.IssueFixVersions ifv ON i.Key = ifv.IssueKey
+    WHERE ifv.Name = '[TARGET_VERSION]' AND i.IssueTypeName = 'Bug'
+    ORDER BY i.PriorityName DESC LIMIT 100
+
+    Args:
+        spark_sql: Spark SQL query to execute on Jira_F schema
+    """
+    result = query_jira({"spark_sql": spark_sql})
+    return json.dumps(result, indent=2)
 
 
 if __name__ == "__main__":
