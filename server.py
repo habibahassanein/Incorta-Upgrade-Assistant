@@ -275,39 +275,40 @@ _DEFAULT_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__))
 @app.tool()
 def write_checklist_excel(
     cell_values_json: str,
-    template_path: str | None = None,
-    output_path: str | None = None,
+    filename: str = "pre_upgrade_checklist_filled.xlsx",
 ) -> str:
     """
     [CHECKLIST PHASE 2 - WRITE] Write approved checklist values into an Excel template.
     Call this AFTER collect_checklist_data and user approval.
 
     Takes the JSON data from collect_checklist_data (potentially modified by the user),
-    copies the Excel template, fills the 'Pre-Upgrade Checklist' sheet, and saves.
+    fills the bundled 'Pre-Upgrade Checklist' template, and returns the result as a
+    base64-encoded Excel file. Claude Desktop will offer it as a download — no file
+    paths or VM access needed.
+
     All other sheets in the workbook are left untouched.
 
     Args:
         cell_values_json: JSON string of cell values from collect_checklist_data (the <checklist_data> block).
-        template_path: Path to the Pre-Upgrade Checklist Excel template file. Defaults to the bundled template.
-        output_path: Path for the filled output file. Defaults to template path with '_filled' suffix.
+        filename: Suggested filename for the downloaded file. Defaults to 'pre_upgrade_checklist_filled.xlsx'.
     """
-    if not template_path:
-        template_path = _DEFAULT_TEMPLATE_PATH
-    if not os.path.exists(template_path):
-        return f"Error: Template file not found at '{template_path}'"
+    template_path = _DEFAULT_TEMPLATE_PATH
 
-    if not output_path:
-        base, ext = os.path.splitext(template_path)
-        output_path = f"{base}_filled{ext}"
+    if not os.path.exists(template_path):
+        return json.dumps({
+            "error": f"Bundled template not found at '{template_path}'. "
+                     "Ensure pre_upgrade_checklist.xlsx is in the templates/ directory."
+        })
 
     try:
-        return run_write_checklist_excel(
+        result = run_write_checklist_excel(
             cell_values_json=cell_values_json,
             template_path=template_path,
-            output_path=output_path,
+            filename=filename,
         )
+        return json.dumps(result)
     except Exception as e:
-        return f"Error writing Excel: {str(e)}"
+        return json.dumps({"error": f"Error writing Excel: {str(e)}"})
 
 
 @app.tool()

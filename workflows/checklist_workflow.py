@@ -8,10 +8,12 @@ Two-phase workflow for filling the Pre-Upgrade Checklist Excel template:
 Only the "Pre-Upgrade Checklist" sheet is modified. All other sheets are untouched.
 """
 
+import base64
 import json
 import os
 import shutil
 import sys
+import tempfile
 from typing import TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -457,25 +459,31 @@ def run_collect_checklist_data(
 
 
 # ---------------------------------------------------------------------------
-# Public entry: Phase 2 — write approved values to Excel
+# Public entry: Phase 2 — write approved values to Excel, return as base64
 # ---------------------------------------------------------------------------
 
 def run_write_checklist_excel(
     cell_values_json: str,
     template_path: str,
-    output_path: str,
-) -> str:
+    filename: str = "pre_upgrade_checklist_filled.xlsx",
+) -> dict:
     """Write approved cell values into a copy of the Excel template.
 
     Only modifies the 'Pre-Upgrade Checklist' sheet. All other sheets untouched.
+    Writes to a temporary file, encodes as base64, and returns the encoded bytes
+    so the caller can offer it as a download — no output path needed.
 
     Args:
         cell_values_json: JSON string of {row_num: {"B": value, "C": status}}
         template_path: Path to the Excel template file
-        output_path: Path for the filled output file
+        filename: Suggested filename for the download
 
     Returns:
-        Summary report string
+        dict with keys:
+            - "type": "excel"
+            - "filename": suggested download filename
+            - "base64": base64-encoded .xlsx bytes
+            - "summary": human-readable summary string
     """
     from openpyxl import load_workbook
     from openpyxl.styles import PatternFill, Alignment
@@ -484,53 +492,69 @@ def run_write_checklist_excel(
     raw = json.loads(cell_values_json)
     cell_values = {int(k): v for k, v in raw.items()}
 
-    # Copy template
-    shutil.copy2(template_path, output_path)
+    # Write into a temp file so we never need a caller-supplied output path
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp_path = tmp.name
 
-    wb = load_workbook(output_path)
-    ws = wb["Pre-Upgrade Checklist"]
+    try:
+        shutil.copy2(template_path, tmp_path)
 
-    # Status color fills
-    status_fills = {
-        "PASS": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
-        "Done": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
-        "FAIL": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
-        "Failed": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
-        "WARNING": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
-        "Review": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
-        "Action Required": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
-        "Pending": PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid"),
-        "N/A": PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid"),
-    }
+        wb = load_workbook(tmp_path)
+        ws = wb["Pre-Upgrade Checklist"]
 
-    for row_num, cols in cell_values.items():
-        # Column B = Pre-Prod Value
-        value = cols.get("B", "")
-        cell_b = ws.cell(row=row_num, column=2)
-        cell_b.value = value
-        cell_b.alignment = Alignment(wrap_text=True, vertical="top")
+        status_fills = {
+            "PASS": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+            "Done": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+            "FAIL": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+            "Failed": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+            "WARNING": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+            "Review": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+            "Action Required": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+            "Pending": PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid"),
+            "N/A": PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid"),
+        }
 
-        # Column C = Pre-Prod Status
-        status = cols.get("C", "")
-        cell_c = ws.cell(row=row_num, column=3)
-        cell_c.value = status
-        cell_c.alignment = Alignment(horizontal="center", vertical="center")
+        for row_num, cols in cell_values.items():
+            value = cols.get("B", "")
+            cell_b = ws.cell(row=row_num, column=2)
+            cell_b.value = value
+            cell_b.alignment = Alignment(wrap_text=True, vertical="top")
 
-        fill = status_fills.get(status)
-        if fill:
-            cell_c.fill = fill
+            status = cols.get("C", "")
+            cell_c = ws.cell(row=row_num, column=3)
+            cell_c.value = status
+            cell_c.alignment = Alignment(horizontal="center", vertical="center")
 
-    wb.save(output_path)
-    wb.close()
+            fill = status_fills.get(status)
+            if fill:
+                cell_c.fill = fill
+
+        wb.save(tmp_path)
+        wb.close()
+
+        with open(tmp_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
     filled_count = len(cell_values)
     not_impl_count = sum(1 for c in cell_values.values() if c.get("B") == "Not Implemented")
 
-    return (
+    summary = (
         f"# Checklist Generation Complete\n\n"
-        f"- **Output file:** {output_path}\n"
         f"- **Rows filled:** {filled_count}\n"
         f"- **Not Implemented rows:** {not_impl_count}\n"
         f"- **Sheet modified:** Pre-Upgrade Checklist\n"
         f"- **Other sheets:** Untouched (7 sheets preserved as-is)\n"
+        f"- **File:** {filename} (ready for download)\n"
     )
+
+    return {
+        "type": "excel",
+        "filename": filename,
+        "base64": encoded,
+        "summary": summary,
+    }
