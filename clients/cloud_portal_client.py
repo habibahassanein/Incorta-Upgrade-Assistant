@@ -27,7 +27,7 @@ load_dotenv()
 
 # Auth0 configuration (defaults for staging, overridable via env)
 AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "auth-staging.incortalabs.com")
-AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID", "1H6oWlDKORKc6BmiYWSjECS8Zq6XesV8")
+AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID", "0jXCrcpFe6PDm6sIMxDi7hunFCWeRLpt")
 AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "https://cloud.server/api/")
 AUTH0_SCOPES = (
     "openid profile email "
@@ -35,7 +35,7 @@ AUTH0_SCOPES = (
     "offline_access"
 )
 CALLBACK_PORT = int(os.getenv("AUTH0_CALLBACK_PORT", "8910"))
-CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
+CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cp-cloudstaging.incortalabs.com")
 TOKEN_CACHE_PATH = Path(os.getenv("TOKEN_CACHE_PATH", str(Path.home() / ".incorta_cloud_token.json")))
 
 
