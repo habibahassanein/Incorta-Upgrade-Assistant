@@ -25,10 +25,53 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Auth0 configuration (defaults for staging, overridable via env)
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "auth-staging.incortalabs.com")
+
+def discover_auth0_config(portal_url: str) -> dict:
+    """Fetch Auth0 config from the Cloud Portal's embedded React environment.
+
+    Scrapes asset-manifest.json to find the main JS bundle, then extracts
+    REACT_APP_AUTH_CLIENT_ID, REACT_APP_AUTH_DOMAIN, and REACT_APP_AUTH_AUDIENCE.
+
+    Returns dict with keys: client_id, domain, audience (any may be absent).
+    Returns empty dict on any network or parse error (graceful no-op fallback).
+    """
+    import re
+    try:
+        manifest = requests.get(f"{portal_url}/asset-manifest.json", timeout=10).json()
+        main_js = next(
+            (f for f in manifest.get("entrypoints", []) if "main." in f and f.endswith(".js")),
+            None,
+        )
+        if not main_js:
+            return {}
+        bundle = requests.get(f"{portal_url}/{main_js}", timeout=15).text
+        result = {}
+        for key, env_var in [
+            ("client_id", "REACT_APP_AUTH_CLIENT_ID"),
+            ("domain", "REACT_APP_AUTH_DOMAIN"),
+            ("audience", "REACT_APP_AUTH_AUDIENCE"),
+        ]:
+            m = re.search(rf'{env_var}:"([^"]+)"', bundle)
+            if m:
+                result[key] = m.group(1)
+        return result
+    except Exception:
+        return {}
+
+
+# Auth0 configuration — env vars take precedence; fall back to values
+# discovered from the Cloud Portal JS bundle, then hardcoded staging defaults.
+_discovered: dict = {}
+if not os.getenv("AUTH0_DOMAIN") or not os.getenv("AUTH0_AUDIENCE"):
+    _discovered = discover_auth0_config(
+        os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
+    )
+
+AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN") or _discovered.get("domain", "auth-staging.incortalabs.com")
+# AUTH0_CLIENT_ID is intentionally NOT sourced from discovery: the bundle contains
+# the web-app SPA client, which does not have the MCP server's callback URL registered.
 AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID", "0jXCrcpFe6PDm6sIMxDi7hunFCWeRLpt")
-AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "https://cloud.server/api/")
+AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE") or _discovered.get("audience", "https://cloud.server/api/")
 AUTH0_SCOPES = (
     "openid profile email "
     "read:cluster create:cluster update:cluster delete:cluster manage:cluster "
