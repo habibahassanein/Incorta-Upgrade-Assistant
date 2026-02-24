@@ -62,15 +62,13 @@ def discover_auth0_config(portal_url: str) -> dict:
 # Auth0 configuration — env vars take precedence; fall back to values
 # discovered from the Cloud Portal JS bundle, then hardcoded staging defaults.
 _discovered: dict = {}
-if not os.getenv("AUTH0_DOMAIN") or not os.getenv("AUTH0_AUDIENCE"):
+if not os.getenv("AUTH0_DOMAIN") or not os.getenv("AUTH0_AUDIENCE") or not os.getenv("AUTH0_CLIENT_ID"):
     _discovered = discover_auth0_config(
         os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
     )
 
 AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN") or _discovered.get("domain", "auth-staging.incortalabs.com")
-# AUTH0_CLIENT_ID is intentionally NOT sourced from discovery: the bundle contains
-# the web-app SPA client, which does not have the MCP server's callback URL registered.
-AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID", "0jXCrcpFe6PDm6sIMxDi7hunFCWeRLpt")
+AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID") or _discovered.get("client_id", "1H6oWlDKORKc6BmiYWSjECS8Zq6XesV8")
 AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE") or _discovered.get("audience", "https://cloud.server/api/")
 AUTH0_SCOPES = (
     "openid profile email "
