@@ -163,12 +163,11 @@ def write_checklist_excel(
 
 
 # Module-level state for the non-blocking login flows.
-# Tracks either a pending Authorization Code + PKCE login (local)
-# or a Device Code flow (headless/deployed).
+# Tracks a pending Authorization Code + PKCE login (public Cloudflare or local browser).
 _login_state = {
     "active": False,
-    "flow": None,             # "public", "browser", or "device"
-    # Public + browser flow state
+    "flow": None,             # "public" or "browser"
+    # Shared PKCE state
     "state": None,            # CSRF state token
     "event": None,           # threading.Event — set when callback received
     "auth_code_holder": None, # {"code": str|None, "error": str|None}
@@ -177,14 +176,6 @@ _login_state = {
     "authorize_url": None,
     "server": None,           # HTTPServer instance (browser flow only)
     "server_thread": None,    # Background daemon thread (browser flow only)
-    # Device flow state
-    "device_code": None,
-    "verification_uri": None,
-    "user_code": None,
-    "device_expires_in": None,
-    "device_interval": None,
-    "device_started_at": None,
-    # Shared
     "client": None,           # CloudPortalClient instance
 }
 
@@ -207,12 +198,6 @@ def _cleanup_login_state():
         "authorize_url": None,
         "server": None,
         "server_thread": None,
-        "device_code": None,
-        "verification_uri": None,
-        "user_code": None,
-        "device_expires_in": None,
-        "device_interval": None,
-        "device_started_at": None,
         "client": None,
     })
 
@@ -295,12 +280,17 @@ def cloud_portal_login() -> str:
     Without it, Spark/Python versions, disk sizes, and Data Agent status will be N/A.
     Also call this when get_cloud_metadata returns an authentication error.
 
-    Supports three environments automatically:
-    - Deployed with MCP_PUBLIC_URL set: redirect goes to {MCP_PUBLIC_URL}/callback
-    - Local development: redirect goes to localhost:8910/callback
-    - Headless fallback: Device Code Flow (no callback server needed)
+    Supports two environments:
+    - Local development (recommended): redirect goes to localhost:8910/callback.
+      Run without HEADLESS=true.
+    - Deployed with a persistent public URL: set MCP_PUBLIC_URL and redirect goes to
+      {MCP_PUBLIC_URL}/callback. Requires the URL to be registered in Auth0.
+      Quick-tunnel URLs (e.g., Cloudflare) change each session and are not registered —
+      use a persistent domain.
+
+    NOTE: Headless environments (Docker, no browser) cannot authenticate directly.
+    Authenticate locally first — the token is cached and auto-refreshes across restarts.
     """
-    import time as _time
     cloud_client = CloudPortalClient()
 
     # 1. Check if already authenticated with a valid token
@@ -335,80 +325,7 @@ def cloud_portal_login() -> str:
     if _login_state["active"]:
         flow = _login_state.get("flow")
 
-        if flow == "device":
-            # Poll device code flow once
-            device_code = _login_state["device_code"]
-            client = _login_state["client"] or cloud_client
-            started_at = _login_state["device_started_at"] or 0
-            expires_in = _login_state["device_expires_in"] or 900
-
-            if _time.time() > started_at + expires_in:
-                _cleanup_login_state()
-                return (
-                    "## Login Expired\n\n"
-                    "The device code has expired. Call this tool again to start a new login."
-                )
-
-            try:
-                from clients.cloud_portal_client import AUTH0_DOMAIN, AUTH0_CLIENT_ID
-                response = requests.post(
-                    f"https://{AUTH0_DOMAIN}/oauth/token",
-                    json={
-                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                        "device_code": device_code,
-                        "client_id": AUTH0_CLIENT_ID,
-                    },
-                    headers={"Content-Type": "application/json"},
-                    timeout=15,
-                )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    access_token = data.get("access_token")
-                    refresh_token = data.get("refresh_token")
-                    if access_token:
-                        client.bearer_token = access_token
-                        client.refresh_token = refresh_token
-                        client._save_token(access_token, refresh_token)
-                        _cleanup_login_state()
-                        try:
-                            user_id = client.get_user_id()
-                        except RuntimeError:
-                            user_id = "unknown"
-                        return (
-                            f"## Cloud Portal Login Successful\n\n"
-                            f"- **User ID:** `{user_id}`\n"
-                            f"- Token cached and will auto-refresh.\n"
-                            f"\nYou can now use `get_cloud_metadata` to query your clusters."
-                        )
-
-                error = response.json().get("error", "")
-                if error == "authorization_pending":
-                    return (
-                        f"## Login In Progress\n\n"
-                        f"Still waiting for you to complete login.\n\n"
-                        f"1. Visit: **{_login_state['verification_uri']}**\n"
-                        f"2. Enter code: **`{_login_state['user_code']}`**\n\n"
-                        f"After approving, call this tool again to confirm."
-                    )
-                elif error == "slow_down":
-                    return (
-                        f"## Login In Progress\n\n"
-                        f"Please wait a moment before calling again.\n\n"
-                        f"1. Visit: **{_login_state['verification_uri']}**\n"
-                        f"2. Enter code: **`{_login_state['user_code']}`**"
-                    )
-                elif error in ("expired_token", "access_denied"):
-                    _cleanup_login_state()
-                    return f"## Login Failed\n\n{error.replace('_', ' ').capitalize()}. Call this tool again to restart."
-                else:
-                    _cleanup_login_state()
-                    return f"## Login Failed\n\nUnexpected error: {error}. Call this tool again to restart."
-
-            except Exception as e:
-                return f"## Login Check Failed\n\n{str(e)}\n\nCall this tool again to retry."
-
-        elif flow in ("public", "browser"):
+        if flow in ("public", "browser"):
             # Check if the callback route (public) or local server (browser) completed
             event = _login_state.get("event")
             holder = _login_state.get("auth_code_holder") or {}
@@ -523,30 +440,19 @@ def cloud_portal_login() -> str:
             f"Complete login (including MFA if required), then **call this tool again** to confirm.\n"
         )
 
-    # Headless fallback: Device Code Flow
-    try:
-        device_info = cloud_client.device_login()
-    except RuntimeError as e:
-        return f"## Login Error\n\n{str(e)}"
-
-    _login_state.update({
-        "active": True,
-        "flow": "device",
-        "device_code": device_info["device_code"],
-        "verification_uri": device_info["verification_uri"],
-        "user_code": device_info["user_code"],
-        "device_expires_in": device_info["expires_in"],
-        "device_interval": device_info["interval"],
-        "device_started_at": _time.time(),
-        "client": cloud_client,
-    })
-
+    # No browser available — Cloud Portal requires browser-based OAuth (PKCE)
+    # The Auth0 SPA client does not have the Device Code grant enabled.
     return (
-        f"## Cloud Portal Login (Device Code)\n\n"
-        f"**Step 1:** Open this URL in your browser:\n"
-        f"{device_info['verification_uri']}\n\n"
-        f"**Step 2:** The code is pre-filled in the URL above. Just approve the login.\n\n"
-        f"After approving, **call this tool again** to confirm login."
+        "## Login Not Available in Headless Mode\n\n"
+        "Cloud Portal authentication requires a browser (OAuth/PKCE) and cannot run "
+        "in a headless or Docker environment without a public URL.\n\n"
+        "**To authenticate:**\n"
+        "1. Run the MCP server locally (without `HEADLESS=true` and outside Docker)\n"
+        "2. Call `cloud_portal_login` — a browser window opens automatically at `localhost:8910`\n"
+        "3. Complete login once — the token is cached and auto-refreshes across restarts\n\n"
+        "**Alternatively:** Set `MCP_PUBLIC_URL` to a *persistent* public URL that is "
+        "registered as a callback in Auth0 (quick-tunnel URLs like Cloudflare change "
+        "each session and are not registered)."
     )
 
 
