@@ -1,10 +1,82 @@
 
 
 import os
-from typing import Dict, Any
+from typing import Dict, Any, List
 import requests
 
 from context.user_context import user_context
+
+
+# ---------------------------------------------------------------------------
+# Zendesk schema cache & upgrade-analysis constants
+# ---------------------------------------------------------------------------
+
+_zendesk_schema_cache: dict | None = None
+
+# Tables required for the full upgrade-analysis workflow (guide Section 9)
+UPGRADE_ANALYSIS_TABLES: List[str] = [
+    "ticket",
+    "ticket_tags",
+    "Upgrade_tickets",
+    "Tickets_Env_Release",
+    "ticket_comments",
+    "ticket_audits",
+    "ticket_audit_events",
+    "satisfaction_ratings",
+    "organization",
+    "ticket_customfields_v",
+]
+
+# All 7 verified upgrade tags used for tag-based filtering
+UPGRADE_TAGS: List[str] = [
+    "upgrade",
+    "upgrade-issue",
+    "post_upgrade_issue",
+    "cloud_upgrade",
+    "customer_upgrade",
+    "customer_upgrade_cloud",
+    "customer_upgrade_onprem",
+]
+
+# Metadata documenting how each upgrade-analysis table is used
+UPGRADE_ANALYSIS_TABLE_METADATA: dict = {
+    "ticket_tags": {
+        "purpose": "Tag-based filtering (most reliable for upgrade issues)",
+        "join_pattern": "INNER JOIN ZendeskTickets.ticket_tags tt ON t.id = tt.ticket_id",
+        "key_values": ", ".join(UPGRADE_TAGS),
+    },
+    "Upgrade_tickets": {
+        "purpose": "Version tracking (from/to)",
+        "join_pattern": "LEFT JOIN ZendeskTickets.Upgrade_tickets ut ON t.id = ut.Ticket_Id",
+        "key_columns": "Ticket_Id, from, to",
+    },
+    "Tickets_Env_Release": {
+        "purpose": "Environment & release context",
+        "join_pattern": "LEFT JOIN ZendeskTickets.Tickets_Env_Release ter ON t.id = ter.ticket_id",
+        "key_columns": "ticket_id, release, env, Account_Name",
+    },
+    "ticket_comments": {
+        "purpose": "Full communication history",
+        "join_pattern": "LEFT JOIN ZendeskTickets.ticket_comments tc ON t.id = tc.ticket_id",
+        "key_columns": "ticket_id, body, type, public, author_id",
+    },
+    "ticket_audits": {
+        "purpose": "Change tracking (status, priority, assignment changes)",
+        "join_pattern": "via ticket_audit_events -> ticket_audits",
+        "key_columns": "ticket_id, field_name, previous_value, value",
+    },
+    "satisfaction_ratings": {
+        "purpose": "Customer satisfaction scoring",
+        "join_pattern": "LEFT JOIN ZendeskTickets.satisfaction_ratings sr ON t.id = sr.ticket_id",
+        "key_columns": "ticket_id, score, created_at",
+    },
+}
+
+
+def clear_zendesk_schema_cache():
+    """Clear the cached Zendesk schema. Call between sessions or when schema may have changed."""
+    global _zendesk_schema_cache
+    _zendesk_schema_cache = None
 
 
 def login_to_incorta():
@@ -67,13 +139,33 @@ def get_zendesk_schema(arguments: Dict[str, Any]) -> dict:
     """
     Get Zendesk schema details from Incorta.
 
+    Returns a cached result after the first successful fetch to avoid redundant
+    API calls when multiple helper functions need the schema in parallel.
+
     Args:
-        fetch_schema (bool): Flag to fetch schema details
+        arguments: Dict with optional 'fetch_schema' flag (kept for backward compatibility).
 
     Returns:
-        dict: Schema details with tables and columns
+        dict: Schema details with tables, columns, upgrade_analysis_ready flag,
+              missing_upgrade_tables list, and upgrade_analysis_tables metadata.
     """
-    login_creds = login_to_incorta()
+    global _zendesk_schema_cache
+
+    # Return cached schema if available
+    if _zendesk_schema_cache is not None:
+        return _zendesk_schema_cache
+
+    try:
+        login_creds = login_to_incorta()
+    except Exception as e:
+        return {
+            "error": f"Zendesk schema unavailable (Incorta login failed: {e}). Customer ticket analysis will be skipped.",
+            "source": "zendesk",
+            "upgrade_analysis_ready": False,
+            "missing_upgrade_tables": list(UPGRADE_ANALYSIS_TABLES),
+            "data_gaps": ["All Zendesk tables — Incorta login failed"],
+        }
+
     url = f"{login_creds['env_url']}/bff/v1/schemas/name/ZendeskTickets"
 
     cookie = ""
@@ -87,7 +179,16 @@ def get_zendesk_schema(arguments: Dict[str, Any]) -> dict:
         "Cookie": cookie
     }
 
-    response = requests.get(url, headers=headers, verify=False)
+    try:
+        response = requests.get(url, headers=headers, verify=False, timeout=30)
+    except requests.exceptions.RequestException as e:
+        return {
+            "error": f"Zendesk schema unavailable (request failed: {e}). Customer ticket analysis will be skipped.",
+            "source": "zendesk",
+            "upgrade_analysis_ready": False,
+            "missing_upgrade_tables": list(UPGRADE_ANALYSIS_TABLES),
+            "data_gaps": ["All Zendesk tables — data source unreachable"],
+        }
 
     if response.status_code == 200:
         full_schema = response.json()
@@ -105,16 +206,31 @@ def get_zendesk_schema(arguments: Dict[str, Any]) -> dict:
                 "columns": columns
             })
 
-        return {
+        # Validate required upgrade-analysis tables
+        found_tables = {t["table"] for t in tables}
+        missing = [t for t in UPGRADE_ANALYSIS_TABLES if t not in found_tables]
+
+        result = {
             "source": "zendesk",
             "schema_name": "ZendeskTickets",
             "tables": tables,
             "table_count": len(tables),
-            "note": "Schema compressed for context efficiency. Use SQL queries to access data."
+            "upgrade_analysis_ready": len(missing) == 0,
+            "missing_upgrade_tables": missing,
+            "upgrade_analysis_tables": UPGRADE_ANALYSIS_TABLE_METADATA,
+            "note": "Schema compressed for context efficiency. Use SQL queries to access data.",
         }
+
+        # Cache only successful responses
+        _zendesk_schema_cache = result
+        return result
     else:
         return {
-            "error": f"Failed to fetch Zendesk schema: {response.status_code} - {response.text}"
+            "error": f"Zendesk schema unavailable (HTTP {response.status_code}). Customer ticket analysis will be skipped.",
+            "source": "zendesk",
+            "upgrade_analysis_ready": False,
+            "missing_upgrade_tables": list(UPGRADE_ANALYSIS_TABLES),
+            "data_gaps": [f"All Zendesk tables — HTTP {response.status_code}"],
         }
 
 

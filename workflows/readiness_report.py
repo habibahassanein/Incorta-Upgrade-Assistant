@@ -1,12 +1,14 @@
 """
 Upgrade Readiness Report Workflow
 
-Orchestrates all data sources (CMC, Cloud Portal, Qdrant, upgrade research)
-to produce an opinionated readiness assessment with a rating and Excel checklist data.
+Orchestrates all data sources (CMC, Cloud Portal, Qdrant, upgrade research,
+Zendesk customer support tickets) to produce an opinionated readiness assessment
+with a rating and Excel checklist data.
 
 Output:
 - Overall readiness: READY / READY WITH CAVEATS / NOT READY
 - Blockers, warnings, considerations
+- Known upgrade issues from customer support data
 - Environment summary
 - Version research
 - Pre-upgrade checklist data (JSON for write_checklist_excel)
@@ -39,6 +41,7 @@ class ReadinessState(TypedDict):
     cluster_metadata: dict
     validation_checks: dict
     cloud_metadata: dict
+    zendesk_issues: dict  # NEW — from Zendesk collection workflow
     upgrade_knowledge: list
     upgrade_research: dict
     checklist_cell_values: dict
@@ -107,7 +110,31 @@ def collect_cmc_data(state: ReadinessState) -> ReadinessState:
 
 
 # ---------------------------------------------------------------------------
-# Node 2: Collect Cloud Portal data (fault-tolerant)
+# Node 2: Collect Zendesk customer support data (fault-tolerant)
+# ---------------------------------------------------------------------------
+
+def collect_zendesk_data(state: ReadinessState) -> ReadinessState:
+    """Automatically gather upgrade-related customer support issues from Zendesk."""
+    errors = list(state.get("errors", []))
+    from_v = state.get("from_version", "")
+    to_v = state.get("to_version", "")
+
+    if not from_v or not to_v:
+        errors.append("Zendesk collection skipped: upgrade versions not yet available")
+        return {**state, "zendesk_issues": {}, "errors": errors}
+
+    try:
+        from workflows.collect_zendesk_issues import run_zendesk_collection
+
+        findings = run_zendesk_collection(from_v, to_v)
+        return {**state, "zendesk_issues": findings}
+    except Exception as e:
+        errors.append(f"Zendesk collection failed: {e}")
+        return {**state, "zendesk_issues": {}, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# Node 3: Collect Cloud Portal data (fault-tolerant)
 # ---------------------------------------------------------------------------
 
 def collect_cloud_data(state: ReadinessState) -> ReadinessState:
@@ -248,6 +275,7 @@ def assess_readiness(state: ReadinessState) -> ReadinessState:
     checks = state.get("validation_checks", {})
     cloud = state.get("cloud_metadata", {})
     knowledge = state.get("upgrade_knowledge", [])
+    zendesk = state.get("zendesk_issues", {})
     errors = list(state.get("errors", []))
 
     # --- 1. Collect blockers and warnings from validation checks ---
@@ -275,8 +303,18 @@ def assess_readiness(state: ReadinessState) -> ReadinessState:
     for w in risks.get("warnings", []):
         warnings.append(f"[Risk Assessment] {w}")
 
+    # --- 2b. Add blockers/warnings/considerations from Zendesk data ---
+    for b in zendesk.get("blockers", []):
+        blockers.append(b)
+    for w in zendesk.get("warnings", []):
+        warnings.append(w)
+
     # --- 3. Key upgrade considerations ---
     considerations = []
+
+    # Zendesk considerations
+    for c in zendesk.get("considerations", []):
+        considerations.append(c)
 
     # Database migration
     db = metadata.get("database", {})
@@ -353,6 +391,7 @@ def assess_readiness(state: ReadinessState) -> ReadinessState:
         },
         "risk_level": risks.get("risk_level", "UNKNOWN"),
         "data_gaps": errors,
+        "zendesk_findings": zendesk,
     }
 
     return {**state, "readiness_assessment": assessment}
@@ -426,6 +465,101 @@ def generate_report(state: ReadinessState) -> ReadinessState:
             lines.append(f"| {name} | {status} |")
         lines.append("")
 
+    # --- Known Upgrade Issues (from Customer Support Data) ---
+    zendesk = assessment.get("zendesk_findings", {})
+    if zendesk.get("data_available"):
+        lines.append("## Known Upgrade Issues (from Customer Support Data)")
+        lines.append("")
+
+        # Version-Specific Issues
+        vp = zendesk.get("version_pair_issues", {})
+        pairs = vp.get("version_pairs", [])
+        if pairs:
+            lines.append("### Version-Specific Issues")
+            for p in pairs:
+                lines.append(
+                    f"- **{p.get('from', '?')} \u2192 {p.get('to', '?')}**: "
+                    f"{p.get('issue_count', 0)} issue(s), "
+                    f"{p.get('affected_accounts', 0)} account(s) affected, "
+                    f"{p.get('resolved_count', 0)} resolved"
+                )
+            lines.append("")
+
+        # Risk Assessment
+        risk = zendesk.get("risk_patterns", {})
+        if risk.get("risk_level") and risk["risk_level"] != "UNKNOWN":
+            lines.append("### Risk Assessment")
+            lines.append(
+                f"- **Risk Level:** {risk['risk_level']} "
+                f"({risk.get('total_issues', 0)} total, "
+                f"{risk.get('critical_issues', 0)} critical)"
+            )
+            if risk.get("avg_resolution_days"):
+                lines.append(
+                    f"- **Avg Resolution:** {risk['avg_resolution_days']} days "
+                    f"(max {risk.get('max_resolution_days', '?')} days)"
+                )
+            for w in risk.get("warnings", []):
+                lines.append(f"- {w}")
+            lines.append("")
+
+        # Environment-Specific Considerations
+        env_issues = zendesk.get("environment_issues", {})
+        by_env = env_issues.get("by_environment", {})
+        if by_env:
+            lines.append("### Environment-Specific Considerations")
+            for env_name, env_data in by_env.items():
+                lines.append(
+                    f"- **{env_name}**: {env_data.get('issue_count', 0)} issue(s), "
+                    f"{env_data.get('affected_accounts', 0)} account(s)"
+                )
+            lines.append("")
+
+        # Customer Impact & Satisfaction
+        sat = zendesk.get("satisfaction_data", {})
+        if sat.get("total_tickets", 0) > 0:
+            lines.append("### Customer Impact & Satisfaction")
+            lines.append(f"- **Total Tickets:** {sat.get('total_tickets', 0)}")
+            if sat.get("rated_count", 0) > 0:
+                lines.append(
+                    f"- **Avg Satisfaction:** {sat.get('avg_satisfaction', 0)}/5 "
+                    f"({sat.get('rated_count', 0)} ratings)"
+                )
+            lines.append(f"- **Resolved:** {sat.get('resolved_count', 0)}")
+            if sat.get("avg_resolution_days"):
+                lines.append(
+                    f"- **Avg Resolution Time:** {sat['avg_resolution_days']} days"
+                )
+            lines.append("")
+
+        # Top Issues (from complete details)
+        complete = zendesk.get("complete_issues", {})
+        issues = complete.get("issues", [])
+        if issues:
+            lines.append("### Top Reported Issues")
+            lines.append("| # | Subject | Priority | Status | Environment | Days |")
+            lines.append("|---|---------|----------|--------|-------------|------|")
+            for i, issue in enumerate(issues[:10], 1):
+                lines.append(
+                    f"| {i} | {issue.get('subject', '?')[:60]} "
+                    f"| {issue.get('priority', '?')} "
+                    f"| {issue.get('status', '?')} "
+                    f"| {issue.get('environment', '?')} "
+                    f"| {issue.get('days_to_resolution', '?')} |"
+                )
+            if len(issues) > 10:
+                lines.append(f"_... and {len(issues) - 10} more_")
+            lines.append("")
+    elif zendesk:
+        # Schema was not ready or no data found
+        lines.append("## Known Upgrade Issues (from Customer Support Data)")
+        lines.append("_Customer support data not available._")
+        zendesk_gaps = zendesk.get("data_gaps", [])
+        if zendesk_gaps:
+            for gap in zendesk_gaps:
+                lines.append(f"- {gap}")
+        lines.append("")
+
     # --- Key Considerations ---
     considerations = assessment.get("considerations", [])
     if considerations:
@@ -473,8 +607,9 @@ def generate_report(state: ReadinessState) -> ReadinessState:
 def _build_workflow():
     workflow = StateGraph(ReadinessState)
 
-    workflow.add_node("collect_cmc", collect_cmc_data)
     workflow.add_node("collect_cloud", collect_cloud_data)
+    workflow.add_node("collect_cmc", collect_cmc_data)
+    workflow.add_node("collect_zendesk", collect_zendesk_data)
     workflow.add_node("collect_knowledge", collect_upgrade_knowledge)
     workflow.add_node("collect_research", collect_upgrade_research)
     workflow.add_node("collect_checklist", collect_checklist_data)
@@ -483,7 +618,8 @@ def _build_workflow():
 
     workflow.set_entry_point("collect_cloud")
     workflow.add_edge("collect_cloud", "collect_cmc")
-    workflow.add_edge("collect_cmc", "collect_knowledge")
+    workflow.add_edge("collect_cmc", "collect_zendesk")
+    workflow.add_edge("collect_zendesk", "collect_knowledge")
     workflow.add_edge("collect_knowledge", "collect_research")
     workflow.add_edge("collect_research", "collect_checklist")
     workflow.add_edge("collect_checklist", "assess")
@@ -521,6 +657,7 @@ def run_readiness_report(
         "cluster_metadata": {},
         "validation_checks": {},
         "cloud_metadata": {},
+        "zendesk_issues": {},
         "upgrade_knowledge": [],
         "upgrade_research": {},
         "checklist_cell_values": {},

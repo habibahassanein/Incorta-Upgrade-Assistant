@@ -41,8 +41,9 @@ def generate_upgrade_readiness_report(
 ) -> str:
     """
     [CORE - RUN FIRST] Generate a comprehensive Upgrade Readiness Report.
-    Orchestrates all data sources (CMC, Cloud Portal, knowledge base, upgrade research)
-    to produce an opinionated readiness assessment with a rating and Excel checklist data.
+    Orchestrates all data sources (CMC, Cloud Portal, knowledge base, upgrade research,
+    and Zendesk customer support tickets) to produce an opinionated readiness assessment
+    with a rating and Excel checklist data.
 
     This is the recommended single-command way to assess upgrade readiness.
     It runs ALL other tools internally and produces a unified report.
@@ -51,9 +52,17 @@ def generate_upgrade_readiness_report(
     Data Agent status, and auto-detected current version), call `cloud_portal_login`
     first. Without it, these fields will appear as N/A in the report.
 
+    AUTOMATIC ZENDESK ANALYSIS: The report automatically queries Zendesk for:
+    - Known issues for this specific upgrade path (tag-based filtering)
+    - Risk assessment (critical issues, resolution times)
+    - Environment-specific issues (cloud vs on-prem)
+    - Customer satisfaction metrics
+    No manual SQL or Zendesk tool calls needed — this runs automatically.
+
     OUTPUT INCLUDES:
     - Overall Readiness Rating: READY / READY WITH CAVEATS / NOT READY
     - Environment summary (deployment type, DB, topology, versions)
+    - Known upgrade issues from customer support data
     - Blockers that must be resolved before upgrade
     - Warnings to review
     - Validation checks summary (10 health checks)
@@ -719,6 +728,17 @@ def get_zendesk_schema_tool() -> str:
     - Ticket_Target_Release (2 cols): ticket_id, custom_field_value (target version)
     - organization (15 cols): Customer data - id, name, region
     - ticket_jira_links (5 cols): Zendesk <-> Jira linkage
+
+    UPGRADE ANALYSIS TABLES (used by automatic Zendesk collection):
+    - ticket_tags: Tag-based filtering — most reliable way to find upgrade issues
+    - Upgrade_tickets: Version tracking — from/to version for each upgrade ticket
+    - Tickets_Env_Release: Environment context — cloud/onprem, release, account name
+    - ticket_comments: Full communication history — problem descriptions, resolutions
+    - ticket_audits/ticket_audit_events: Change tracking — escalations, reassignments
+    - satisfaction_ratings: Customer satisfaction — scores, resolution quality
+
+    Returns upgrade_analysis_ready=True if all required tables are present.
+    Schema is cached within session to avoid redundant calls.
     """
     result = get_zendesk_schema({"fetch_schema": True})
     return json.dumps(result, indent=2)
