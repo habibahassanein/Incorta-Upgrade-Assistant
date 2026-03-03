@@ -228,7 +228,7 @@ async def oauth_callback(request: Request) -> HTMLResponse:
 
     Receives the redirect from Auth0 after user login, validates state,
     exchanges the code for a token, and completes the login flow.
-    Used when MCP_PUBLIC_URL is set (deployed/Cloudflare tunnel environment).
+    Used when MCP_PUBLIC_URL is set in headless mode with a persistent, pre-registered domain.
     """
     from clients.cloud_portal_client import CloudPortalClient as _CPC
     params = dict(request.query_params)
@@ -301,12 +301,10 @@ def cloud_portal_login() -> str:
     Also call this when get_cloud_metadata returns an authentication error.
 
     Supports two environments:
-    - Local development (recommended): redirect goes to localhost:8910/callback.
-      Run without HEADLESS=true.
-    - Deployed with a persistent public URL: set MCP_PUBLIC_URL and redirect goes to
-      {MCP_PUBLIC_URL}/callback. Requires the URL to be registered in Auth0.
-      Quick-tunnel URLs (e.g., Cloudflare) change each session and are not registered —
-      use a persistent domain.
+    - Local/browser (recommended): redirect always goes to localhost:8910/callback,
+      regardless of MCP_PUBLIC_URL. Works whenever a browser is available.
+    - Headless with persistent URL: set MCP_PUBLIC_URL to a domain registered in Auth0.
+      Ephemeral Cloudflare tunnel URLs (*.trycloudflare.com) are rejected automatically.
 
     NOTE: Headless environments (Docker, no browser) cannot authenticate directly.
     Authenticate locally first — the token is cached and auto-refreshes across restarts.
@@ -408,33 +406,17 @@ def cloud_portal_login() -> str:
     # 4. No active flow — determine which flow to use and start it
     public_url = os.getenv("MCP_PUBLIC_URL", "").rstrip("/")
 
-    if public_url:
-        # Deployed with Cloudflare tunnel: use public callback URL
-        redirect_uri = f"{public_url}/callback"
-        login_info = cloud_client.build_authorize_url(redirect_uri)
-        event = __import__("threading").Event()
-
-        _login_state.update({
-            "active": True,
-            "flow": "public",
-            "state": login_info["state"],
-            "code_verifier": login_info["code_verifier"],
-            "redirect_uri": redirect_uri,
-            "authorize_url": login_info["authorize_url"],
-            "auth_code_holder": {"code": None, "error": None},
-            "event": event,
-            "client": cloud_client,
-        })
-
-        return (
-            f"## Cloud Portal Login\n\n"
-            f"**Open this URL in your browser to log in:**\n"
-            f"{login_info['authorize_url']}\n\n"
-            f"After completing login, **call this tool again** to confirm."
+    if public_url and ".trycloudflare.com" in public_url:
+        import logging
+        logging.getLogger(__name__).warning(
+            "MCP_PUBLIC_URL is a trycloudflare.com URL which changes every session "
+            "and cannot be registered in Auth0. OAuth will use localhost instead."
         )
 
     if not cloud_client._is_headless():
-        # Local development: use localhost callback server
+        # PREFERRED: Browser available — always use localhost callback.
+        # OAuth redirects happen in the user's browser, which can reach localhost:8910
+        # regardless of whether the MCP server is exposed via a tunnel.
         try:
             login_info = cloud_client.login_for_mcp()
         except RuntimeError as e:
@@ -460,8 +442,32 @@ def cloud_portal_login() -> str:
             f"Complete login (including MFA if required), then **call this tool again** to confirm.\n"
         )
 
-    # No browser available — Cloud Portal requires browser-based OAuth (PKCE)
-    # The Auth0 SPA client does not have the Device Code grant enabled.
+    if public_url and ".trycloudflare.com" not in public_url:
+        # FALLBACK: Headless with a persistent, pre-registered public URL.
+        redirect_uri = f"{public_url}/callback"
+        login_info = cloud_client.build_authorize_url(redirect_uri)
+        event = __import__("threading").Event()
+
+        _login_state.update({
+            "active": True,
+            "flow": "public",
+            "state": login_info["state"],
+            "code_verifier": login_info["code_verifier"],
+            "redirect_uri": redirect_uri,
+            "authorize_url": login_info["authorize_url"],
+            "auth_code_holder": {"code": None, "error": None},
+            "event": event,
+            "client": cloud_client,
+        })
+
+        return (
+            f"## Cloud Portal Login\n\n"
+            f"**Open this URL in your browser to log in:**\n"
+            f"{login_info['authorize_url']}\n\n"
+            f"After completing login, **call this tool again** to confirm."
+        )
+
+    # No browser available and no valid public URL — cannot authenticate.
     return (
         "## Login Not Available in Headless Mode\n\n"
         "Cloud Portal authentication requires a browser (OAuth/PKCE) and cannot run "
