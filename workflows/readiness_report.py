@@ -2,13 +2,14 @@
 Upgrade Readiness Report Workflow
 
 Orchestrates all data sources (CMC, Cloud Portal, Qdrant, upgrade research,
-Zendesk customer support tickets) to produce an opinionated readiness assessment
-with a rating and Excel checklist data.
+Zendesk customer support tickets, Jira bug tracking) to produce an opinionated
+readiness assessment with a rating and Excel checklist data.
 
 Output:
 - Overall readiness: READY / READY WITH CAVEATS / NOT READY
 - Blockers, warnings, considerations
 - Known upgrade issues from customer support data
+- Customer bug fix status from Jira
 - Environment summary
 - Version research
 - Pre-upgrade checklist data (JSON for write_checklist_excel)
@@ -33,6 +34,7 @@ class ReadinessState(TypedDict):
     # Inputs
     cmc_cluster_name: str
     cloud_cluster_name: str
+    customer_name: str
     from_version: str
     to_version: str
 
@@ -41,7 +43,8 @@ class ReadinessState(TypedDict):
     cluster_metadata: dict
     validation_checks: dict
     cloud_metadata: dict
-    zendesk_issues: dict  # NEW — from Zendesk collection workflow
+    zendesk_issues: dict  # From Zendesk collection workflow
+    jira_issues: dict     # From Jira collection workflow
     upgrade_knowledge: list
     upgrade_research: dict
     checklist_cell_values: dict
@@ -131,6 +134,40 @@ def collect_zendesk_data(state: ReadinessState) -> ReadinessState:
     except Exception as e:
         errors.append(f"Zendesk collection failed: {e}")
         return {**state, "zendesk_issues": {}, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# Node 2b: Collect Jira bug data (fault-tolerant, runs after Zendesk)
+# ---------------------------------------------------------------------------
+
+def collect_jira_data(state: ReadinessState) -> ReadinessState:
+    """Automatically gather customer bug fix status from Jira.
+
+    Runs after Zendesk so linked Jira keys from Zendesk tickets are available.
+    """
+    errors = list(state.get("errors", []))
+    to_v = state.get("to_version", "")
+
+    if not to_v:
+        errors.append("Jira collection skipped: target version not yet available")
+        return {**state, "jira_issues": {}, "errors": errors}
+
+    try:
+        from workflows.collect_jira_issues import run_jira_collection
+
+        # Extract linked Jira keys from Zendesk findings if available
+        zendesk = state.get("zendesk_issues", {})
+        linked_keys = zendesk.get("linked_jira_keys", [])
+
+        findings = run_jira_collection(
+            customer_name=state.get("customer_name", ""),
+            to_version=to_v,
+            linked_jira_keys=linked_keys,
+        )
+        return {**state, "jira_issues": findings}
+    except Exception as e:
+        errors.append(f"Jira collection failed: {e}")
+        return {**state, "jira_issues": {}, "errors": errors}
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +313,7 @@ def assess_readiness(state: ReadinessState) -> ReadinessState:
     cloud = state.get("cloud_metadata", {})
     knowledge = state.get("upgrade_knowledge", [])
     zendesk = state.get("zendesk_issues", {})
+    jira = state.get("jira_issues", {})
     errors = list(state.get("errors", []))
 
     # --- 1. Collect blockers and warnings from validation checks ---
@@ -309,11 +347,21 @@ def assess_readiness(state: ReadinessState) -> ReadinessState:
     for w in zendesk.get("warnings", []):
         warnings.append(w)
 
+    # --- 2c. Add blockers/warnings/considerations from Jira data ---
+    for b in jira.get("blockers", []):
+        blockers.append(b)
+    for w in jira.get("warnings", []):
+        warnings.append(w)
+
     # --- 3. Key upgrade considerations ---
     considerations = []
 
     # Zendesk considerations
     for c in zendesk.get("considerations", []):
+        considerations.append(c)
+
+    # Jira considerations
+    for c in jira.get("considerations", []):
         considerations.append(c)
 
     # Database migration
@@ -392,6 +440,7 @@ def assess_readiness(state: ReadinessState) -> ReadinessState:
         "risk_level": risks.get("risk_level", "UNKNOWN"),
         "data_gaps": errors,
         "zendesk_findings": zendesk,
+        "jira_findings": jira,
     }
 
     return {**state, "readiness_assessment": assessment}
@@ -560,6 +609,95 @@ def generate_report(state: ReadinessState) -> ReadinessState:
                 lines.append(f"- {gap}")
         lines.append("")
 
+    # --- Customer Bug Fix Status (from Jira) ---
+    jira = assessment.get("jira_findings", {})
+    if jira.get("data_available"):
+        lines.append("## Customer Bug Fix Status")
+        lines.append("")
+
+        classification = jira.get("bug_classification", {})
+        summary = classification.get("summary", {})
+        total = summary.get("total", 0)
+
+        if total > 0:
+            lines.append(
+                f"**{total} bug(s) analyzed** \u2014 "
+                f"{summary.get('fixed_count', 0)} fixed in target, "
+                f"{summary.get('open_count', 0)} still open, "
+                f"{summary.get('later_release_count', 0)} require later release"
+            )
+            lines.append("")
+
+            # Fixed in target
+            fixed = classification.get("fixed_in_target", [])
+            if fixed:
+                lines.append("### Fixed in Target Version")
+                lines.append("| # | Issue | Summary | Fix Version |")
+                lines.append("|---|-------|---------|-------------|")
+                for i, bug in enumerate(fixed[:15], 1):
+                    lines.append(
+                        f"| {i} | {bug.get('key', '?')} "
+                        f"| {bug.get('summary', '?')[:60]} "
+                        f"| {bug.get('fix_version', '?')} |"
+                    )
+                if len(fixed) > 15:
+                    lines.append(f"_... and {len(fixed) - 15} more_")
+                lines.append("")
+
+            # Still open
+            still_open = classification.get("still_open", [])
+            if still_open:
+                lines.append("### Still Open (Not Fixed in Target)")
+                lines.append("| # | Issue | Summary | Status |")
+                lines.append("|---|-------|---------|--------|")
+                for i, bug in enumerate(still_open[:15], 1):
+                    lines.append(
+                        f"| {i} | {bug.get('key', '?')} "
+                        f"| {bug.get('summary', '?')[:60]} "
+                        f"| {bug.get('status', '?')} |"
+                    )
+                if len(still_open) > 15:
+                    lines.append(f"_... and {len(still_open) - 15} more_")
+                lines.append("")
+
+            # Requires later release
+            later = classification.get("requires_later_release", [])
+            if later:
+                lines.append("### Requires Later Release")
+                lines.append("| # | Issue | Summary | Fix Version |")
+                lines.append("|---|-------|---------|-------------|")
+                for i, bug in enumerate(later[:15], 1):
+                    lines.append(
+                        f"| {i} | {bug.get('key', '?')} "
+                        f"| {bug.get('summary', '?')[:60]} "
+                        f"| {bug.get('fix_version', '?')} |"
+                    )
+                if len(later) > 15:
+                    lines.append(f"_... and {len(later) - 15} more_")
+                lines.append("")
+        else:
+            lines.append("_No customer-reported bugs found._")
+            lines.append("")
+
+        # Upgrade path bugs from other customers
+        path_bugs = jira.get("upgrade_path_bugs", {})
+        path_count = path_bugs.get("total_bugs", 0)
+        if path_count > 0:
+            lines.append("### Bugs from Other Customers (Upgrade Path)")
+            lines.append(
+                f"_{path_count} bug(s) reported by other customers affect versions "
+                f"in the upgrade path._"
+            )
+            lines.append("")
+    elif jira:
+        lines.append("## Customer Bug Fix Status")
+        lines.append("_Customer bug data not available._")
+        jira_gaps = jira.get("data_gaps", [])
+        if jira_gaps:
+            for gap in jira_gaps:
+                lines.append(f"- {gap}")
+        lines.append("")
+
     # --- Key Considerations ---
     considerations = assessment.get("considerations", [])
     if considerations:
@@ -610,6 +748,7 @@ def _build_workflow():
     workflow.add_node("collect_cloud", collect_cloud_data)
     workflow.add_node("collect_cmc", collect_cmc_data)
     workflow.add_node("collect_zendesk", collect_zendesk_data)
+    workflow.add_node("collect_jira", collect_jira_data)
     workflow.add_node("collect_knowledge", collect_upgrade_knowledge)
     workflow.add_node("collect_research", collect_upgrade_research)
     workflow.add_node("collect_checklist", collect_checklist_data)
@@ -619,7 +758,8 @@ def _build_workflow():
     workflow.set_entry_point("collect_cloud")
     workflow.add_edge("collect_cloud", "collect_cmc")
     workflow.add_edge("collect_cmc", "collect_zendesk")
-    workflow.add_edge("collect_zendesk", "collect_knowledge")
+    workflow.add_edge("collect_zendesk", "collect_jira")
+    workflow.add_edge("collect_jira", "collect_knowledge")
     workflow.add_edge("collect_knowledge", "collect_research")
     workflow.add_edge("collect_research", "collect_checklist")
     workflow.add_edge("collect_checklist", "assess")
@@ -636,6 +776,7 @@ def _build_workflow():
 def run_readiness_report(
     cmc_cluster_name: str,
     to_version: str,
+    customer_name: str,
     cloud_cluster_name: str = "",
 ) -> str:
     """Run the full readiness report workflow.
@@ -643,6 +784,7 @@ def run_readiness_report(
     Args:
         cmc_cluster_name: CMC cluster name (e.g., 'customCluster')
         to_version: Target Incorta version (e.g., '2024.7.0')
+        customer_name: Customer name as it appears in Jira (e.g., 'Acme Corp')
         cloud_cluster_name: Cloud Portal cluster name (optional, inferred from CMC_URL)
 
     Returns:
@@ -651,6 +793,7 @@ def run_readiness_report(
     initial_state = {
         "cmc_cluster_name": cmc_cluster_name,
         "cloud_cluster_name": cloud_cluster_name,
+        "customer_name": customer_name,
         "from_version": "",  # Auto-detected from Cloud Portal in collect_cloud node
         "to_version": to_version,
         "cluster_data": {},
@@ -658,6 +801,7 @@ def run_readiness_report(
         "validation_checks": {},
         "cloud_metadata": {},
         "zendesk_issues": {},
+        "jira_issues": {},
         "upgrade_knowledge": [],
         "upgrade_research": {},
         "checklist_cell_values": {},

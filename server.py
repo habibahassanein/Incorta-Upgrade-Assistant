@@ -35,6 +35,7 @@ app = FastMCP("incorta-upgrade-agent", stateless_http=True)
 @app.tool()
 def generate_upgrade_readiness_report(
     to_version: str,
+    customer_name: str,
     cmc_cluster_name: str | None = None,
     from_version: str = "",
     cloud_cluster_name: str | None = None,
@@ -42,8 +43,8 @@ def generate_upgrade_readiness_report(
     """
     [CORE - RUN FIRST] Generate a comprehensive Upgrade Readiness Report.
     Orchestrates all data sources (CMC, Cloud Portal, knowledge base, upgrade research,
-    and Zendesk customer support tickets) to produce an opinionated readiness assessment
-    with a rating and Excel checklist data.
+    Zendesk customer support tickets, and Jira bug tracking) to produce an opinionated
+    readiness assessment with a rating and Excel checklist data.
 
     This is the recommended single-command way to assess upgrade readiness.
     It runs ALL other tools internally and produces a unified report.
@@ -59,10 +60,18 @@ def generate_upgrade_readiness_report(
     - Customer satisfaction metrics
     No manual SQL or Zendesk tool calls needed — this runs automatically.
 
+    AUTOMATIC JIRA BUG ANALYSIS: The report automatically queries Jira for:
+    - Customer-reported bugs and their fix version status
+    - Bugs linked from Zendesk tickets
+    - Bugs from other customers affecting versions in the upgrade path
+    - Classification: fixed in target / still open / requires later release
+    Requires customer_name to match bugs in Jira.
+
     OUTPUT INCLUDES:
     - Overall Readiness Rating: READY / READY WITH CAVEATS / NOT READY
     - Environment summary (deployment type, DB, topology, versions)
     - Known upgrade issues from customer support data
+    - Customer bug fix status from Jira
     - Blockers that must be resolved before upgrade
     - Warnings to review
     - Validation checks summary (10 health checks)
@@ -76,6 +85,7 @@ def generate_upgrade_readiness_report(
 
     Args:
         to_version: Target Incorta version (e.g., '2024.7.0'). Required.
+        customer_name: Customer name exactly as it appears in Jira's Customer field (e.g., 'Acme Corp'). Required for Jira bug analysis.
         cmc_cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
         from_version: Current Incorta version (e.g., '2024.1.0'). Auto-detected from cluster if empty.
         cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). Auto-inferred from CMC_URL if not provided.
@@ -94,6 +104,7 @@ def generate_upgrade_readiness_report(
         return run_readiness_report(
             cmc_cluster_name=cmc_cluster_name,
             to_version=to_version,
+            customer_name=customer_name,
             cloud_cluster_name=cloud_cluster_name or "",
         )
     except Exception as e:
@@ -769,8 +780,12 @@ def query_upgrade_tickets(spark_sql: str) -> str:
 @app.tool()
 def get_jira_schema_tool() -> str:
     """
-    [BUG TRACKING - SCHEMA] Get Jira schema to understand available fields.
+    [STEP 4A - BEFORE JIRA QUERIES] Get Jira schema to understand available fields.
     Call this BEFORE querying bugs/features to see table structure.
+
+    Returns bug_analysis_ready flag indicating whether all required tables
+    (Issues, IssueFixVersions, IssueAffectedVersions, IssueLinks, IssueComponents)
+    are present. Schema is cached after first successful fetch.
 
     KEY TABLES FOR UPGRADES:
     - Issues (324 cols): Main issue data - Key, Summary, StatusName, PriorityName, Customer

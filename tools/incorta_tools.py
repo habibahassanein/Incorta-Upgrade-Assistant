@@ -79,6 +79,56 @@ def clear_zendesk_schema_cache():
     _zendesk_schema_cache = None
 
 
+# ---------------------------------------------------------------------------
+# Jira schema cache & bug-analysis constants
+# ---------------------------------------------------------------------------
+
+_jira_schema_cache: dict | None = None
+
+# Tables required for the full bug-analysis workflow
+BUG_ANALYSIS_TABLES: List[str] = [
+    "Issues",
+    "IssueFixVersions",
+    "IssueAffectedVersions",
+    "IssueLinks",
+    "IssueComponents",
+]
+
+# Metadata documenting how each bug-analysis table is used
+BUG_ANALYSIS_TABLE_METADATA: dict = {
+    "Issues": {
+        "purpose": "Main issue data (bugs, features, tasks)",
+        "key_columns": "Key, Summary, StatusName, PriorityName, Customer, IssueTypeName",
+    },
+    "IssueFixVersions": {
+        "purpose": "Which versions fix each issue",
+        "join_pattern": "JOIN Jira_F.IssueFixVersions ifv ON i.Key = ifv.IssueKey",
+        "key_columns": "IssueKey, Name (version name)",
+    },
+    "IssueAffectedVersions": {
+        "purpose": "Versions affected by bugs",
+        "join_pattern": "JOIN Jira_F.IssueAffectedVersions iav ON i.Key = iav.IssueKey",
+        "key_columns": "IssueKey, Name (version name)",
+    },
+    "IssueLinks": {
+        "purpose": "Issue relationships (blocks, duplicates, relates to)",
+        "join_pattern": "JOIN Jira_F.IssueLinks il ON i.Key = il.SourceIssueKey",
+        "key_columns": "SourceIssueKey, DestinationIssueKey, LinkTypeName",
+    },
+    "IssueComponents": {
+        "purpose": "Product areas affected by each issue",
+        "join_pattern": "JOIN Jira_F.IssueComponents ic ON i.Key = ic.IssueKey",
+        "key_columns": "IssueKey, Name (component name)",
+    },
+}
+
+
+def clear_jira_schema_cache():
+    """Clear the cached Jira schema. Call between sessions or when schema may have changed."""
+    global _jira_schema_cache
+    _jira_schema_cache = None
+
+
 def login_to_incorta():
     """
     Get Incorta session credentials from context.
@@ -238,13 +288,33 @@ def get_jira_schema(arguments: Dict[str, Any]) -> dict:
     """
     Get Jira schema details from Incorta.
 
+    Returns a cached result after the first successful fetch to avoid redundant
+    API calls when multiple helper functions need the schema in parallel.
+
     Args:
-        fetch_schema (bool): Flag to fetch schema details
+        arguments: Dict with optional 'fetch_schema' flag (kept for backward compatibility).
 
     Returns:
-        dict: Schema details with tables and columns
+        dict: Schema details with tables, columns, bug_analysis_ready flag,
+              missing_bug_tables list, and bug_analysis_tables metadata.
     """
-    login_creds = login_to_incorta()
+    global _jira_schema_cache
+
+    # Return cached schema if available
+    if _jira_schema_cache is not None:
+        return _jira_schema_cache
+
+    try:
+        login_creds = login_to_incorta()
+    except Exception as e:
+        return {
+            "error": f"Jira schema unavailable (Incorta login failed: {e}). Bug analysis will be skipped.",
+            "source": "jira",
+            "bug_analysis_ready": False,
+            "missing_bug_tables": list(BUG_ANALYSIS_TABLES),
+            "data_gaps": ["All Jira tables — Incorta login failed"],
+        }
+
     url = f"{login_creds['env_url']}/bff/v1/schemas/name/Jira_F"
 
     cookie = ""
@@ -258,7 +328,16 @@ def get_jira_schema(arguments: Dict[str, Any]) -> dict:
         "Cookie": cookie
     }
 
-    response = requests.get(url, headers=headers, verify=False)
+    try:
+        response = requests.get(url, headers=headers, verify=False, timeout=30)
+    except requests.exceptions.RequestException as e:
+        return {
+            "error": f"Jira schema unavailable (request failed: {e}). Bug analysis will be skipped.",
+            "source": "jira",
+            "bug_analysis_ready": False,
+            "missing_bug_tables": list(BUG_ANALYSIS_TABLES),
+            "data_gaps": ["All Jira tables — data source unreachable"],
+        }
 
     if response.status_code == 200:
         full_schema = response.json()
@@ -276,16 +355,31 @@ def get_jira_schema(arguments: Dict[str, Any]) -> dict:
                 "columns": columns
             })
 
-        return {
+        # Validate required bug-analysis tables
+        found_tables = {t["table"] for t in tables}
+        missing = [t for t in BUG_ANALYSIS_TABLES if t not in found_tables]
+
+        result = {
             "source": "jira",
             "schema_name": "Jira_F",
             "tables": tables,
             "table_count": len(tables),
-            "note": "Schema compressed for context efficiency. Use SQL queries to access data."
+            "bug_analysis_ready": len(missing) == 0,
+            "missing_bug_tables": missing,
+            "bug_analysis_tables": BUG_ANALYSIS_TABLE_METADATA,
+            "note": "Schema compressed for context efficiency. Use SQL queries to access data.",
         }
+
+        # Cache only successful responses
+        _jira_schema_cache = result
+        return result
     else:
         return {
-            "error": f"Failed to fetch Jira schema: {response.status_code} - {response.text}"
+            "error": f"Jira schema unavailable (HTTP {response.status_code}). Bug analysis will be skipped.",
+            "source": "jira",
+            "bug_analysis_ready": False,
+            "missing_bug_tables": list(BUG_ANALYSIS_TABLES),
+            "data_gaps": [f"All Jira tables — HTTP {response.status_code}"],
         }
 
 

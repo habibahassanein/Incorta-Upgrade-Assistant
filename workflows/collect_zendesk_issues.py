@@ -26,6 +26,7 @@ from tools.zendesk_helpers import (
     get_common_issue_types,
     get_complete_upgrade_issues,
     assess_upgrade_satisfaction,
+    get_linked_jira_keys,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class ZendeskCollectionState(TypedDict):
     common_issues: dict
     complete_issues: dict
     satisfaction_data: dict
+    linked_jira_data: dict
 
     # Aggregated output
     zendesk_findings: dict
@@ -171,8 +173,23 @@ def collect_satisfaction(state: ZendeskCollectionState) -> ZendeskCollectionStat
         return {**state, "satisfaction_data": {}, "errors": errors}
 
 
+def collect_linked_jira_keys(state: ZendeskCollectionState) -> ZendeskCollectionState:
+    """Query F: Extract linked Jira issue keys for the Zendesk→Jira bridge."""
+    if not state.get("schema_ready"):
+        return {**state, "linked_jira_data": {}}
+    try:
+        result = get_linked_jira_keys(
+            state["from_version"], state["to_version"]
+        )
+        return {**state, "linked_jira_data": result}
+    except Exception as e:
+        errors = list(state.get("errors", []))
+        errors.append(f"Zendesk linked Jira keys query failed: {e}")
+        return {**state, "linked_jira_data": {}, "errors": errors}
+
+
 # ---------------------------------------------------------------------------
-# Node 7: Synthesise findings
+# Node 8: Synthesise findings
 # ---------------------------------------------------------------------------
 
 def synthesize_zendesk_findings(state: ZendeskCollectionState) -> ZendeskCollectionState:
@@ -183,6 +200,7 @@ def synthesize_zendesk_findings(state: ZendeskCollectionState) -> ZendeskCollect
     common = state.get("common_issues", {})
     complete = state.get("complete_issues", {})
     satisfaction = state.get("satisfaction_data", {})
+    linked_jira = state.get("linked_jira_data", {})
     errors = list(state.get("errors", []))
 
     # Determine if we have any useful data
@@ -252,7 +270,7 @@ def synthesize_zendesk_findings(state: ZendeskCollectionState) -> ZendeskCollect
 
     # Collect data gaps from all sub-queries
     data_gaps: list[str] = []
-    for d in [version_pair, risk, env, common, complete, satisfaction]:
+    for d in [version_pair, risk, env, common, complete, satisfaction, linked_jira]:
         if d and d.get("data_gaps"):
             data_gaps.extend(d["data_gaps"])
     if not state.get("schema_ready"):
@@ -266,6 +284,7 @@ def synthesize_zendesk_findings(state: ZendeskCollectionState) -> ZendeskCollect
         "common_issues": common,
         "complete_issues": complete,
         "satisfaction_data": satisfaction,
+        "linked_jira_keys": linked_jira.get("jira_keys", []),
         "blockers": blockers,
         "warnings": warnings,
         "considerations": considerations,
@@ -289,9 +308,10 @@ def _build_zendesk_workflow():
     workflow.add_node("common_types", collect_common_types)
     workflow.add_node("complete_details", collect_complete_details)
     workflow.add_node("satisfaction", collect_satisfaction)
+    workflow.add_node("linked_jira", collect_linked_jira_keys)
     workflow.add_node("synthesize", synthesize_zendesk_findings)
 
-    # Sequential: validate schema first, then run all 6 queries, then synthesize
+    # Sequential: validate schema first, then run all 7 queries, then synthesize
     workflow.set_entry_point("validate_schema")
     workflow.add_edge("validate_schema", "version_pair")
     workflow.add_edge("version_pair", "risk_patterns")
@@ -299,7 +319,8 @@ def _build_zendesk_workflow():
     workflow.add_edge("environment", "common_types")
     workflow.add_edge("common_types", "complete_details")
     workflow.add_edge("complete_details", "satisfaction")
-    workflow.add_edge("satisfaction", "synthesize")
+    workflow.add_edge("satisfaction", "linked_jira")
+    workflow.add_edge("linked_jira", "synthesize")
     workflow.add_edge("synthesize", END)
 
     return workflow.compile()
@@ -330,6 +351,7 @@ def run_zendesk_collection(from_version: str, to_version: str) -> dict:
         "common_issues": {},
         "complete_issues": {},
         "satisfaction_data": {},
+        "linked_jira_data": {},
         "zendesk_findings": {},
         "errors": [],
     }

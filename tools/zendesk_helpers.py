@@ -508,3 +508,58 @@ def assess_upgrade_satisfaction(from_v: str, to_v: str) -> dict:
         "error": None,
         "data_gaps": [],
     }
+
+
+# ---------------------------------------------------------------------------
+# Helper 7: Linked Jira Keys (for Zendesk→Jira bridge)
+# ---------------------------------------------------------------------------
+
+
+def get_linked_jira_keys(from_v: str, to_v: str) -> dict:
+    """Extract Jira issue keys linked to upgrade-related Zendesk tickets.
+
+    Queries the ticket_jira_links table to find Jira keys associated with
+    upgrade tickets for a given version pair, enabling targeted Jira analysis.
+
+    Returns:
+        {
+            "jira_keys": [str],
+            "found": bool,
+            "error": str | None,
+            "data_gaps": []
+        }
+    """
+    err = _check_schema_ready()
+    if err:
+        return {"jira_keys": [], "found": False, **err}
+
+    # ticket_jira_links may not exist — query gracefully
+    sql = f"""
+    SELECT DISTINCT tjl.jira_issue_key
+    FROM ZendeskTickets.ticket_jira_links tjl
+    INNER JOIN ZendeskTickets.ticket t ON tjl.ticket_id = t.id
+    INNER JOIN ZendeskTickets.ticket_tags tt ON t.id = tt.ticket_id
+    LEFT JOIN ZendeskTickets.Upgrade_tickets ut ON t.id = ut.Ticket_Id
+    WHERE LOWER(tt.tag) IN ({_TAGS_IN_CLAUSE})
+      AND (ut.`from` = '{from_v}' AND ut.`to` = '{to_v}')
+    """
+
+    result = _run_query(sql)
+    if result.get("error"):
+        # ticket_jira_links may not exist — not a blocker
+        return {
+            "jira_keys": [],
+            "found": False,
+            "error": None,
+            "data_gaps": ["ticket_jira_links table may not be available"],
+        }
+
+    rows = _extract_rows(result)
+    keys = [r.get("jira_issue_key", "") for r in rows if r.get("jira_issue_key")]
+
+    return {
+        "jira_keys": keys,
+        "found": len(keys) > 0,
+        "error": None,
+        "data_gaps": [],
+    }
