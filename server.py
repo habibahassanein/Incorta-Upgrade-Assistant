@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import time
 from typing import Literal
 
 import requests
@@ -19,12 +20,35 @@ from workflows.pre_upgrade_validation import run_validation
 from tools.qdrant_tool import search_knowledge_base
 from tools.incorta_tools import query_zendesk, query_jira, get_zendesk_schema, get_jira_schema
 from tools.extract_cluster_metadata import extract_cluster_metadata, format_metadata_report
-from clients.cloud_portal_client import CloudPortalClient, infer_cloud_cluster_name
+from clients.cloud_portal_client import CloudPortalClient
 from workflows.checklist_workflow import run_write_checklist_excel
 from workflows.readiness_report import run_readiness_report
 
 
 app = FastMCP("incorta-upgrade-agent", stateless_http=True)
+
+
+# ==========================================
+# HELPERS
+# ==========================================
+
+
+def _get_cmc_cluster_name(explicit: str | None = None) -> str | None:
+    """Resolve CMC cluster name from: explicit param → cached config → env var.
+
+    Returns the cluster name string, or None if not found anywhere.
+    """
+    if explicit:
+        return explicit
+
+    # Check cached config from portal login
+    from clients.cmc_client import CMCClient
+    cached = CMCClient.load_cached_config()
+    if cached.get("cluster_name"):
+        return cached["cluster_name"]
+
+    # Fall back to environment variable
+    return os.getenv("CMC_CLUSTER_NAME") or None
 
 
 # ==========================================
@@ -49,9 +73,11 @@ def generate_upgrade_readiness_report(
     This is the recommended single-command way to assess upgrade readiness.
     It runs ALL other tools internally and produces a unified report.
 
-    PREREQUISITES: For complete Cloud Portal data (Spark/Python versions, disk sizes,
-    Data Agent status, and auto-detected current version), call `cloud_portal_login`
-    first. Without it, these fields will appear as N/A in the report.
+    PREREQUISITES:
+    - Ask the user for the Cloud Portal cluster name (e.g., 'habibascluster') and
+      make sure the cluster is running before calling this tool.
+    - For Cloud Portal data, call `cloud_portal_login` first. Without it, these
+      fields will appear as N/A in the report.
 
     AUTOMATIC ZENDESK ANALYSIS: The report automatically queries Zendesk for:
     - Known issues for this specific upgrade path (tag-based filtering)
@@ -88,24 +114,31 @@ def generate_upgrade_readiness_report(
         customer_name: Customer name exactly as it appears in Jira's Customer field (e.g., 'Acme Corp'). Required for Jira bug analysis.
         cmc_cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
         from_version: Current Incorta version (e.g., '2024.1.0'). Auto-detected from cluster if empty.
-        cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). Auto-inferred from CMC_URL if not provided.
+        cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). REQUIRED — ask the user.
     """
-    # Resolve CMC cluster name
-    if cmc_cluster_name is None:
-        cmc_cluster_name = os.getenv("CMC_CLUSTER_NAME")
-        if not cmc_cluster_name:
-            return "Error: No cmc_cluster_name provided and CMC_CLUSTER_NAME env var not set."
+    # Resolve CMC cluster name (explicit → cached → env)
+    cmc_cluster_name = _get_cmc_cluster_name(cmc_cluster_name)
+    if not cmc_cluster_name:
+        return (
+            "Error: CMC cluster name not available.\n"
+            "Please call the **cmc_login** tool first to authenticate via the login portal, "
+            "or provide the cmc_cluster_name parameter."
+        )
 
-    # Resolve Cloud Portal cluster name: explicit → env var → inferred from CMC_URL
-    if cloud_cluster_name is None:
-        cloud_cluster_name = os.getenv("CLOUD_PORTAL_CLUSTER_NAME") or infer_cloud_cluster_name()
+    # Cloud Portal cluster name is required — do not infer
+    if not cloud_cluster_name:
+        return (
+            "Error: cloud_cluster_name is required.\n"
+            "Please ask the user for the Cloud Portal cluster name "
+            "(e.g., 'habibascluster') and make sure the cluster is running."
+        )
 
     try:
         return run_readiness_report(
             cmc_cluster_name=cmc_cluster_name,
             to_version=to_version,
             customer_name=customer_name,
-            cloud_cluster_name=cloud_cluster_name or "",
+            cloud_cluster_name=cloud_cluster_name,
         )
     except Exception as e:
         return f"Error generating readiness report: {str(e)}"
@@ -128,10 +161,13 @@ def run_pre_upgrade_validation(cluster_name: str | None = None) -> str:
     Args:
         cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
     """
-    if cluster_name is None:
-        cluster_name = os.getenv("CMC_CLUSTER_NAME")
-        if not cluster_name:
-            return "Error: No cluster_name provided and CMC_CLUSTER_NAME env var not set"
+    cluster_name = _get_cmc_cluster_name(cluster_name)
+    if not cluster_name:
+        return (
+            "Error: CMC cluster name not available.\n"
+            "Please call the **cmc_login** tool first to authenticate via the login portal, "
+            "or provide the cluster_name parameter."
+        )
     try:
         return run_validation(cluster_name)
     except Exception as e:
@@ -282,6 +318,166 @@ async def oauth_callback(request: Request) -> HTMLResponse:
         if _login_state.get("event"):
             _login_state["event"].set()
         return _html(500, "Login Failed", f"Token exchange failed: {e}")
+
+
+# ==========================================
+# CMC LOGIN PORTAL (browser-based form)
+# ==========================================
+
+# Module-level flag: set to True after successful CMC portal login
+_cmc_login_success = False
+
+_INCORTA_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Mulish:wght@400;600;700&display=swap');
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Mulish', sans-serif; background: #F5F6FA; min-height: 100vh;
+       display: flex; align-items: center; justify-content: center; }
+.card { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.10);
+        padding: 40px 36px; max-width: 440px; width: 100%; }
+.logo { text-align: center; margin-bottom: 24px; }
+.logo svg { height: 36px; }
+h2 { color: #1B2A4A; font-size: 22px; font-weight: 700; text-align: center; margin-bottom: 8px; }
+.subtitle { color: #6B7280; font-size: 14px; text-align: center; margin-bottom: 28px; }
+label { display: block; color: #1B2A4A; font-weight: 600; font-size: 14px; margin-bottom: 6px; }
+input[type=text], input[type=password] {
+    width: 100%; padding: 10px 14px; border: 1.5px solid #D1D5DB; border-radius: 8px;
+    font-family: 'Mulish', sans-serif; font-size: 15px; margin-bottom: 18px;
+    transition: border-color 0.2s; outline: none;
+}
+input[type=text]:focus, input[type=password]:focus { border-color: #F26522; box-shadow: 0 0 0 3px rgba(242,101,34,0.12); }
+.btn { display: block; width: 100%; padding: 12px; background: #F26522; color: #fff; border: none;
+       border-radius: 8px; font-family: 'Mulish', sans-serif; font-size: 16px; font-weight: 700;
+       cursor: pointer; transition: background 0.2s; }
+.btn:hover { background: #d9551a; }
+.error-box { background: #FEF2F2; border: 1px solid #FECACA; border-radius: 8px;
+             padding: 12px 16px; color: #991B1B; font-size: 14px; margin-bottom: 18px; }
+.success-box { background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 8px;
+               padding: 16px; color: #166534; font-size: 14px; text-align: center; margin-top: 20px; }
+.hint { color: #9CA3AF; font-size: 12px; margin-top: -14px; margin-bottom: 18px; }
+"""
+
+_INCORTA_LOGO_SVG = """<svg width="120" height="36" viewBox="0 0 120 36" xmlns="http://www.w3.org/2000/svg">
+  <text x="0" y="28" font-family="Mulish, sans-serif" font-size="28" font-weight="700" fill="#1B2A4A">inc</text>
+  <text x="42" y="28" font-family="Mulish, sans-serif" font-size="28" font-weight="700" fill="#F26522">o</text>
+  <text x="60" y="28" font-family="Mulish, sans-serif" font-size="28" font-weight="700" fill="#1B2A4A">rta</text>
+</svg>"""
+
+
+def _cmc_html_page(title: str, body_html: str, status: int = 200) -> HTMLResponse:
+    """Return an Incorta-branded HTML page."""
+    html = (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{title}</title><style>{_INCORTA_CSS}</style></head>"
+        f"<body><div class='card'>"
+        f"<div class='logo'>{_INCORTA_LOGO_SVG}</div>"
+        f"{body_html}"
+        f"</div></body></html>"
+    )
+    return HTMLResponse(content=html, status_code=status)
+
+
+@app.custom_route("/cmc-login", methods=["GET"])
+async def cmc_login_form(request: Request) -> HTMLResponse:
+    """Serve the CMC login form."""
+    form_html = (
+        "<h2>CMC Login</h2>"
+        "<p class='subtitle'>Enter your CMC credentials to authenticate.</p>"
+        "<form method='POST' action='/cmc-login'>"
+        "<label for='cmc_url'>CMC URL</label>"
+        "<input type='text' id='cmc_url' name='cmc_url' "
+        "placeholder='https://yourcluster.cloudstaging.incortalabs.com/cmc' required />"
+        "<p class='hint'>Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc</p>"
+        "<label for='username'>Username</label>"
+        "<input type='text' id='username' name='username' placeholder='admin' required />"
+        "<label for='password'>Password</label>"
+        "<input type='password' id='password' name='password' required />"
+        "<label for='cluster_name'>CMC Cluster Name</label>"
+        "<input type='text' id='cluster_name' name='cluster_name' placeholder='customCluster' required />"
+        "<p class='hint'>The cluster name as shown in CMC (e.g., customCluster)</p>"
+        "<button type='submit' class='btn'>Login</button>"
+        "</form>"
+    )
+    return _cmc_html_page("CMC Login", form_html)
+
+
+@app.custom_route("/cmc-login", methods=["POST"])
+async def cmc_login_submit(request: Request) -> HTMLResponse:
+    """Process the CMC login form submission."""
+    global _cmc_login_success
+
+    form = await request.form()
+    cmc_url = (form.get("cmc_url") or "").strip().rstrip("/")
+    username = (form.get("username") or "").strip()
+    password = (form.get("password") or "").strip()
+    cluster_name = (form.get("cluster_name") or "").strip()
+
+    # Validate all fields are provided
+    missing = []
+    if not cmc_url:
+        missing.append("CMC URL")
+    if not username:
+        missing.append("Username")
+    if not password:
+        missing.append("Password")
+    if not cluster_name:
+        missing.append("CMC Cluster Name")
+
+    if missing:
+        error_html = (
+            "<h2>CMC Login</h2>"
+            f"<div class='error-box'>Missing required fields: {', '.join(missing)}</div>"
+            "<p style='text-align:center; margin-top:16px;'>"
+            "<a href='/cmc-login' style='color:#F26522; font-weight:600;'>Try Again</a></p>"
+        )
+        return _cmc_html_page("CMC Login - Error", error_html, status=400)
+
+    # Try authenticating against CMC
+    from clients.cmc_client import CMCClient
+
+    try:
+        client = CMCClient(url=cmc_url, user=username, password=password, cluster_name=cluster_name)
+        client.login()  # This caches the token + url + cluster_name to disk
+    except RuntimeError as e:
+        error_msg = str(e)
+        # Truncate long error messages for display
+        if len(error_msg) > 300:
+            error_msg = error_msg[:300] + "..."
+        error_html = (
+            "<h2>CMC Login</h2>"
+            f"<div class='error-box'>{error_msg}</div>"
+            "<p style='text-align:center; margin-top:16px;'>"
+            "<a href='/cmc-login' style='color:#F26522; font-weight:600;'>Try Again</a></p>"
+        )
+        return _cmc_html_page("CMC Login - Failed", error_html, status=401)
+
+    # Success!
+    _cmc_login_success = True
+
+    # Decode JWT for display
+    expiry_info = ""
+    try:
+        import jwt as pyjwt
+        claims = pyjwt.decode(client.token, options={"verify_signature": False})
+        exp = claims.get("exp")
+        if exp:
+            remaining = (exp - time.time()) / 3600
+            expiry_info = f"<br>Token expires in <strong>{remaining:.1f} hours</strong>."
+    except Exception:
+        pass
+
+    success_html = (
+        "<h2>Login Successful</h2>"
+        "<div class='success-box'>"
+        f"<strong>Authenticated as {username}</strong><br>"
+        f"CMC URL: <code>{cmc_url}</code><br>"
+        f"Cluster: <code>{cluster_name}</code>"
+        f"{expiry_info}"
+        "</div>"
+        "<p style='text-align:center; margin-top:20px; color:#6B7280; font-size:14px;'>"
+        "You can close this tab and return to Claude.</p>"
+    )
+    return _cmc_html_page("CMC Login - Success", success_html)
 
 
 @app.tool()
@@ -483,6 +679,90 @@ def cloud_portal_login() -> str:
 
 
 @app.tool()
+def cmc_login() -> str:
+    """
+    [CMC AUTH] Authenticate with CMC via a browser-based login portal.
+
+    TWO-STEP PROCESS:
+      Step 1: Call this tool — you receive a URL for the login portal.
+              Ask the user to open it in their browser, fill in the form, and submit.
+      Step 2: Call this tool again — it detects the cached token and confirms authentication.
+
+    The login portal collects: CMC URL, username, password, and cluster name.
+    After successful login, the JWT and config are cached at ~/.incorta_cmc_token.json.
+    Subsequent CMC tool calls (extract_cluster_metadata, run_pre_upgrade_validation, etc.)
+    will use the cached token automatically — no .env variables needed.
+
+    The cached token auto-expires (checked on each use). When it expires,
+    call this tool again to re-open the login portal.
+    """
+    global _cmc_login_success
+    from clients.cmc_client import CMCClient
+
+    # Check if already authenticated (cached token on disk)
+    cached = CMCClient.load_cached_config()
+    if cached.get("access_token"):
+        user = cached.get("user", "unknown")
+        url = cached.get("url", "unknown")
+        cluster = cached.get("cluster_name", "unknown")
+
+        # Decode JWT for expiry info
+        expiry_info = ""
+        try:
+            import jwt as pyjwt
+            claims = pyjwt.decode(cached["access_token"], options={"verify_signature": False})
+            exp = claims.get("exp")
+            if exp:
+                remaining = (exp - time.time()) / 3600
+                expiry_info = f"- **Expires in:** {remaining:.1f} hours\n"
+        except Exception:
+            pass
+
+        _cmc_login_success = False  # Reset for next round
+        return (
+            f"## CMC Authenticated\n\n"
+            f"- **User:** `{user}`\n"
+            f"- **CMC URL:** `{url}`\n"
+            f"- **Cluster Name:** `{cluster}`\n"
+            f"- **Token cached at:** `~/.incorta_cmc_token.json`\n"
+            f"{expiry_info}\n"
+            f"CMC tools are ready to use."
+        )
+
+    # Check if the portal form was just submitted successfully
+    if _cmc_login_success:
+        _cmc_login_success = False
+        # Re-check cache (should be populated now)
+        cached = CMCClient.load_cached_config()
+        if cached.get("access_token"):
+            user = cached.get("user", "unknown")
+            url = cached.get("url", "unknown")
+            cluster = cached.get("cluster_name", "unknown")
+            return (
+                f"## CMC Login Successful\n\n"
+                f"- **User:** `{user}`\n"
+                f"- **CMC URL:** `{url}`\n"
+                f"- **Cluster Name:** `{cluster}`\n"
+                f"- **Token cached at:** `~/.incorta_cmc_token.json`\n\n"
+                f"CMC tools are now ready to use."
+            )
+
+    # No cached token — direct user to the login portal
+    port = int(os.getenv("MCP_PORT", "8000"))
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    portal_url = f"http://{host}:{port}/cmc-login"
+
+    return (
+        f"## CMC Login Required\n\n"
+        f"**Open this URL in your browser to log in:**\n"
+        f"{portal_url}\n\n"
+        f"Fill in the form with your CMC URL, username, password, and cluster name, "
+        f"then click **Login**.\n\n"
+        f"After successful login, **call this tool again** to confirm authentication."
+    )
+
+
+@app.tool()
 def get_cloud_metadata(
     cluster_name: str | None = None,
     include_consumption: bool = True,
@@ -492,34 +772,47 @@ def get_cloud_metadata(
     [CLOUD DATA] Get cloud metadata from Cloud Portal API.
     Provides data NOT available in CMC API. Call AFTER extract_cluster_metadata.
 
-    CLUSTER NAMING: This tool uses the Cloud Portal API and requires the Cloud Portal cluster name.
-    Example: If Cloud Portal UI shows 'habibascluster', use that name (NOT the CMC name).
+    IMPORTANT: You MUST ask the user for the cluster name. Do NOT infer or guess it.
+    The cluster name is the Cloud Portal instance name (e.g., 'habibascluster').
 
     NOTE: Cloud Portal and CMC use different cluster names for the same cluster.
     - CMC name (e.g., 'customCluster') is used by extract_cluster_metadata_tool
     - Cloud Portal name (e.g., 'habibascluster') is used by this tool
-    The AI agent should use both tools together and correlate results by context.
 
-    NEW DATA AVAILABLE:
-    - Consumption & Cost: Daily/monthly power units, usage trends
-    - User Management: Authorized users, roles (owner/developer), last login times
-    - Build Details: Custom build IDs, exact versions (Spark, Python)
-    - Feature Flags: MLflow, Chat/OpenAI, Delta Share, Data Agent status
-    - Upgrade History: Last upgrade timestamp, upgrade patterns
+    DATA AVAILABLE:
+    - Instance details, build info, platform, service statuses
+    - Software versions (Spark, Python, MySQL)
+    - Sizing (analytics, loader, CMC memory/CPU/IPU)
+    - Feature flags, feature bits
+    - Consumption & cost data
+    - Authorized users
+    - Upgrade history
 
     Args:
-        cluster_name: Cloud Portal cluster name. Defaults to CLOUD_PORTAL_CLUSTER_NAME env var.
+        cluster_name: Cloud Portal cluster name. REQUIRED — ask the user for this value.
         include_consumption: Include consumption/cost data (default: True)
         include_users: Include authorized users (default: True)
     """
-    if cluster_name is None:
-        cluster_name = os.getenv("CLOUD_PORTAL_CLUSTER_NAME") or infer_cloud_cluster_name()
-        if not cluster_name:
-            return "Error: No cluster_name provided. Set CLOUD_PORTAL_CLUSTER_NAME env var or ensure CMC_URL is configured."
+    if not cluster_name:
+        return (
+            "Error: cluster_name is required.\n"
+            "Please ask the user for the Cloud Portal cluster name "
+            "(e.g., 'habibascluster') and make sure the cluster is running."
+        )
+
     cloud_client = CloudPortalClient()
 
+    # Use the cp- search endpoint (no user_id needed, richer response)
     try:
-        user_id = cloud_client.get_user_id()
+        our_cluster = cloud_client.search_instances(cluster_name)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            return (
+                "Error: Not authenticated with Cloud Portal.\n"
+                "Please call the **cloud_portal_login** tool first to log in.\n"
+                "After logging in, retry this tool."
+            )
+        return f"Error: Failed to search instances from Cloud Portal: {str(e)}"
     except RuntimeError as e:
         error_msg = str(e)
         if "AUTHENTICATION_REQUIRED" in error_msg:
@@ -530,34 +823,87 @@ def get_cloud_metadata(
             )
         return f"Error: {error_msg}"
 
-    try:
-        our_cluster = cloud_client.find_cluster(user_id, cluster_name)
-    except (requests.exceptions.HTTPError, RuntimeError) as e:
-        return f"Error: Failed to fetch clusters from Cloud Portal: {str(e)}"
-
     if not our_cluster:
-        return f"Error: Cluster '{cluster_name}' not found in Cloud Portal"
+        return f"Error: Cluster '{cluster_name}' not found in Cloud Portal."
 
     instance_uuid = our_cluster.get("id")
+    cluster_status = our_cluster.get("status", "unknown")
 
+    # --- Build report ---
     report_lines = [
         f"# Cloud Portal Metadata: {cluster_name}",
         "",
-        "## Instance Details",
-        f"- **UUID:** `{instance_uuid}`",
-        f"- **Build:** {our_cluster.get('customBuild')} ({our_cluster.get('customBuildID')})",
-        f"- **Platform:** {our_cluster.get('platform')} - {our_cluster.get('region')}/{our_cluster.get('zone')}",
-        f"- **K8s Cluster:** {our_cluster.get('k8sClusterCode')}",
-        f"- **Status:** {our_cluster.get('status')}",
-        "",
-        "## Software Versions",
-        f"- **Spark:** {our_cluster.get('incortaSparkVersion')}",
-        f"- **Python:** {our_cluster.get('pythonVersion')}",
-        "",
     ]
 
+    # Warning if cluster is not running
+    if cluster_status != "running":
+        report_lines.extend([
+            f"> **WARNING:** Cluster status is **{cluster_status}** (not running).",
+            "> Some data may be stale. Please ensure the cluster is running for accurate results.",
+            "",
+        ])
+
+    report_lines.extend([
+        "## Instance Details",
+        f"- **UUID:** `{instance_uuid}`",
+        f"- **Build:** {our_cluster.get('customBuild') or 'Vanilla'} ({our_cluster.get('customBuildName') or our_cluster.get('image')})",
+        f"- **Image:** {our_cluster.get('image')}",
+        f"- **Platform:** {our_cluster.get('platform')} - {our_cluster.get('region')}/{our_cluster.get('zone')}",
+        f"- **K8s Cluster:** {our_cluster.get('k8sClusterCode')}",
+        f"- **Status:** {cluster_status}",
+        f"- **Premium:** {'Yes' if our_cluster.get('isPremium') else 'No'}",
+        f"- **Organization:** {our_cluster.get('organization')}",
+        "",
+    ])
+
+    # Service statuses from instanceServices
+    services = our_cluster.get("instanceServices", [])
+    if services:
+        svc = services[0]
+        report_lines.extend([
+            "## Service Status",
+            f"- **CMC:** {svc.get('cmc_status', 'N/A')}",
+            f"- **Analytics:** {svc.get('analytics_status', 'N/A')}",
+            f"- **Loader:** {svc.get('loader_status', 'N/A')}",
+            f"- **Spark:** {svc.get('spark_status', 'N/A')}",
+            f"- **Zookeeper:** {svc.get('zookeeper_status', 'N/A')}",
+            "",
+        ])
+
+    report_lines.extend([
+        "## Software Versions",
+        f"- **Spark:** {our_cluster.get('incortaSparkVersion')}",
+        f"- **Python:** {our_cluster.get('pythonVersion') or 'N/A'}",
+        f"- **MySQL:** {our_cluster.get('mysqlVersion') or 'N/A'}",
+        "",
+    ])
+
+    # Sizing details from nested objects
+    def _format_size(size_obj, label):
+        if not size_obj or not isinstance(size_obj, dict):
+            return [f"- **{label}:** N/A"]
+        return [
+            f"- **{label}:** {size_obj.get('displayName', 'N/A')} "
+            f"(Memory: {size_obj.get('memoryRequest', '?')}-{size_obj.get('memoryLimit', '?')} GB, "
+            f"CPU: {size_obj.get('cpu', 'N/A')} vCPU, "
+            f"IPU: {size_obj.get('ipu', 'N/A')})",
+        ]
+
+    report_lines.append("## Cluster Sizing")
+    report_lines.extend(_format_size(our_cluster.get("analyticsSize"), "Analytics"))
+    report_lines.extend(_format_size(our_cluster.get("loaderSize"), "Loader"))
+    report_lines.extend(_format_size(our_cluster.get("cmcSize"), "CMC"))
+    report_lines.extend([
+        f"- **Analytics Nodes:** {our_cluster.get('analyticsNodes', 'N/A')}",
+        f"- **Loader Nodes:** {our_cluster.get('loaderNodes', 'N/A')}",
+        f"- **ZK Replicas:** {our_cluster.get('zkReplicas', 'N/A')}",
+        "",
+    ])
+
+    # Consumption (still uses the separate endpoint — needs user_id)
     if include_consumption:
         try:
+            user_id = cloud_client.get_user_id()
             consumption = cloud_client.get_consumption(user_id, instance_uuid)
             consumption_agg = consumption.get('consumptionAgg', {})
             total_pu = consumption_agg.get('totalAgg', 0)
@@ -598,8 +944,10 @@ def get_cloud_metadata(
                 ""
             ])
 
+    # Authorized users (still uses the separate endpoint — needs user_id)
     if include_users:
         try:
+            user_id = cloud_client.get_user_id()
             users_data = cloud_client.get_authorized_users(user_id, cluster_name)
             users_list = users_data.get('authorizedUserRoles', [])
 
@@ -634,12 +982,31 @@ def get_cloud_metadata(
         f"- **Incorta X:** {'Enabled' if our_cluster.get('incortaXEnabled') else 'Disabled'}",
         f"- **Data Agent:** {'Enabled' if our_cluster.get('enableDataAgent') else 'Disabled'}",
         f"- **Chat/OpenAI:** {'Enabled' if our_cluster.get('enableChat') else 'Disabled'}",
+        f"- **OpenAI:** {'Enabled' if our_cluster.get('enableOpenAI') else 'Disabled'}",
         f"- **MLflow:** {'Enabled' if our_cluster.get('mlflowEnabled') else 'Disabled'}",
-        f"- **Delta Share:** {'Enabled' if our_cluster.get('enableDeltaShare') else 'Disabled'}",
+        f"- **Data Studio:** {'Enabled' if our_cluster.get('enableDataStudio') else 'Disabled'}",
+        f"- **On-Demand Loader:** {'Enabled' if (our_cluster.get('onDemandLoader') or {}).get('enabled') else 'Disabled'}",
         "",
+    ])
+
+    # Feature bits
+    feature_bits = our_cluster.get("featureBits", [])
+    if feature_bits:
+        report_lines.append("## Feature Bits")
+        for fb in feature_bits:
+            fb_details = fb.get("featureBits", {})
+            report_lines.append(
+                f"- **{fb_details.get('name', 'Unknown')}** (`{fb_details.get('key', '')}`) — "
+                f"{'Enabled' if fb_details.get('enabled') else 'Disabled'}"
+            )
+        report_lines.append("")
+
+    report_lines.extend([
         "## Spark Configuration",
         f"- **Min Executors:** {our_cluster.get('minExecutors', 'N/A')}",
         f"- **Max Executors:** {our_cluster.get('maxExecutors', 'N/A')}",
+        f"- **Spark Memory:** {our_cluster.get('sparkMem', 'N/A')} MB",
+        f"- **Spark CPU:** {our_cluster.get('sparkCpu', 'N/A')} millicores",
         "",
         "## Storage",
         f"- **Data Size:** {our_cluster.get('dsize')} GB",
@@ -685,10 +1052,13 @@ def extract_cluster_metadata_tool(
         cluster_name: CMC cluster name. Defaults to CMC_CLUSTER_NAME env var.
         format: Output format - 'json', 'markdown', or 'both' (default).
     """
-    if cluster_name is None:
-        cluster_name = os.getenv("CMC_CLUSTER_NAME")
-        if not cluster_name:
-            return "Error: No cluster_name provided and CMC_CLUSTER_NAME env var not set"
+    cluster_name = _get_cmc_cluster_name(cluster_name)
+    if not cluster_name:
+        return (
+            "Error: CMC cluster name not available.\n"
+            "Please call the **cmc_login** tool first to authenticate via the login portal, "
+            "or provide the cluster_name parameter."
+        )
     from clients.cmc_client import CMCClient
     client = CMCClient()
     try:

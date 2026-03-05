@@ -756,6 +756,53 @@ class CloudPortalClient:
         )
 
     # ------------------------------------------------------------------
+    # CP (Cloud Portal Admin) search endpoint
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_cp_base_url():
+        """Derive the cp- prefixed base URL for the instances search endpoint.
+
+        E.g. https://cloudstaging.incortalabs.com → https://cp-cloudstaging.incortalabs.com/api/v2
+        """
+        parsed = urlparse(CLOUD_PORTAL_URL)
+        cp_hostname = f"cp-{parsed.hostname}"
+        return f"{parsed.scheme}://{cp_hostname}/api/v2"
+
+    def search_instances(self, cluster_name):
+        """Search for instances by name using the cp- admin endpoint.
+
+        Uses GET /api/v2/instances?search={cluster_name} on the cp- subdomain.
+        This endpoint is simpler (no user_id needed) and returns richer data
+        (131 fields including analyticsSize, instanceServices, featureBits, etc.).
+
+        The search is fuzzy — 'habibascluster' may match 'habibascluster2' too.
+        This method finds the exact-match instance from the results.
+
+        Args:
+            cluster_name: Exact instance name as shown in Cloud Portal.
+
+        Returns:
+            dict or None: The matching instance dict, or None if not found.
+        """
+        cp_base = self._build_cp_base_url()
+        url = f"{cp_base}/instances"
+        r = requests.get(
+            url,
+            headers=self._headers(),
+            params={"search": cluster_name},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        # Search is fuzzy, so find the exact match by name
+        for instance in data.get("instances", []):
+            if instance.get("name") == cluster_name:
+                return instance
+        return None
+
+    # ------------------------------------------------------------------
     # API methods (unchanged)
     # ------------------------------------------------------------------
 

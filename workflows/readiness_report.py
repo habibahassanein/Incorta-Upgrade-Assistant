@@ -175,7 +175,7 @@ def collect_jira_data(state: ReadinessState) -> ReadinessState:
 # ---------------------------------------------------------------------------
 
 def collect_cloud_data(state: ReadinessState) -> ReadinessState:
-    """Fetch cloud metadata from Cloud Portal API."""
+    """Fetch cloud metadata from Cloud Portal API using the cp- search endpoint."""
     errors = list(state.get("errors", []))
     cloud_cluster_name = state.get("cloud_cluster_name", "")
 
@@ -187,32 +187,81 @@ def collect_cloud_data(state: ReadinessState) -> ReadinessState:
         from clients.cloud_portal_client import CloudPortalClient
 
         cloud_client = CloudPortalClient()
-        user_id = cloud_client.get_user_id()
-        cluster = cloud_client.find_cluster(user_id, cloud_cluster_name)
+        cluster = cloud_client.search_instances(cloud_cluster_name)
 
         if not cluster:
             errors.append(f"Cloud cluster '{cloud_cluster_name}' not found in Cloud Portal")
             return {**state, "cloud_metadata": {}, "errors": errors}
 
+        # Warn if cluster is not running
+        cluster_status = cluster.get("status", "unknown")
+        if cluster_status != "running":
+            errors.append(
+                f"WARNING: Cloud cluster '{cloud_cluster_name}' status is '{cluster_status}' (not running). "
+                "Data may be stale."
+            )
+
+        # Extract sizing details from nested objects
+        analytics_size = cluster.get("analyticsSize") or {}
+        loader_size = cluster.get("loaderSize") or {}
+        cmc_size = cluster.get("cmcSize") or {}
+
         cloud_meta = {
             "spark_version": cluster.get("incortaSparkVersion"),
             "python_version": cluster.get("pythonVersion"),
+            "mysql_version": cluster.get("mysqlVersion"),
             "build": cluster.get("customBuild"),
-            "build_id": cluster.get("customBuildID"),
+            "build_name": cluster.get("customBuildName"),
+            "image": cluster.get("image"),
             "platform": cluster.get("platform"),
             "region": cluster.get("region"),
-            "status": cluster.get("status"),
+            "status": cluster_status,
+            "is_premium": cluster.get("isPremium", False),
+            # Storage
             "data_size_gb": cluster.get("dsize"),
             "loader_size_gb": cluster.get("dsizeLoader"),
             "cmc_size_gb": cluster.get("dsizeCmc"),
             "available_disk_gb": cluster.get("availableDisk"),
             "consumed_data_gb": cluster.get("consumedData"),
+            # Sizing
+            "analytics_size": analytics_size.get("displayName"),
+            "analytics_memory_gb": analytics_size.get("memoryLimit"),
+            "analytics_cpu": analytics_size.get("cpu"),
+            "loader_size": loader_size.get("displayName"),
+            "loader_memory_gb": loader_size.get("memoryLimit"),
+            "cmc_size_display": cmc_size.get("displayName"),
+            # Topology
+            "analytics_nodes": cluster.get("analyticsNodes"),
+            "loader_nodes": cluster.get("loaderNodes"),
+            "zk_replicas": cluster.get("zkReplicas"),
+            # Features
             "sqli_enabled": cluster.get("sqliEnabled", False),
+            "incorta_x_enabled": cluster.get("incortaXEnabled", False),
             "data_agent_enabled": cluster.get("enableDataAgent", False),
-            "last_upgrade": cluster.get("initiatedUpgradeAt"),
+            "openai_enabled": cluster.get("enableOpenAI", False),
+            "mlflow_enabled": cluster.get("mlflowEnabled", False),
+            "data_studio_enabled": cluster.get("enableDataStudio", False),
+            # Spark
             "min_executors": cluster.get("minExecutors"),
             "max_executors": cluster.get("maxExecutors"),
+            "spark_mem_mb": cluster.get("sparkMem"),
+            "spark_cpu_millicores": cluster.get("sparkCpu"),
+            # Upgrade
+            "last_upgrade": cluster.get("initiatedUpgradeAt"),
         }
+
+        # Service statuses from instanceServices
+        services = cluster.get("instanceServices", [])
+        if services:
+            svc = services[0]
+            cloud_meta["service_statuses"] = {
+                "cmc": svc.get("cmc_status"),
+                "analytics": svc.get("analytics_status"),
+                "loader": svc.get("loader_status"),
+                "spark": svc.get("spark_status"),
+                "zookeeper": svc.get("zookeeper_status"),
+            }
+
         # Auto-detect from_version from cloud build if not already provided
         from_version = state.get("from_version", "")
         if not from_version and cloud_meta.get("build"):
