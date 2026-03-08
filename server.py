@@ -330,36 +330,42 @@ _cmc_login_success = False
 _INCORTA_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Mulish:wght@400;600;700&display=swap');
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'Mulish', sans-serif; background: #F5F6FA; min-height: 100vh;
+body { font-family: 'Mulish', sans-serif; background: #f3f5f6; min-height: 100vh;
        display: flex; align-items: center; justify-content: center; }
-.card { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.10);
+.card { background: #fff; border-radius: 15px; box-shadow: 7px 7px 55px #f2f3f6;
         padding: 40px 36px; max-width: 440px; width: 100%; }
 .logo { text-align: center; margin-bottom: 24px; }
 .logo svg { height: 36px; }
-h2 { color: #1B2A4A; font-size: 22px; font-weight: 700; text-align: center; margin-bottom: 8px; }
-.subtitle { color: #6B7280; font-size: 14px; text-align: center; margin-bottom: 28px; }
-label { display: block; color: #1B2A4A; font-weight: 600; font-size: 14px; margin-bottom: 6px; }
+h2 { color: #15152b; font-size: 22px; font-weight: 700; text-align: center; margin-bottom: 8px; }
+.subtitle { color: #818192; font-size: 14px; text-align: center; margin-bottom: 28px; }
+label { display: block; color: #15152b; font-weight: 600; font-size: 14px; margin-bottom: 6px; }
 input[type=text], input[type=password] {
-    width: 100%; padding: 10px 14px; border: 1.5px solid #D1D5DB; border-radius: 8px;
+    width: 100%; padding: 10px 14px; border: 1.5px solid #d0d5dd; border-radius: 8px;
     font-family: 'Mulish', sans-serif; font-size: 15px; margin-bottom: 18px;
     transition: border-color 0.2s; outline: none;
 }
-input[type=text]:focus, input[type=password]:focus { border-color: #F26522; box-shadow: 0 0 0 3px rgba(242,101,34,0.12); }
-.btn { display: block; width: 100%; padding: 12px; background: #F26522; color: #fff; border: none;
-       border-radius: 8px; font-family: 'Mulish', sans-serif; font-size: 16px; font-weight: 700;
+input[type=text]:focus, input[type=password]:focus { border-color: #4854fe; box-shadow: 0 0 0 3px rgba(72,84,254,0.12); }
+.btn { display: block; width: 100%; padding: 12px; background: #241c55; color: #fff; border: none;
+       border-radius: 11.354px; font-family: 'Mulish', sans-serif; font-size: 16px; font-weight: 700;
        cursor: pointer; transition: background 0.2s; }
-.btn:hover { background: #d9551a; }
-.error-box { background: #FEF2F2; border: 1px solid #FECACA; border-radius: 8px;
-             padding: 12px 16px; color: #991B1B; font-size: 14px; margin-bottom: 18px; }
-.success-box { background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 8px;
-               padding: 16px; color: #166534; font-size: 14px; text-align: center; margin-top: 20px; }
-.hint { color: #9CA3AF; font-size: 12px; margin-top: -14px; margin-bottom: 18px; }
+.btn:hover { background: #4854fe; }
+.error-box { background: #fef3f2; border: 1px solid #fecaca; border-radius: 8px;
+             padding: 12px 16px; color: #b42318; font-size: 14px; margin-bottom: 18px; }
+.success-box { background: #ecfdf3; border: 1px solid #bbf7d0; border-radius: 8px;
+               padding: 16px; color: #027a48; font-size: 14px; text-align: center; margin-top: 20px; }
+.hint { color: #818192; font-size: 12px; margin-top: -14px; margin-bottom: 18px; }
 """
 
-_INCORTA_LOGO_SVG = """<svg width="120" height="36" viewBox="0 0 120 36" xmlns="http://www.w3.org/2000/svg">
-  <text x="0" y="28" font-family="Mulish, sans-serif" font-size="28" font-weight="700" fill="#1B2A4A">inc</text>
-  <text x="42" y="28" font-family="Mulish, sans-serif" font-size="28" font-weight="700" fill="#F26522">o</text>
-  <text x="60" y="28" font-family="Mulish, sans-serif" font-size="28" font-weight="700" fill="#1B2A4A">rta</text>
+_INCORTA_LOGO_SVG = """<svg width="160" height="36" viewBox="0 0 555.63 125.85" xmlns="http://www.w3.org/2000/svg">
+  <defs><style>.cls-1{fill:#15152b;}</style></defs>
+  <path class="cls-1" d="M133.93,124.28h-25.43v-52.31c0-7.92-6.42-14.33-14.33-14.33s-14.33,6.42-14.33,14.33v52.31h-25.43v-52.31c0-21.96,17.8-39.76,39.76-39.76s39.76,17.8,39.76,39.76v52.31h0Z"/>
+  <path class="cls-1" d="M233.19,91.7c-2.89,9.97-8.89,18.76-17.13,25.08-13.7,9.65-31.35,11.73-46.93,5.53-5.74-2.48-10.9-6.14-15.14-10.73-4.21-4.43-7.53-9.63-9.78-15.32-2.21-5.68-3.34-11.72-3.31-17.81-.02-6.05,1.17-12.04,3.5-17.62,2.38-5.6,5.8-10.69,10.08-15.01,4.27-4.44,9.38-7.99,15.04-10.44,5.63-2.35,11.68-3.54,17.77-3.48,10.28-.27,20.36,2.88,28.66,8.95,8.31,6.59,14.34,15.64,17.23,25.84h-27.67c-1.73-2.99-4.27-5.42-7.33-7.02-3.44-1.69-7.23-2.52-11.06-2.42-5.49-.1-10.77,2.08-14.6,6-3.83,4.12-5.9,9.58-5.78,15.2-.25,5.94,1.86,11.73,5.88,16.11,6.8,6.22,16.69,7.69,25,3.71,2.99-1.57,5.58-3.82,7.55-6.56h28.02Z"/>
+  <path class="cls-1" d="M252.23,46.14c4.36-4.38,9.53-7.89,15.22-10.31,5.56-2.37,11.54-3.59,17.58-3.6,6.15-.05,12.25,1.07,17.97,3.29,11.57,4.65,20.85,13.66,25.82,25.1,2.45,5.63,3.73,11.69,3.75,17.83.08,6.3-1.06,12.55-3.36,18.41-2.29,5.65-5.72,10.78-10.07,15.06-4.36,4.43-9.55,7.96-15.28,10.38-5.87,2.4-12.17,3.61-18.51,3.55-6.34.09-12.63-1.11-18.49-3.52-5.74-2.49-10.89-6.14-15.14-10.73-4.21-4.35-7.54-9.48-9.78-15.11-2.22-5.64-3.34-11.65-3.31-17.71-.02-6.07,1.17-12.08,3.5-17.69,2.35-5.6,5.78-10.68,10.08-14.95ZM285.53,100.98c5.62-.01,10.99-2.33,14.87-6.4,3.99-4.16,6.2-9.71,6.17-15.47.04-5.81-2.18-11.4-6.17-15.62-7.75-8.21-20.68-8.59-28.9-.84-.29.27-.57.55-.84.84-4,4.21-6.21,9.81-6.17,15.62-.02,5.77,2.21,11.32,6.22,15.47,3.87,4.06,9.22,6.37,14.82,6.4h0Z"/>
+  <path class="cls-1" d="M339.57,82.33v41.95h25.43v-41.95c.01-13.63,11.06-24.68,24.69-24.69v-25.43c-27.67.03-50.09,22.45-50.12,50.12Z"/>
+  <path class="cls-1" d="M443.86,57.67v-25.48h-18.73V12.72h-25.43v111.54h25.43v-55.63c0-5.67,4.59-10.95,10.26-10.95h8.47Z"/>
+  <path class="cls-1" d="M41.91,41.36v-9.15H0l.2,25.44h6.22c5.67,0,10.06,4.8,10.06,10.46v56.15h25.43V41.36h0Z"/>
+  <circle class="cls-1" cx="29.71" cy="12.97" r="12.97"/>
+  <path class="cls-1" d="M539.35,88.28v-56.2h-22.28v7.08c-2.36-1.49-4.86-2.75-7.45-3.78-5.74-2.23-11.85-3.35-18.01-3.3-6.05,0-12.05,1.22-17.62,3.59-5.7,2.43-10.89,5.93-15.26,10.32-4.32,4.28-7.75,9.37-10.1,14.98-2.33,5.61-3.52,11.64-3.51,17.72-.03,6.07,1.1,12.09,3.32,17.74,2.25,5.63,5.57,10.77,9.79,15.12,4.26,4.6,9.42,8.26,15.17,10.75,5.87,2.42,12.17,3.62,18.52,3.53,6.36.06,12.66-1.15,18.55-3.55,2.59-1.08,5.08-2.41,7.42-3.95v6.73h37.74v-26.42h-5.9c-5.73.02-10.39-4.62-10.39-10.35ZM507,94.55c-7.75,8.21-20.69,8.58-28.9.83-.28-.27-.56-.55-.83-.83-4.02-4.16-6.26-9.72-6.25-15.5-.04-5.82,2.18-11.42,6.19-15.64,7.75-8.23,20.71-8.61,28.93-.86.29.28.58.56.86.86,4.01,4.22,6.22,9.83,6.19,15.64.03,5.77-2.19,11.33-6.19,15.5h0Z"/>
 </svg>"""
 
 
@@ -428,7 +434,7 @@ async def cmc_login_submit(request: Request) -> HTMLResponse:
             "<h2>CMC Login</h2>"
             f"<div class='error-box'>Missing required fields: {', '.join(missing)}</div>"
             "<p style='text-align:center; margin-top:16px;'>"
-            "<a href='/cmc-login' style='color:#F26522; font-weight:600;'>Try Again</a></p>"
+            "<a href='/cmc-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
         )
         return _cmc_html_page("CMC Login - Error", error_html, status=400)
 
@@ -447,7 +453,7 @@ async def cmc_login_submit(request: Request) -> HTMLResponse:
             "<h2>CMC Login</h2>"
             f"<div class='error-box'>{error_msg}</div>"
             "<p style='text-align:center; margin-top:16px;'>"
-            "<a href='/cmc-login' style='color:#F26522; font-weight:600;'>Try Again</a></p>"
+            "<a href='/cmc-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
         )
         return _cmc_html_page("CMC Login - Failed", error_html, status=401)
 
