@@ -77,16 +77,19 @@ def _extract_rows(result: dict) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def get_customer_bugs(customer_name: str) -> dict:
+def get_customer_bugs(customer_name: str, from_version: str = "") -> dict:
     """Retrieve all bugs reported by a customer with their fix version info.
 
     Args:
         customer_name: Customer name to filter by (uses LIKE matching).
+        from_version: Current version to filter by affected version (optional).
+                      When provided, only returns bugs affecting this version.
 
     Returns:
         {
             "bugs": [{ key, summary, status, priority, issue_type, customer,
-                       fix_version }],
+                       fix_version, created, updated, resolution, labels,
+                       description, affected_version }],
             "total_bugs": int,
             "found": bool,
             "error": str | None,
@@ -97,6 +100,15 @@ def get_customer_bugs(customer_name: str) -> dict:
     if err:
         return {"bugs": [], "total_bugs": 0, "found": False, **err}
 
+    # Build optional affected version join/filter
+    affected_join = ""
+    affected_select = ""
+    affected_where = ""
+    if from_version:
+        affected_select = ",\n        iav.Name AS affected_version"
+        affected_join = "\n    JOIN Jira_F.IssueAffectedVersions iav ON i.Key = iav.IssueKey"
+        affected_where = f"\n      AND iav.Name LIKE '{from_version}%'"
+
     sql = f"""
     SELECT
         i.Key,
@@ -105,11 +117,16 @@ def get_customer_bugs(customer_name: str) -> dict:
         i.PriorityName,
         i.IssueTypeName,
         i.Customer,
-        ifv.Name AS fix_version
+        i.Created,
+        i.Updated,
+        i.ResolutionName,
+        i.Labels,
+        SUBSTRING(i.Description, 1, 500) AS description,
+        ifv.Name AS fix_version{affected_select}
     FROM Jira_F.Issues i
-    LEFT JOIN Jira_F.IssueFixVersions ifv ON i.Key = ifv.IssueKey
+    LEFT JOIN Jira_F.IssueFixVersions ifv ON i.Key = ifv.IssueKey{affected_join}
     WHERE i.Customer LIKE '%{customer_name}%'
-      AND i.IssueTypeName = 'Bug'
+      AND i.IssueTypeName = 'Bug'{affected_where}
     ORDER BY i.PriorityName ASC
     LIMIT 200
     """
@@ -125,8 +142,9 @@ def get_customer_bugs(customer_name: str) -> dict:
         }
 
     rows = _extract_rows(result)
-    bugs = [
-        {
+    bugs = []
+    for r in rows:
+        bug = {
             "key": r.get("Key", ""),
             "summary": r.get("Summary", ""),
             "status": r.get("StatusName", ""),
@@ -134,9 +152,16 @@ def get_customer_bugs(customer_name: str) -> dict:
             "issue_type": r.get("IssueTypeName", ""),
             "customer": r.get("Customer", ""),
             "fix_version": r.get("fix_version"),
+            "created": r.get("Created", ""),
+            "updated": r.get("Updated", ""),
+            "resolution": r.get("ResolutionName", ""),
+            "labels": r.get("Labels", ""),
+            "description": r.get("description", ""),
         }
-        for r in rows
-    ]
+        if from_version:
+            bug["affected_version"] = r.get("affected_version", "")
+        bugs.append(bug)
+
     return {
         "bugs": bugs,
         "total_bugs": len(bugs),
@@ -191,6 +216,12 @@ def get_linked_jira_issues(jira_keys: List[str]) -> dict:
         i.StatusName,
         i.PriorityName,
         i.IssueTypeName,
+        i.Customer,
+        i.Created,
+        i.Updated,
+        i.ResolutionName,
+        i.Labels,
+        SUBSTRING(i.Description, 1, 500) AS description,
         ifv.Name AS fix_version
     FROM Jira_F.Issues i
     LEFT JOIN Jira_F.IssueFixVersions ifv ON i.Key = ifv.IssueKey
@@ -216,7 +247,13 @@ def get_linked_jira_issues(jira_keys: List[str]) -> dict:
             "status": r.get("StatusName", ""),
             "priority": r.get("PriorityName", ""),
             "issue_type": r.get("IssueTypeName", ""),
+            "customer": r.get("Customer", ""),
             "fix_version": r.get("fix_version"),
+            "created": r.get("Created", ""),
+            "updated": r.get("Updated", ""),
+            "resolution": r.get("ResolutionName", ""),
+            "labels": r.get("Labels", ""),
+            "description": r.get("description", ""),
         }
         for r in rows
     ]
@@ -258,19 +295,35 @@ def get_upgrade_path_bugs(from_version: str, to_version: str) -> dict:
     if err:
         return {"bugs": [], "total_bugs": 0, "found": False, **err}
 
+    # Build version filter — need at least one version to filter on
+    version_conditions = []
+    if from_version:
+        version_conditions.append(f"iav.Name LIKE '{from_version}%'")
+    if to_version:
+        version_conditions.append(f"iav.Name LIKE '{to_version}%'")
+    if not version_conditions:
+        return {"bugs": [], "total_bugs": 0, "found": False,
+                "error": None, "data_gaps": []}
+    version_filter = " OR ".join(version_conditions)
+
     sql = f"""
     SELECT
         i.Key,
         i.Summary,
         i.StatusName,
         i.PriorityName,
+        i.Created,
+        i.Updated,
+        i.ResolutionName,
+        i.Labels,
+        SUBSTRING(i.Description, 1, 500) AS description,
         iav.Name AS affected_version,
         ifv.Name AS fix_version
     FROM Jira_F.Issues i
     JOIN Jira_F.IssueAffectedVersions iav ON i.Key = iav.IssueKey
     LEFT JOIN Jira_F.IssueFixVersions ifv ON i.Key = ifv.IssueKey
     WHERE i.IssueTypeName = 'Bug'
-      AND (iav.Name LIKE '{from_version}%' OR iav.Name LIKE '{to_version}%')
+      AND ({version_filter})
     ORDER BY i.PriorityName ASC
     LIMIT 200
     """
@@ -294,6 +347,11 @@ def get_upgrade_path_bugs(from_version: str, to_version: str) -> dict:
             "priority": r.get("PriorityName", ""),
             "affected_version": r.get("affected_version", ""),
             "fix_version": r.get("fix_version"),
+            "created": r.get("Created", ""),
+            "updated": r.get("Updated", ""),
+            "resolution": r.get("ResolutionName", ""),
+            "labels": r.get("Labels", ""),
+            "description": r.get("description", ""),
         }
         for r in rows
     ]
@@ -311,27 +369,39 @@ def get_upgrade_path_bugs(from_version: str, to_version: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_WONT_FIX_RESOLUTIONS = frozenset({
+    "won't fix", "wontfix", "duplicate", "cannot reproduce", "incomplete",
+})
+
+
 def classify_bug_fix_status(
     bugs: List[Dict[str, Any]], to_version: str
 ) -> dict:
-    """Classify each bug as fixed in target, still open, or requires dot release.
+    """Classify each bug as fixed in target, still open, won't fix, or requires dot release.
+
+    Uses both StatusName and ResolutionName for accurate classification.
+    A bug "Closed as Won't Fix" is separated from genuinely fixed bugs.
 
     Args:
-        bugs: List of bug dicts with at least 'key', 'status', and 'fix_version'.
+        bugs: List of bug dicts with at least 'key', 'status', 'fix_version',
+              and optionally 'resolution'.
         to_version: Target Incorta version.
 
     Returns:
         {
             "fixed_in_target": [{ key, summary, fix_version }],
             "still_open": [{ key, summary, status }],
+            "wont_fix": [{ key, summary, resolution }],
             "requires_later_release": [{ key, summary, fix_version }],
-            "summary": { fixed_count, open_count, later_release_count, total },
+            "summary": { fixed_count, open_count, wont_fix_count,
+                         later_release_count, total },
             "error": None,
             "data_gaps": []
         }
     """
     fixed_in_target: List[Dict[str, Any]] = []
     still_open: List[Dict[str, Any]] = []
+    wont_fix: List[Dict[str, Any]] = []
     requires_later: List[Dict[str, Any]] = []
 
     # De-duplicate by key (a bug may appear multiple times with different fix versions)
@@ -355,8 +425,16 @@ def classify_bug_fix_status(
         summary = bug.get("summary", "")
         status = bug.get("status", "")
         fix_version = bug.get("fix_version")
+        resolution = (bug.get("resolution") or "").strip()
 
-        if fix_version and fix_version == to_version:
+        # Check for "Won't Fix" / "Duplicate" / "Cannot Reproduce" first
+        if resolution.lower() in _WONT_FIX_RESOLUTIONS:
+            wont_fix.append({
+                "key": key,
+                "summary": summary,
+                "resolution": resolution,
+            })
+        elif fix_version and fix_version == to_version:
             fixed_in_target.append({
                 "key": key,
                 "summary": summary,
@@ -375,7 +453,7 @@ def classify_bug_fix_status(
                 "status": status,
             })
         else:
-            # Has a fix version that's earlier or equal — check if it matches target
+            # Has a fix version that's earlier or equal — resolved
             fixed_in_target.append({
                 "key": key,
                 "summary": summary,
@@ -385,10 +463,12 @@ def classify_bug_fix_status(
     return {
         "fixed_in_target": fixed_in_target,
         "still_open": still_open,
+        "wont_fix": wont_fix,
         "requires_later_release": requires_later,
         "summary": {
             "fixed_count": len(fixed_in_target),
             "open_count": len(still_open),
+            "wont_fix_count": len(wont_fix),
             "later_release_count": len(requires_later),
             "total": len(seen_keys),
         },

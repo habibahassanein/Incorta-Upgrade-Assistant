@@ -563,3 +563,66 @@ def get_linked_jira_keys(from_v: str, to_v: str) -> dict:
         "error": None,
         "data_gaps": [],
     }
+
+
+# ---------------------------------------------------------------------------
+# Helper 8: Customer-Specific Jira Links (all tickets, not just upgrade-tagged)
+# ---------------------------------------------------------------------------
+
+
+def get_customer_jira_links(customer_name: str) -> dict:
+    """Extract Jira issue keys linked to ANY of a customer's Zendesk tickets.
+
+    Unlike get_linked_jira_keys() which only finds upgrade-tagged tickets,
+    this helper finds ALL Jira links for a customer's org — providing a
+    complete view of customer bugs tracked in both systems.
+
+    Uses case-insensitive LIKE matching on organization name for semantic
+    fuzzy matching (e.g., "Acme" matches "Acme Corp", "ACME Corporation").
+
+    Args:
+        customer_name: Customer name (fuzzy matched against org name).
+
+    Returns:
+        {
+            "jira_keys": [str],
+            "found": bool,
+            "error": str | None,
+            "data_gaps": []
+        }
+    """
+    if not customer_name:
+        return {"jira_keys": [], "found": False, "error": None, "data_gaps": []}
+
+    err = _check_schema_ready()
+    if err:
+        return {"jira_keys": [], "found": False, **err}
+
+    sql = f"""
+    SELECT DISTINCT tjl.jira_issue_key
+    FROM ZendeskTickets.ticket_jira_links tjl
+    INNER JOIN ZendeskTickets.ticket t ON tjl.ticket_id = t.id
+    INNER JOIN ZendeskTickets.organization o ON t.organization_id = o.id
+    WHERE LOWER(o.name) LIKE LOWER('%{customer_name}%')
+    LIMIT 200
+    """
+
+    result = _run_query(sql)
+    if result.get("error"):
+        # ticket_jira_links or organization table may not exist
+        return {
+            "jira_keys": [],
+            "found": False,
+            "error": None,
+            "data_gaps": ["ticket_jira_links or organization table may not be available"],
+        }
+
+    rows = _extract_rows(result)
+    keys = [r.get("jira_issue_key", "") for r in rows if r.get("jira_issue_key")]
+
+    return {
+        "jira_keys": keys,
+        "found": len(keys) > 0,
+        "error": None,
+        "data_gaps": [],
+    }

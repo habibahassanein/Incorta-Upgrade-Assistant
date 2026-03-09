@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 class JiraCollectionState(TypedDict):
     # Inputs
     customer_name: str
+    from_version: str
     to_version: str
     linked_jira_keys: List[str]  # From Zendesk ticket_jira_links
 
@@ -94,7 +95,8 @@ def collect_customer_bugs_node(state: JiraCollectionState) -> JiraCollectionStat
         return {**state, "customer_bugs": {"bugs": [], "total_bugs": 0, "found": False,
                                            "error": None, "data_gaps": []}}
     try:
-        result = get_customer_bugs(customer_name)
+        from_version = state.get("from_version", "")
+        result = get_customer_bugs(customer_name, from_version)
         return {**state, "customer_bugs": result}
     except Exception as e:
         errors = list(state.get("errors", []))
@@ -124,8 +126,8 @@ def collect_upgrade_path_bugs_node(state: JiraCollectionState) -> JiraCollection
     if not state.get("schema_ready"):
         return {**state, "upgrade_path_bugs": {}}
     try:
-        # Use the to_version as both boundaries for now (prefix matching in the query)
-        result = get_upgrade_path_bugs("", state["to_version"])
+        from_version = state.get("from_version", "")
+        result = get_upgrade_path_bugs(from_version, state["to_version"])
         return {**state, "upgrade_path_bugs": result}
     except Exception as e:
         errors = list(state.get("errors", []))
@@ -196,6 +198,7 @@ def synthesize_jira_findings(state: JiraCollectionState) -> JiraCollectionState:
     summary = classification.get("summary", {})
     open_count = summary.get("open_count", 0)
     fixed_count = summary.get("fixed_count", 0)
+    wont_fix_count = summary.get("wont_fix_count", 0)
     later_count = summary.get("later_release_count", 0)
     total = summary.get("total", 0)
 
@@ -213,6 +216,14 @@ def synthesize_jira_findings(state: JiraCollectionState) -> JiraCollectionState:
         warnings.append(
             f"[Jira] {open_count - len(critical_open)} customer-reported bug(s) still open "
             f"with no fix version assigned"
+        )
+
+    # Won't Fix / Duplicate bugs are warnings
+    if wont_fix_count > 0:
+        wf_bugs = classification.get("wont_fix", [])
+        warnings.append(
+            f"[Jira] {wont_fix_count} bug(s) closed as Won't Fix/Duplicate/Cannot Reproduce: "
+            f"{', '.join(b['key'] + ' (' + str(b.get('resolution', '?')) + ')' for b in wf_bugs[:5])}"
         )
 
     # Bugs requiring later release are warnings
@@ -292,6 +303,7 @@ def _build_jira_workflow():
 def run_jira_collection(
     customer_name: str,
     to_version: str,
+    from_version: str = "",
     linked_jira_keys: List[str] | None = None,
 ) -> dict:
     """Run the full Jira bug collection workflow.
@@ -299,6 +311,8 @@ def run_jira_collection(
     Args:
         customer_name: Customer name for bug filtering (e.g., 'Acme Corp').
         to_version: Target Incorta version (e.g., '2024.7.0').
+        from_version: Current Incorta version (e.g., '2024.1.0'). When provided,
+                      filters customer bugs by affected version.
         linked_jira_keys: Jira issue keys from Zendesk ticket_jira_links (optional).
 
     Returns:
@@ -307,6 +321,7 @@ def run_jira_collection(
     """
     initial_state: JiraCollectionState = {
         "customer_name": customer_name,
+        "from_version": from_version,
         "to_version": to_version,
         "linked_jira_keys": linked_jira_keys or [],
         "schema_ready": False,

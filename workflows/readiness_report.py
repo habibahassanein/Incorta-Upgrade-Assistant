@@ -129,7 +129,10 @@ def collect_zendesk_data(state: ReadinessState) -> ReadinessState:
     try:
         from workflows.collect_zendesk_issues import run_zendesk_collection
 
-        findings = run_zendesk_collection(from_v, to_v)
+        findings = run_zendesk_collection(
+            from_v, to_v,
+            customer_name=state.get("customer_name", ""),
+        )
         return {**state, "zendesk_issues": findings}
     except Exception as e:
         errors.append(f"Zendesk collection failed: {e}")
@@ -162,6 +165,7 @@ def collect_jira_data(state: ReadinessState) -> ReadinessState:
         findings = run_jira_collection(
             customer_name=state.get("customer_name", ""),
             to_version=to_v,
+            from_version=state.get("from_version", ""),
             linked_jira_keys=linked_keys,
         )
         return {**state, "jira_issues": findings}

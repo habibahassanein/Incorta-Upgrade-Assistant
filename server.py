@@ -73,6 +73,12 @@ def generate_upgrade_readiness_report(
     This is the recommended single-command way to assess upgrade readiness.
     It runs ALL other tools internally and produces a unified report.
 
+    IMPORTANT: Before calling this tool, the agent MUST ask the user for their
+    customer name in conversation. Do not assume or guess the customer name.
+    The name is used for fuzzy matching in both Jira (Customer field) and
+    Zendesk (organization name), so partial names work (e.g., "Acme" matches
+    "Acme Corp" in Jira and "Acme Corporation" in Zendesk).
+
     PREREQUISITES:
     - Ask the user for the Cloud Portal cluster name (e.g., 'habibascluster') and
       make sure the cluster is running before calling this tool.
@@ -84,13 +90,15 @@ def generate_upgrade_readiness_report(
     - Risk assessment (critical issues, resolution times)
     - Environment-specific issues (cloud vs on-prem)
     - Customer satisfaction metrics
+    - Jira keys linked to ALL of this customer's Zendesk tickets (fuzzy org match)
     No manual SQL or Zendesk tool calls needed — this runs automatically.
 
     AUTOMATIC JIRA BUG ANALYSIS: The report automatically queries Jira for:
-    - Customer-reported bugs and their fix version status
-    - Bugs linked from Zendesk tickets
+    - Customer-reported bugs filtered by affected version (from_version)
+    - Bugs linked from Zendesk tickets (both upgrade-tagged and all customer tickets)
     - Bugs from other customers affecting versions in the upgrade path
-    - Classification: fixed in target / still open / requires later release
+    - Classification: fixed in target / still open / won't fix / requires later release
+    - Rich bug details: Created, Updated, ResolutionName, Labels, Description
     Requires customer_name to match bugs in Jira.
 
     OUTPUT INCLUDES:

@@ -1,10 +1,13 @@
 
 
+import logging
 import os
 from typing import Dict, Any, List
 import requests
 
 from context.user_context import user_context
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +412,16 @@ def query_zendesk(arguments: Dict[str, Any]) -> dict:
 
     params = {"sql": arguments['spark_sql']}
 
-    response = requests.post(url, headers=headers, json=params, verify=False)
+    for attempt in range(2):
+        try:
+            response = requests.post(url, headers=headers, json=params,
+                                     verify=False, timeout=120)
+            break
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                logger.warning("Zendesk query timed out, retrying...")
+                continue
+            return {"error": "Zendesk query timed out after 2 attempts (120s each). Try a more selective query."}
 
     if response.status_code == 200:
         return {
@@ -448,7 +460,16 @@ def query_jira(arguments: Dict[str, Any]) -> dict:
 
     params = {"sql": arguments['spark_sql']}
 
-    response = requests.post(url, headers=headers, json=params, verify=False)
+    for attempt in range(2):
+        try:
+            response = requests.post(url, headers=headers, json=params,
+                                     verify=False, timeout=120)
+            break
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                logger.warning("Jira query timed out, retrying...")
+                continue
+            return {"error": "Jira query timed out after 2 attempts (120s each). Try a more selective query."}
 
     if response.status_code == 200:
         return {

@@ -27,6 +27,7 @@ from tools.zendesk_helpers import (
     get_complete_upgrade_issues,
     assess_upgrade_satisfaction,
     get_linked_jira_keys,
+    get_customer_jira_links,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class ZendeskCollectionState(TypedDict):
     # Inputs
     from_version: str
     to_version: str
+    customer_name: str
 
     # Schema validation
     schema_ready: bool
@@ -52,6 +54,7 @@ class ZendeskCollectionState(TypedDict):
     complete_issues: dict
     satisfaction_data: dict
     linked_jira_data: dict
+    customer_jira_data: dict
 
     # Aggregated output
     zendesk_findings: dict
@@ -188,8 +191,30 @@ def collect_linked_jira_keys(state: ZendeskCollectionState) -> ZendeskCollection
         return {**state, "linked_jira_data": {}, "errors": errors}
 
 
+def collect_customer_jira_links_node(state: ZendeskCollectionState) -> ZendeskCollectionState:
+    """Query G: Extract Jira keys linked to ALL of this customer's Zendesk tickets.
+
+    Unlike collect_linked_jira_keys which only finds upgrade-tagged tickets,
+    this finds ALL Jira links for the customer's org — covering regular support
+    tickets too. Uses fuzzy org name matching.
+    """
+    if not state.get("schema_ready"):
+        return {**state, "customer_jira_data": {}}
+    customer_name = state.get("customer_name", "")
+    if not customer_name:
+        return {**state, "customer_jira_data": {
+            "jira_keys": [], "found": False, "error": None, "data_gaps": []}}
+    try:
+        result = get_customer_jira_links(customer_name)
+        return {**state, "customer_jira_data": result}
+    except Exception as e:
+        errors = list(state.get("errors", []))
+        errors.append(f"Zendesk customer Jira links query failed: {e}")
+        return {**state, "customer_jira_data": {}, "errors": errors}
+
+
 # ---------------------------------------------------------------------------
-# Node 8: Synthesise findings
+# Node 9: Synthesise findings
 # ---------------------------------------------------------------------------
 
 def synthesize_zendesk_findings(state: ZendeskCollectionState) -> ZendeskCollectionState:
@@ -201,6 +226,7 @@ def synthesize_zendesk_findings(state: ZendeskCollectionState) -> ZendeskCollect
     complete = state.get("complete_issues", {})
     satisfaction = state.get("satisfaction_data", {})
     linked_jira = state.get("linked_jira_data", {})
+    customer_jira = state.get("customer_jira_data", {})
     errors = list(state.get("errors", []))
 
     # Determine if we have any useful data
@@ -270,11 +296,17 @@ def synthesize_zendesk_findings(state: ZendeskCollectionState) -> ZendeskCollect
 
     # Collect data gaps from all sub-queries
     data_gaps: list[str] = []
-    for d in [version_pair, risk, env, common, complete, satisfaction, linked_jira]:
+    for d in [version_pair, risk, env, common, complete, satisfaction,
+              linked_jira, customer_jira]:
         if d and d.get("data_gaps"):
             data_gaps.extend(d["data_gaps"])
     if not state.get("schema_ready"):
         data_gaps.append("Zendesk schema not available — all ticket analysis skipped")
+
+    # Merge upgrade-tagged Jira keys + customer-specific Jira keys (deduplicate)
+    upgrade_jira_keys = set(linked_jira.get("jira_keys", []))
+    customer_jira_keys = set(customer_jira.get("jira_keys", []))
+    all_jira_keys = list(upgrade_jira_keys | customer_jira_keys)
 
     findings = {
         "data_available": data_available,
@@ -284,7 +316,7 @@ def synthesize_zendesk_findings(state: ZendeskCollectionState) -> ZendeskCollect
         "common_issues": common,
         "complete_issues": complete,
         "satisfaction_data": satisfaction,
-        "linked_jira_keys": linked_jira.get("jira_keys", []),
+        "linked_jira_keys": all_jira_keys,
         "blockers": blockers,
         "warnings": warnings,
         "considerations": considerations,
@@ -309,9 +341,10 @@ def _build_zendesk_workflow():
     workflow.add_node("complete_details", collect_complete_details)
     workflow.add_node("satisfaction", collect_satisfaction)
     workflow.add_node("linked_jira", collect_linked_jira_keys)
+    workflow.add_node("customer_jira", collect_customer_jira_links_node)
     workflow.add_node("synthesize", synthesize_zendesk_findings)
 
-    # Sequential: validate schema first, then run all 7 queries, then synthesize
+    # Sequential: validate schema first, then run all 8 queries, then synthesize
     workflow.set_entry_point("validate_schema")
     workflow.add_edge("validate_schema", "version_pair")
     workflow.add_edge("version_pair", "risk_patterns")
@@ -320,7 +353,8 @@ def _build_zendesk_workflow():
     workflow.add_edge("common_types", "complete_details")
     workflow.add_edge("complete_details", "satisfaction")
     workflow.add_edge("satisfaction", "linked_jira")
-    workflow.add_edge("linked_jira", "synthesize")
+    workflow.add_edge("linked_jira", "customer_jira")
+    workflow.add_edge("customer_jira", "synthesize")
     workflow.add_edge("synthesize", END)
 
     return workflow.compile()
@@ -330,20 +364,28 @@ def _build_zendesk_workflow():
 # Public entry function
 # ---------------------------------------------------------------------------
 
-def run_zendesk_collection(from_version: str, to_version: str) -> dict:
+def run_zendesk_collection(
+    from_version: str,
+    to_version: str,
+    customer_name: str = "",
+) -> dict:
     """Run the full Zendesk issue collection workflow.
 
     Args:
         from_version: Current Incorta version (e.g., '2024.1.0')
         to_version: Target Incorta version (e.g., '2024.7.0')
+        customer_name: Customer name for fuzzy org matching (optional).
+                       When provided, also extracts Jira keys linked to ALL
+                       of this customer's Zendesk tickets (not just upgrade-tagged).
 
     Returns:
         dict: Unified zendesk_findings with blockers, warnings, considerations,
-              and data from all 6 queries.
+              and data from all queries.
     """
     initial_state: ZendeskCollectionState = {
         "from_version": from_version,
         "to_version": to_version,
+        "customer_name": customer_name,
         "schema_ready": False,
         "version_pair_issues": {},
         "risk_patterns": {},
@@ -352,6 +394,7 @@ def run_zendesk_collection(from_version: str, to_version: str) -> dict:
         "complete_issues": {},
         "satisfaction_data": {},
         "linked_jira_data": {},
+        "customer_jira_data": {},
         "zendesk_findings": {},
         "errors": [],
     }
