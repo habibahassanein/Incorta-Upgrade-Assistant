@@ -282,7 +282,13 @@ def collect_cloud_data(state: ReadinessState) -> ReadinessState:
 # ---------------------------------------------------------------------------
 
 def collect_upgrade_knowledge(state: ReadinessState) -> ReadinessState:
-    """Search knowledge base for upgrade considerations between versions."""
+    """Search knowledge base for upgrade considerations, informed by cluster metadata.
+
+    Runs a baseline version query plus context-aware queries built from the
+    customer's actual cluster configuration (database, topology, Spark, features,
+    connectors, platform). Results are deduplicated by URL and tagged with their
+    source category for downstream assessment.
+    """
     errors = list(state.get("errors", []))
     from_v = state.get("from_version", "")
     to_v = state.get("to_version", "")
@@ -292,11 +298,46 @@ def collect_upgrade_knowledge(state: ReadinessState) -> ReadinessState:
 
     try:
         from tools.qdrant_tool import search_knowledge_base
+        from workflows.upgrade_research import _build_context_queries
 
-        query = f"upgrade considerations from {from_v} to {to_v}"
-        result = search_knowledge_base({"query": query, "limit": 10})
-        knowledge = result.get("results", []) if isinstance(result, dict) else []
-        return {**state, "upgrade_knowledge": knowledge}
+        all_results = []
+        seen_urls: set = set()
+
+        def _add_results(results, category="general"):
+            """Deduplicate by URL and tag results with category."""
+            for item in results:
+                url = item.get("url", "")
+                if url and url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                item["context_category"] = category
+                all_results.append(item)
+
+        # 1. Baseline version query (always runs)
+        baseline_query = f"upgrade considerations from {from_v} to {to_v}"
+        baseline_result = search_knowledge_base({"query": baseline_query, "limit": 5})
+        _add_results(
+            baseline_result.get("results", []) if isinstance(baseline_result, dict) else [],
+            category="version",
+        )
+
+        # 2. Context-aware queries from cluster metadata
+        cluster_meta = state.get("cluster_metadata", {})
+        cloud_meta = state.get("cloud_metadata", {})
+        context_queries = _build_context_queries(from_v, to_v, cluster_meta, cloud_meta)
+
+        for category, query_text, limit in context_queries:
+            try:
+                result = search_knowledge_base({"query": query_text, "limit": limit})
+                items = result.get("results", []) if isinstance(result, dict) else []
+                _add_results(items, category=category)
+            except Exception:
+                continue  # Skip failed individual queries
+
+        # Sort by relevance score descending
+        all_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        return {**state, "upgrade_knowledge": all_results}
     except Exception as e:
         errors.append(f"Upgrade knowledge search failed: {e}")
         return {**state, "upgrade_knowledge": [], "errors": errors}
@@ -307,7 +348,7 @@ def collect_upgrade_knowledge(state: ReadinessState) -> ReadinessState:
 # ---------------------------------------------------------------------------
 
 def collect_upgrade_research(state: ReadinessState) -> ReadinessState:
-    """Run the full upgrade path research workflow."""
+    """Run the full upgrade path research workflow with cluster-specific context."""
     errors = list(state.get("errors", []))
     from_v = state.get("from_version", "")
     to_v = state.get("to_version", "")
@@ -318,7 +359,12 @@ def collect_upgrade_research(state: ReadinessState) -> ReadinessState:
     try:
         from workflows.upgrade_research import research_upgrade_path
 
-        report = research_upgrade_path(from_v, to_v)
+        report = research_upgrade_path(
+            from_v,
+            to_v,
+            cluster_metadata=state.get("cluster_metadata", {}),
+            cloud_metadata=state.get("cloud_metadata", {}),
+        )
         return {**state, "upgrade_research": {"report": report}}
     except Exception as e:
         errors.append(f"Upgrade research failed: {e}")
@@ -438,13 +484,32 @@ def assess_readiness(state: ReadinessState) -> ReadinessState:
             "All nodes must be upgraded. Coordinate downtime."
         )
 
-    # Knowledge base version-specific notes
+    # Knowledge base version-specific and context-specific notes
     if knowledge:
+        # Category-aware labels for considerations
+        _kb_category_labels = {
+            "version": "Version Note",
+            "database": "Database Note",
+            "topology": "Topology Note",
+            "spark": "Spark Note",
+            "python": "Python Note",
+            "notebook": "Notebook Note",
+            "sqli": "SQLi Note",
+            "kyuubi": "Kyuubi Note",
+            "mlflow": "MLflow Note",
+            "data_agent": "Data Agent Note",
+            "incorta_x": "Incorta X Note",
+            "data_studio": "Data Studio Note",
+            "connectors": "Connector Note",
+            "platform": "Platform Note",
+        }
         high_relevance = [k for k in knowledge if k.get("score", 0) > 0.5]
-        for item in high_relevance[:5]:
+        for item in high_relevance[:8]:
             title = item.get("title", "Untitled")
             text = item.get("text", "")[:200]
-            considerations.append(f"Version Note: {title} -- {text}")
+            category = item.get("context_category", "version")
+            label = _kb_category_labels.get(category, "Version Note")
+            considerations.append(f"{label}: {title} -- {text}")
 
     # Data collection errors as considerations
     if errors:
