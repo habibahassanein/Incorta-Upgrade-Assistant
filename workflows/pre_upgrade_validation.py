@@ -27,6 +27,7 @@ from tools.validation_checks import (
     check_database_migration,
     generate_report
 )
+from tools.test_connection import test_all_connections
 
 
 class ValidationState(TypedDict):
@@ -47,6 +48,62 @@ def fetch_cluster_data(state: ValidationState) -> ValidationState:
         return {**state, "cluster_data": cluster_data}
     except Exception as e:
         return {**state, "error": str(e)}
+
+
+def check_datasource_connectivity() -> dict:
+    """Check datasource connectivity using cached Incorta Analytics session.
+
+    Returns a validation check result dict with status and details.
+    Skips gracefully if no Analytics session is available.
+    """
+    # Import the cached session from server module
+    try:
+        from server import _incorta_session_cache
+    except ImportError:
+        _incorta_session_cache = {}
+
+    if not _incorta_session_cache.get("authorization"):
+        return {
+            "status": "WARN",
+            "details": [
+                "Datasource connectivity not checked — Incorta Analytics login required.",
+                "Call the **test_datasource_connections** tool to authenticate and test connections.",
+            ],
+        }
+
+    try:
+        result = test_all_connections(_incorta_session_cache)
+    except Exception as e:
+        return {
+            "status": "WARN",
+            "details": [f"Failed to test datasource connections: {str(e)}"],
+        }
+
+    if "error" in result:
+        return {
+            "status": "WARN",
+            "details": [result["error"]],
+        }
+
+    details = [
+        f"Tested {result['tested']}/{result['total']} datasources "
+        f"({result['skipped']} skipped — no test support)",
+    ]
+
+    if result["failed"] == 0:
+        status = "PASS"
+        details.append(f"All {result['passed']} tested datasources connected successfully.")
+    else:
+        status = "FAIL"
+        details.append(f"{result['passed']} passed, {result['failed']} failed:")
+        for r in result["results"]:
+            mark = "OK" if r["success"] else "FAIL"
+            details.append(f"  [{mark}] {r['name']} ({r.get('type', 'unknown')}): {r['message']}")
+
+    if result["skipped_datasources"]:
+        details.append(f"Skipped: {', '.join(result['skipped_datasources'])}")
+
+    return {"status": status, "details": details}
 
 
 def validate_services(state: ValidationState) -> ValidationState:
@@ -84,8 +141,10 @@ def validate_services(state: ValidationState) -> ValidationState:
         "Database Migration": check_database_migration(state["cluster_data"]),
     }
 
+    # Datasource connectivity check (requires Incorta Analytics login)
+    checks["Data Source Connectivity"] = check_datasource_connectivity()
+
     # --- Future checks that require additional API endpoints ---
-    # checks["Data Source Connectivity"] = check_datasources(state["cluster_data"])  # Req K
     # checks["Top Workloads"] = check_top_workloads(state["cluster_data"])  # Req M
     # checks["Scheduled Jobs"] = check_scheduled_jobs(state["cluster_data"])  # Req O
     # checks["Inspector Tool"] = check_inspector_results(state["cluster_data"])  # Req R

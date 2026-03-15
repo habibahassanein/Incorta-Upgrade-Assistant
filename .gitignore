@@ -21,3 +21,12 @@ logs/
 
 # Generated checklist Excel files
 *_filled.xlsx
+
+# Claude Code workspace files
+.claude/
+
+# Local MCP client config (contains credentials)
+claude_desktop_config.json
+
+# Docs (internal feature specs, not for repo)
+docs/

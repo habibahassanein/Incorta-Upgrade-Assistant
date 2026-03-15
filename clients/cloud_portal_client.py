@@ -59,8 +59,68 @@ def discover_auth0_config(portal_url: str) -> dict:
         return {}
 
 
-# Auth0 configuration — env vars take precedence; fall back to values
-# discovered from the Cloud Portal JS bundle, then hardcoded staging defaults.
+# ---------------------------------------------------------------------------
+# Environment presets — staging vs production
+# ---------------------------------------------------------------------------
+ENVIRONMENTS = {
+    "staging": {
+        "portal_url": "https://cloudstaging.incortalabs.com",
+        "auth0_domain": "auth-staging.incortalabs.com",
+        "auth0_client_id": "1H6oWlDKORKc6BmiYWSjECS8Zq6XesV8",
+        "cmc_domain": "cloudstaging.incortalabs.com",
+    },
+    "production": {
+        "portal_url": "https://cloud.incorta.com",
+        "auth0_domain": "auth.incorta.com",
+        "auth0_client_id": "NoUnC0eTxnqwc4I7hwFMp7PANP8Uju1Y",
+        "cmc_domain": "cloud2.incorta.com",
+    },
+}
+
+
+def _detect_environment() -> str:
+    """Detect environment from CMC URL domain, falling back to INCORTA_ENV env var.
+
+    Checks the CMC URL (from env var or cached token) to determine whether
+    the user is connected to staging or production:
+      - 'cloud2.incorta.com' in CMC URL → 'production'
+      - 'cloudstaging.incortalabs.com' in CMC URL → 'staging'
+      - No CMC URL → INCORTA_ENV env var (default: 'staging')
+    """
+    cmc_url = os.getenv("CMC_URL", "")
+    if not cmc_url:
+        # Check cached CMC token
+        from clients.cmc_client import CMCClient
+        cached = CMCClient.load_cached_config()
+        cmc_url = cached.get("url", "")
+
+    if "cloud2.incorta.com" in cmc_url:
+        return "production"
+    elif "cloudstaging.incortalabs.com" in cmc_url:
+        return "staging"
+
+    return os.getenv("INCORTA_ENV", "staging")
+
+
+def _get_env_preset() -> dict:
+    """Return the environment preset for the detected (or configured) environment."""
+    env_name = _detect_environment()
+    return ENVIRONMENTS.get(env_name, ENVIRONMENTS["staging"])
+
+
+# ---------------------------------------------------------------------------
+# Auth0 & Cloud Portal configuration
+#
+# Resolution order:
+#   1. Explicit env vars (CLOUD_PORTAL_URL, AUTH0_CLIENT_ID, etc.) — always win
+#   2. Auto-detect from CMC URL → select matching environment preset
+#   3. INCORTA_ENV env var → select preset (fallback when no CMC URL)
+#   4. Staging defaults — last resort
+#
+# NOTE: Initial values are set at import time using staging defaults.
+# _resolve_cloud_config() is called lazily (from CloudPortalClient.__init__)
+# to re-resolve based on the CMC URL, which may not be available at import.
+# ---------------------------------------------------------------------------
 _discovered: dict = {}
 if not os.getenv("AUTH0_DOMAIN") or not os.getenv("AUTH0_AUDIENCE") or not os.getenv("AUTH0_CLIENT_ID"):
     _discovered = discover_auth0_config(
@@ -79,14 +139,57 @@ CALLBACK_PORT = int(os.getenv("AUTH0_CALLBACK_PORT", "8910"))
 CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
 TOKEN_CACHE_PATH = Path(os.getenv("TOKEN_CACHE_PATH", str(Path.home() / ".incorta_cloud_token.json")))
 
+_cloud_config_resolved = False
+
+
+def _resolve_cloud_config():
+    """Re-resolve Cloud Portal config based on the detected environment.
+
+    Updates the module-level globals (AUTH0_CLIENT_ID, AUTH0_DOMAIN,
+    CLOUD_PORTAL_URL, etc.) if the user hasn't set explicit env vars.
+    Called lazily from CloudPortalClient.__init__ so that the CMC token
+    cache is available.
+    """
+    global AUTH0_CLIENT_ID, AUTH0_DOMAIN, CLOUD_PORTAL_URL, _cloud_config_resolved, _discovered
+
+    if _cloud_config_resolved:
+        return
+    _cloud_config_resolved = True
+
+    preset = _get_env_preset()
+    detected_env = _detect_environment()
+
+    # Only override if user hasn't set explicit env vars
+    if not os.getenv("CLOUD_PORTAL_URL"):
+        CLOUD_PORTAL_URL = preset["portal_url"]
+
+    if not os.getenv("AUTH0_DOMAIN"):
+        # Production uses auth.incorta.com, staging uses auth-staging.incortalabs.com
+        if detected_env == "production" or not _discovered.get("domain"):
+            AUTH0_DOMAIN = preset["auth0_domain"]
+
+    if not os.getenv("AUTH0_CLIENT_ID"):
+        # For production, auto-discovery from the JS bundle doesn't work,
+        # so use the preset client_id directly
+        if detected_env == "production" or not _discovered.get("client_id"):
+            AUTH0_CLIENT_ID = preset["auth0_client_id"]
+
 
 def infer_cloud_cluster_name():
     """Infer Cloud Portal cluster name from CMC_URL subdomain.
 
-    CMC_URL pattern: https://{cluster_name}.cloudstaging.incortalabs.com/cmc
+    Supports both domain patterns:
+      - Staging:    https://{cluster_name}.cloudstaging.incortalabs.com/cmc
+      - Production: https://{cluster_name}.cloud2.incorta.com/cmc
+
     Returns the subdomain (e.g., 'habibascluster') or empty string.
     """
     cmc_url = os.getenv("CMC_URL", "")
+    if not cmc_url:
+        # Also check cached CMC token
+        from clients.cmc_client import CMCClient
+        cached = CMCClient.load_cached_config()
+        cmc_url = cached.get("url", "")
     if not cmc_url:
         return ""
     parsed = urlparse(cmc_url)
@@ -99,6 +202,10 @@ def infer_cloud_cluster_name():
 
 class CloudPortalClient:
     def __init__(self, bearer_token=None):
+        # Resolve environment-specific config (staging vs production)
+        # based on CMC URL before using CLOUD_PORTAL_URL.
+        _resolve_cloud_config()
+
         self.base_url = f"{CLOUD_PORTAL_URL}/api/v2"
         self.bearer_token = bearer_token or os.getenv("CLOUD_PORTAL_TOKEN")
         self.user_id = os.getenv("CLOUD_PORTAL_USER_ID")
@@ -764,7 +871,9 @@ class CloudPortalClient:
         """Derive the cp- prefixed base URL for the instances search endpoint.
 
         E.g. https://cloudstaging.incortalabs.com → https://cp-cloudstaging.incortalabs.com/api/v2
+             https://cloud.incorta.com             → https://cp-cloud.incorta.com/api/v2
         """
+        _resolve_cloud_config()
         parsed = urlparse(CLOUD_PORTAL_URL)
         cp_hostname = f"cp-{parsed.hostname}"
         return f"{parsed.scheme}://{cp_hostname}/api/v2"

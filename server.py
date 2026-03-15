@@ -20,6 +20,7 @@ from workflows.pre_upgrade_validation import run_validation
 from tools.qdrant_tool import search_knowledge_base
 from tools.incorta_tools import query_zendesk, query_jira, get_zendesk_schema, get_jira_schema
 from tools.extract_cluster_metadata import extract_cluster_metadata, format_metadata_report
+from tools.test_connection import derive_incorta_url_from_cmc, login_to_incorta_analytics, test_all_connections
 from clients.cloud_portal_client import CloudPortalClient
 from workflows.checklist_workflow import run_write_checklist_excel
 from workflows.readiness_report import run_readiness_report
@@ -335,6 +336,10 @@ async def oauth_callback(request: Request) -> HTMLResponse:
 # Module-level flag: set to True after successful CMC portal login
 _cmc_login_success = False
 
+# Module-level state for test-connection portal
+_test_conn_login_success = False
+_incorta_session_cache = {}
+
 _INCORTA_CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Mulish:wght@400;600;700&display=swap');
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -398,10 +403,19 @@ async def cmc_login_form(request: Request) -> HTMLResponse:
         "<h2>CMC Login</h2>"
         "<p class='subtitle'>Enter your CMC credentials to authenticate.</p>"
         "<form method='POST' action='/cmc-login'>"
+        "<label for='env'>Environment</label>"
+        "<select id='env' name='env' onchange='updateCmcUrl()' "
+        "style='width:100%;padding:10px;margin-bottom:12px;border:1px solid #D1D5DB;"
+        "border-radius:8px;font-size:14px;background:#fff;'>"
+        "<option value='staging'>Staging (cloudstaging.incortalabs.com)</option>"
+        "<option value='production'>Production (cloud2.incorta.com)</option>"
+        "<option value='custom'>Custom</option>"
+        "</select>"
         "<label for='cmc_url'>CMC URL</label>"
         "<input type='text' id='cmc_url' name='cmc_url' "
         "placeholder='https://yourcluster.cloudstaging.incortalabs.com/cmc' required />"
-        "<p class='hint'>Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc</p>"
+        "<p class='hint' id='cmc_url_hint'>"
+        "Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc</p>"
         "<label for='username'>Username</label>"
         "<input type='text' id='username' name='username' placeholder='admin' required />"
         "<label for='password'>Password</label>"
@@ -411,6 +425,23 @@ async def cmc_login_form(request: Request) -> HTMLResponse:
         "<p class='hint'>The cluster name as shown in CMC (e.g., customCluster)</p>"
         "<button type='submit' class='btn'>Login</button>"
         "</form>"
+        "<script>"
+        "function updateCmcUrl() {"
+        "  var env = document.getElementById('env').value;"
+        "  var urlInput = document.getElementById('cmc_url');"
+        "  var hint = document.getElementById('cmc_url_hint');"
+        "  if (env === 'staging') {"
+        "    urlInput.placeholder = 'https://yourcluster.cloudstaging.incortalabs.com/cmc';"
+        "    hint.innerHTML = 'Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc';"
+        "  } else if (env === 'production') {"
+        "    urlInput.placeholder = 'https://yourcluster.cloud2.incorta.com/cmc';"
+        "    hint.innerHTML = 'Format: https://&lt;cluster&gt;.cloud2.incorta.com/cmc';"
+        "  } else {"
+        "    urlInput.placeholder = 'https://your-cmc-url/cmc';"
+        "    hint.innerHTML = 'Enter the full CMC URL';"
+        "  }"
+        "}"
+        "</script>"
     )
     return _cmc_html_page("CMC Login", form_html)
 
@@ -492,6 +523,197 @@ async def cmc_login_submit(request: Request) -> HTMLResponse:
         "You can close this tab and return to Claude.</p>"
     )
     return _cmc_html_page("CMC Login - Success", success_html)
+
+
+# ==========================================
+# TEST CONNECTION LOGIN PORTAL (combined CMC + Analytics)
+# ==========================================
+
+
+@app.custom_route("/test-connection-login", methods=["GET"])
+async def test_connection_login_form(request: Request) -> HTMLResponse:
+    """Serve the combined CMC + Incorta Analytics login form."""
+    form_html = (
+        "<h2>Test Connection Login</h2>"
+        "<p class='subtitle'>Enter your CMC and Incorta Analytics credentials to test datasource connections.</p>"
+        "<form method='POST' action='/test-connection-login'>"
+
+        # CMC Section
+        "<div style='margin-bottom:8px;'>"
+        "<h3 style='color:#15152b;font-size:16px;font-weight:700;margin-bottom:12px;"
+        "padding-bottom:8px;border-bottom:1px solid #e5e7eb;'>CMC Credentials</h3>"
+        "</div>"
+        "<label for='env'>Environment</label>"
+        "<select id='env' name='env' onchange='updateCmcUrl()' "
+        "style='width:100%;padding:10px;margin-bottom:12px;border:1px solid #D1D5DB;"
+        "border-radius:8px;font-size:14px;background:#fff;'>"
+        "<option value='staging'>Staging (cloudstaging.incortalabs.com)</option>"
+        "<option value='production'>Production (cloud2.incorta.com)</option>"
+        "<option value='custom'>Custom</option>"
+        "</select>"
+        "<label for='cmc_url'>CMC URL</label>"
+        "<input type='text' id='cmc_url' name='cmc_url' "
+        "placeholder='https://yourcluster.cloudstaging.incortalabs.com/cmc' required />"
+        "<p class='hint' id='cmc_url_hint'>"
+        "Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc</p>"
+        "<label for='cmc_username'>CMC Username</label>"
+        "<input type='text' id='cmc_username' name='cmc_username' placeholder='admin' required />"
+        "<label for='cmc_password'>CMC Password</label>"
+        "<input type='password' id='cmc_password' name='cmc_password' required />"
+        "<label for='cluster_name'>CMC Cluster Name</label>"
+        "<input type='text' id='cluster_name' name='cluster_name' placeholder='customCluster' required />"
+        "<p class='hint'>The cluster name as shown in CMC (e.g., customCluster)</p>"
+
+        # Incorta Analytics Section
+        "<div style='margin-top:24px;margin-bottom:8px;'>"
+        "<h3 style='color:#15152b;font-size:16px;font-weight:700;margin-bottom:4px;"
+        "padding-bottom:8px;border-bottom:1px solid #e5e7eb;'>Incorta Analytics Credentials</h3>"
+        "</div>"
+        "<p class='hint' style='margin-top:0;margin-bottom:14px;'>"
+        "Analytics URL will be auto-derived from CMC URL. "
+        "<a href='#' id='analytics_link' target='_blank' style='color:#4854fe;'>Open Analytics Login</a>"
+        "</p>"
+        "<label for='tenant'>Tenant</label>"
+        "<input type='text' id='tenant' name='tenant' placeholder='default' required />"
+        "<label for='incorta_username'>Username</label>"
+        "<input type='text' id='incorta_username' name='incorta_username' required />"
+        "<label for='incorta_password'>Password</label>"
+        "<input type='password' id='incorta_password' name='incorta_password' required />"
+
+        "<button type='submit' class='btn' style='margin-top:8px;'>Login & Test Connections</button>"
+        "</form>"
+
+        "<script>"
+        "function updateCmcUrl() {"
+        "  var env = document.getElementById('env').value;"
+        "  var urlInput = document.getElementById('cmc_url');"
+        "  var hint = document.getElementById('cmc_url_hint');"
+        "  if (env === 'staging') {"
+        "    urlInput.placeholder = 'https://yourcluster.cloudstaging.incortalabs.com/cmc';"
+        "    hint.innerHTML = 'Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc';"
+        "  } else if (env === 'production') {"
+        "    urlInput.placeholder = 'https://yourcluster.cloud2.incorta.com/cmc';"
+        "    hint.innerHTML = 'Format: https://&lt;cluster&gt;.cloud2.incorta.com/cmc';"
+        "  } else {"
+        "    urlInput.placeholder = 'https://your-cmc-url/cmc';"
+        "    hint.innerHTML = 'Enter the full CMC URL';"
+        "  }"
+        "  updateAnalyticsLink();"
+        "}"
+        "function updateAnalyticsLink() {"
+        "  var cmcUrl = document.getElementById('cmc_url').value.replace(/\\/+$/, '');"
+        "  var link = document.getElementById('analytics_link');"
+        "  if (cmcUrl) {"
+        "    var base = cmcUrl.endsWith('/cmc') ? cmcUrl.slice(0, -4) : cmcUrl;"
+        "    link.href = base + '/incorta/#/login';"
+        "    link.textContent = 'Open Analytics Login (' + base + '/incorta)';"
+        "  } else {"
+        "    link.href = '#';"
+        "    link.textContent = 'Open Analytics Login';"
+        "  }"
+        "}"
+        "document.getElementById('cmc_url').addEventListener('input', updateAnalyticsLink);"
+        "</script>"
+    )
+    return _cmc_html_page("Test Connection Login", form_html)
+
+
+@app.custom_route("/test-connection-login", methods=["POST"])
+async def test_connection_login_submit(request: Request) -> HTMLResponse:
+    """Process the combined login form: authenticate CMC + Incorta Analytics."""
+    global _test_conn_login_success, _incorta_session_cache
+
+    form = await request.form()
+    cmc_url = (form.get("cmc_url") or "").strip().rstrip("/")
+    cmc_username = (form.get("cmc_username") or "").strip()
+    cmc_password = (form.get("cmc_password") or "").strip()
+    cluster_name = (form.get("cluster_name") or "").strip()
+    tenant = (form.get("tenant") or "").strip()
+    incorta_username = (form.get("incorta_username") or "").strip()
+    incorta_password = (form.get("incorta_password") or "").strip()
+
+    # Validate all fields
+    missing = []
+    if not cmc_url:
+        missing.append("CMC URL")
+    if not cmc_username:
+        missing.append("CMC Username")
+    if not cmc_password:
+        missing.append("CMC Password")
+    if not cluster_name:
+        missing.append("CMC Cluster Name")
+    if not tenant:
+        missing.append("Tenant")
+    if not incorta_username:
+        missing.append("Analytics Username")
+    if not incorta_password:
+        missing.append("Analytics Password")
+
+    if missing:
+        error_html = (
+            "<h2>Test Connection Login</h2>"
+            f"<div class='error-box'>Missing required fields: {', '.join(missing)}</div>"
+            "<p style='text-align:center; margin-top:16px;'>"
+            "<a href='/test-connection-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
+        )
+        return _cmc_html_page("Test Connection Login - Error", error_html, status=400)
+
+    # Step 1: Login to CMC
+    from clients.cmc_client import CMCClient
+
+    try:
+        cmc_client = CMCClient(url=cmc_url, user=cmc_username, password=cmc_password, cluster_name=cluster_name)
+        cmc_client.login()
+    except RuntimeError as e:
+        error_msg = str(e)
+        if len(error_msg) > 300:
+            error_msg = error_msg[:300] + "..."
+        error_html = (
+            "<h2>Test Connection Login</h2>"
+            f"<div class='error-box'><strong>CMC Login Failed:</strong> {error_msg}</div>"
+            "<p style='text-align:center; margin-top:16px;'>"
+            "<a href='/test-connection-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
+        )
+        return _cmc_html_page("Test Connection Login - Failed", error_html, status=401)
+
+    # Step 2: Derive Incorta Analytics URL
+    incorta_url = derive_incorta_url_from_cmc(cmc_url)
+
+    # Step 3: Login to Incorta Analytics
+    try:
+        session = login_to_incorta_analytics(incorta_url, tenant, incorta_username, incorta_password)
+    except RuntimeError as e:
+        error_msg = str(e)
+        if len(error_msg) > 300:
+            error_msg = error_msg[:300] + "..."
+        error_html = (
+            "<h2>Test Connection Login</h2>"
+            "<div class='success-box' style='background:#ecfdf3;color:#027a48;margin-bottom:16px;'>"
+            f"<strong>CMC Login Successful</strong> (as {cmc_username})</div>"
+            f"<div class='error-box'><strong>Analytics Login Failed:</strong> {error_msg}</div>"
+            "<p style='text-align:center; margin-top:16px;'>"
+            "<a href='/test-connection-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
+        )
+        return _cmc_html_page("Test Connection Login - Partial", error_html, status=401)
+
+    # Both logins successful
+    _incorta_session_cache = session
+    _test_conn_login_success = True
+
+    success_html = (
+        "<h2>Login Successful</h2>"
+        "<div class='success-box'>"
+        f"<strong>CMC:</strong> Authenticated as <code>{cmc_username}</code><br>"
+        f"Cluster: <code>{cluster_name}</code><br><br>"
+        f"<strong>Analytics:</strong> Authenticated as <code>{incorta_username}</code><br>"
+        f"Tenant: <code>{tenant}</code><br>"
+        f"URL: <code>{incorta_url}</code>"
+        "</div>"
+        "<p style='text-align:center; margin-top:20px; color:#6B7280; font-size:14px;'>"
+        "You can close this tab and return to Claude.<br>"
+        "Call <strong>test_datasource_connections</strong> again to run the tests.</p>"
+    )
+    return _cmc_html_page("Test Connection Login - Success", success_html)
 
 
 @app.tool()
@@ -1093,6 +1315,61 @@ def extract_cluster_metadata_tool(
         markdown_report = format_metadata_report(metadata)
         json_data = json.dumps(metadata, indent=2)
         return f"{markdown_report}\n\n---\n\n## Raw Metadata (JSON)\n\n```json\n{json_data}\n```"
+
+
+@app.tool()
+def test_datasource_connections() -> str:
+    """
+    [CONNECTIVITY CHECK] Test all datasource connections on the Incorta Analytics instance.
+
+    TWO-STEP PROCESS:
+      Step 1: Call this tool — you receive a URL for the login portal.
+              Ask the user to open it in their browser and fill in the combined
+              CMC + Incorta Analytics credentials form.
+      Step 2: Call this tool again — it tests all datasource connections and returns results.
+
+    The login portal collects:
+      - CMC: URL, username, password, cluster name
+      - Analytics: tenant, username, password
+
+    After login, the tool fetches all datasources and tests each connection,
+    reporting which succeeded and which failed.
+    Datasources that don't support test queries (e.g., LocalFiles) are skipped.
+    """
+    global _test_conn_login_success, _incorta_session_cache
+
+    # Check if we have a cached Incorta Analytics session
+    if _incorta_session_cache.get("authorization"):
+        try:
+            result = test_all_connections(_incorta_session_cache)
+            return json.dumps(result, indent=2)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to test connections: {str(e)}"})
+
+    # Check if the portal was just submitted successfully
+    if _test_conn_login_success:
+        _test_conn_login_success = False
+        if _incorta_session_cache.get("authorization"):
+            try:
+                result = test_all_connections(_incorta_session_cache)
+                return json.dumps(result, indent=2)
+            except Exception as e:
+                return json.dumps({"error": f"Failed to test connections: {str(e)}"})
+
+    # No session — direct user to the login portal
+    port = int(os.getenv("MCP_PORT", "8000"))
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    portal_url = f"http://{host}:{port}/test-connection-login"
+
+    return (
+        "## Test Connection Login Required\n\n"
+        "**Open this URL in your browser to log in:**\n"
+        f"{portal_url}\n\n"
+        "Fill in your **CMC credentials** (URL, username, password, cluster name) "
+        "and **Incorta Analytics credentials** (tenant, username, password), "
+        "then click **Login & Test Connections**.\n\n"
+        "After successful login, **call this tool again** to run the datasource connection tests."
+    )
 
 
 @app.tool()
