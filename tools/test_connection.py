@@ -1,5 +1,6 @@
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -137,7 +138,7 @@ def test_single_connection(session: dict, datasource_id: int, datasource_name: s
             headers=form_headers,
             data={"id": datasource_id, "name": datasource_name},
             verify=False,
-            timeout=60,
+            timeout=15,
         )
 
         if response.status_code == 200:
@@ -158,7 +159,7 @@ def test_single_connection(session: dict, datasource_id: int, datasource_name: s
 
     except requests.exceptions.Timeout:
         success = False
-        message = "Connection timed out (60s)"
+        message = "Connection timed out (15s)"
     except requests.exceptions.ConnectionError as e:
         success = False
         message = f"Connection error: {str(e)[:200]}"
@@ -189,16 +190,22 @@ def test_all_connections(session: dict) -> dict:
 
     total = len(testable) + len(skipped)
 
-    # Test each connection
+    # Test connections concurrently (max 10 threads) to stay within MCP timeout
     results = []
-    for ds in testable:
+
+    def _test_ds(ds):
         ds_id = ds["id"]
         ds_name = ds["name"]
         logger.info(f"Testing connection: {ds_name} (id={ds_id})")
-        result = test_single_connection(session, ds_id, ds_name)
-        result["type"] = ds.get("subType", ds.get("type", "unknown"))
-        result["category"] = ds.get("category", "unknown")
-        results.append(result)
+        r = test_single_connection(session, ds_id, ds_name)
+        r["type"] = ds.get("subType", ds.get("type", "unknown"))
+        r["category"] = ds.get("category", "unknown")
+        return r
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_test_ds, ds): ds for ds in testable}
+        for future in as_completed(futures):
+            results.append(future.result())
 
     passed = sum(1 for r in results if r["success"])
     failed = sum(1 for r in results if not r["success"])
