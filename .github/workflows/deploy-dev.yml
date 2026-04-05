@@ -35,15 +35,14 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           port: ${{ secrets.VM_PORT }}
-          envs: GITHUB_TOKEN,GITHUB_REPOSITORY
+          envs: GITHUB_TOKEN,GITHUB_REPOSITORY,DEPLOY_BRANCH
           script: |
-            # Pull latest code (use token for private repo access)
             cd /opt/incorta-upgrade-assistant
             git init 2>/dev/null || true
             git remote remove origin 2>/dev/null || true
             git remote add origin https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
-            git fetch origin master
-            git reset --hard origin/master
+            git fetch origin ${DEPLOY_BRANCH}
+            git reset --hard origin/${DEPLOY_BRANCH}
 
             # Build new image
             docker build -t incorta-upgrade-assistant:latest .
@@ -60,6 +59,8 @@ jobs:
               --env-file /opt/incorta-upgrade-assistant/.env \
               -v /opt/incorta-upgrade-assistant/data:/app/data \
               incorta-upgrade-assistant:latest
+        env:
+          DEPLOY_BRANCH: ${{ github.ref_name }}
 
       # --- Hot reload (code-only changes, no Docker rebuild) ---
 
@@ -71,16 +72,17 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           port: ${{ secrets.VM_PORT }}
-          envs: GITHUB_TOKEN,GITHUB_REPOSITORY
+          envs: GITHUB_TOKEN,GITHUB_REPOSITORY,DEPLOY_BRANCH
           script: |
-            # Pull latest code (use token for private repo access)
             cd /opt/incorta-upgrade-assistant
             git init 2>/dev/null || true
             git remote remove origin 2>/dev/null || true
             git remote add origin https://${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
-            git fetch origin master
-            git reset --hard origin/master
+            git fetch origin ${DEPLOY_BRANCH}
+            git reset --hard origin/${DEPLOY_BRANCH}
 
             # Copy updated code into the running container and restart
             docker cp /opt/incorta-upgrade-assistant/. incorta-upgrade-assistant:/app/
             docker restart incorta-upgrade-assistant
+        env:
+          DEPLOY_BRANCH: ${{ github.ref_name }}

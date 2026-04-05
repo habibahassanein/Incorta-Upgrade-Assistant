@@ -33,3 +33,4 @@ ENV TOKENS_DIR=/app/data/tokens
 RUN mkdir -p /app/data/tokens
 
 CMD ["python", "server.py"]
+# force rebuild Sun Apr  5 16:20:07 EET 2026
