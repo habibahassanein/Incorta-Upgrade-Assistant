@@ -971,6 +971,7 @@ async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> 
         "incorta_tenant":     raw_headers.get("incorta-tenant", ""),
         "incorta_username":   raw_headers.get("incorta-username", ""),
         "incorta_password":   raw_headers.get("incorta-password", ""),
+        "incorta_env_url":    raw_headers.get("incorta-analytics-url", "").rstrip("/"),
         "cloud_portal_email": raw_headers.get("cloud-portal-email", ""),
     })
 
