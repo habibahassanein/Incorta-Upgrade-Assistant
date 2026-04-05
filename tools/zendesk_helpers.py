@@ -396,11 +396,13 @@ def get_complete_upgrade_issues(from_v: str, to_v: str) -> dict:
         ut.`to`                           AS upgrade_to,
         ter.env                           AS environment,
         ter.Account_Name                  AS customer_account,
+        tcf.Fixed_in                      AS fixed_in,
         DATEDIFF(t.updated_at, t.created_at) AS days_to_resolution
     FROM ZendeskTickets.ticket t
     INNER JOIN ZendeskTickets.ticket_tags tt ON t.id = tt.ticket_id
     LEFT JOIN ZendeskTickets.Upgrade_tickets ut ON t.id = ut.Ticket_Id
     LEFT JOIN ZendeskTickets.Tickets_Env_Release ter ON t.id = ter.ticket_id
+    LEFT JOIN ZendeskTickets.ticket_customfields_v tcf ON t.id = tcf.ticket_id
     WHERE LOWER(tt.tag) IN ({_TAGS_IN_CLAUSE})
       AND ut.`from` = '{from_v}' AND ut.`to` = '{to_v}'
     ORDER BY t.created_at DESC
@@ -427,6 +429,8 @@ def get_complete_upgrade_issues(from_v: str, to_v: str) -> dict:
             "upgrade_to": r.get("upgrade_to", to_v),
             "environment": r.get("environment", ""),
             "customer_account": r.get("customer_account", ""),
+            "fixed_in": r.get("fixed_in", ""),
+            "has_workaround": bool(r.get("fixed_in")),
             "days_to_resolution": int(r.get("days_to_resolution", 0) or 0),
         }
         for r in rows

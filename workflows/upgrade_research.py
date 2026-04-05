@@ -141,11 +141,25 @@ def _build_context_queries(
     if cloud_metadata.get("data_studio_enabled"):
         queries.append(("data_studio", f"Data Studio upgrade Incorta {to_v}", 3))
 
-    # --- Connectors ---
-    connectors = features.get("connectors", [])
-    if connectors:
-        connector_names = " ".join(connectors[:5])
-        queries.append(("connectors", f"{connector_names} connector upgrade Incorta {to_v}", 3))
+    # --- Connectors (enabled + disabled) ---
+    all_connectors = features.get("all_connectors", [])
+    if not all_connectors:
+        # Fallback to legacy enabled-only list
+        all_connectors = [{"name": c, "enabled": True} for c in features.get("connectors", [])]
+    connector_names_list = [c.get("name", "") for c in all_connectors if c.get("name")]
+    if connector_names_list:
+        # Search in batches of 5 for better coverage
+        for i in range(0, len(connector_names_list), 5):
+            batch = connector_names_list[i:i + 5]
+            batch_str = " ".join(batch)
+            queries.append(("connectors", f"{batch_str} connector upgrade Incorta {to_v}", 3))
+        # Add JDK-specific query when crossing JDK boundary
+        try:
+            from tools.connector_compatibility import is_jdk_upgrade
+            if from_v and is_jdk_upgrade(from_v, to_v):
+                queries.append(("connectors", f"connector JDK 17 compatibility Incorta {to_v}", 3))
+        except Exception:
+            pass
 
     # --- Platform / Deployment ---
     deploy = cluster_metadata.get("deployment_type", {})

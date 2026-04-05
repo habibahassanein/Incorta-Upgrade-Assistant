@@ -82,15 +82,17 @@ def collect_cmc_data(state: ReadinessState) -> ReadinessState:
         cluster_data = client.get_cluster(state["cmc_cluster_name"])
         metadata = extract_cluster_metadata(cluster_data)
 
+        is_cloud = metadata.get("deployment_type", {}).get("is_cloud", False)
+
         checks = {
             "Service Status": check_service_status(cluster_data),
             "Memory Status": check_memory_status(cluster_data),
-            "Cluster Configuration": check_cluster_configuration(cluster_data),
+            "Cluster Configuration": check_cluster_configuration(cluster_data, is_cloud=is_cloud),
             "Infrastructure Services": check_infrastructure_services(cluster_data),
             "Node Topology": check_node_topology(cluster_data),
-            "Connectors": check_connectors(cluster_data),
+            "Connectors": check_connectors(cluster_data, to_version=state.get("to_version", ""), from_version=state.get("from_version", "")),
             "Tenants": check_tenants(cluster_data),
-            "Email Configuration": check_email_configuration(cluster_data),
+            "Email Configuration": check_email_configuration(cluster_data, is_cloud=is_cloud),
             "Notebook & SQLi": check_notebook_sqli_status(cluster_data),
             "Database Migration": check_database_migration(cluster_data),
         }
@@ -252,6 +254,10 @@ def collect_cloud_data(state: ReadinessState) -> ReadinessState:
             "spark_cpu_millicores": cluster.get("sparkCpu"),
             # Upgrade
             "last_upgrade": cluster.get("initiatedUpgradeAt"),
+            # Cluster config (from cp- API)
+            "timezone": cluster.get("timezone"),
+            "idle_time_hours": cluster.get("idleTime"),
+            "sleeppable": cluster.get("sleeppable"),
         }
 
         # Service statuses from instanceServices
@@ -390,6 +396,8 @@ def collect_checklist_data(state: ReadinessState) -> ReadinessState:
             "validation_checks": state.get("validation_checks", {}),
             "cloud_metadata": state.get("cloud_metadata", {}),
             "upgrade_knowledge": state.get("upgrade_knowledge", []),
+            "jira_issues": state.get("jira_issues", {}),
+            "zendesk_issues": state.get("zendesk_issues", {}),
             "cell_values": {},
             "errors": [],
         }

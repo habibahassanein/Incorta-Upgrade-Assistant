@@ -80,17 +80,24 @@ def check_memory_status(cluster_data: dict, threshold: float = 80.0) -> dict:
     return {"status": "PASS", "details": details}
 
 
-def check_cluster_configuration(cluster_data: dict) -> dict:
-    """Check cluster configuration settings (auto-start, scheduler, upgrade flags)"""
+def check_cluster_configuration(cluster_data: dict, is_cloud: bool = False) -> dict:
+    """Check cluster configuration settings (auto-start, scheduler, upgrade flags)
+
+    Args:
+        cluster_data: Cluster JSON from CMC API.
+        is_cloud: If True, auto-start warning is suppressed (managed by Cloud Portal).
+    """
     details = []
     warnings = []
 
-    # Auto-start services
+    # Auto-start services — only warn for on-prem; cloud manages this via the portal
     auto_start = cluster_data.get("auto_start_services", "Unknown")
     if auto_start == "Enabled":
         details.append(f"✓ Auto-start services: {auto_start}")
+    elif is_cloud:
+        details.append(f"Auto-start services: {auto_start} (cloud — managed by portal)")
     else:
-        warnings.append(f"Auto-start services: {auto_start} (recommended: Enabled)")
+        warnings.append(f"Auto-start services: {auto_start} (recommended: Enabled for on-prem)")
 
     # Admin alerts
     admin_alerts = cluster_data.get("admin_alerts", "Unknown")
@@ -208,6 +215,21 @@ def check_node_topology(cluster_data: dict) -> dict:
         if node.get("sqli"):
             details.append(f"  Components: sqli")
 
+    # HA rolling restart concern: only flag when 2+ nodes run the same service
+    # (both analytics or both loader), since a rolling restart would take down that service.
+    # Note: node "type" is "HA" for all HA nodes — use services list instead.
+    if len(nodes) >= 2:
+        from collections import Counter
+        service_counts = Counter()
+        for n in nodes:
+            for svc in n.get("services", []):
+                svc_name = svc.get("name", "").lower()
+                if svc_name in ("analytics", "loader"):
+                    service_counts[svc_name] += 1
+        shared_services = [svc for svc, count in service_counts.items() if count >= 2]
+        if shared_services:
+            details.append(f"HA topology: multiple nodes run {', '.join(shared_services)} — rolling restart coordination needed")
+
     if warnings:
         for w in warnings:
             details.append(f"⚠ {w}")
@@ -216,16 +238,22 @@ def check_node_topology(cluster_data: dict) -> dict:
     return {"status": "PASS", "details": details}
 
 
-def check_connectors(cluster_data: dict) -> dict:
-    """Check enabled connectors"""
+def check_connectors(cluster_data: dict, to_version: str = "", from_version: str = "") -> dict:
+    """Check all connectors (enabled and disabled) and their JDK/version compatibility.
+
+    Args:
+        cluster_data: Cluster JSON from CMC API.
+        to_version: Target Incorta version (optional, enables compatibility check).
+        from_version: Source Incorta version (optional).
+    """
     details = []
+    status = "PASS"
 
     connectors = cluster_data.get("connectors", [])
     enabled_connectors = [c["connectorName"] for c in connectors if c.get("connectorEnabled", False)]
     disabled_connectors = [c["connectorName"] for c in connectors if not c.get("connectorEnabled", False)]
 
-    details.append(f"Total connectors available: {len(connectors)}")
-    details.append(f"Enabled connectors: {len(enabled_connectors)}")
+    details.append(f"Total connectors: {len(connectors)} ({len(enabled_connectors)} enabled, {len(disabled_connectors)} disabled)")
 
     if enabled_connectors:
         details.append("Enabled:")
@@ -234,12 +262,52 @@ def check_connectors(cluster_data: dict) -> dict:
 
     if disabled_connectors:
         details.append(f"Disabled ({len(disabled_connectors)} total):")
-        for conn in disabled_connectors[:5]:  # Show first 5
+        for conn in disabled_connectors:
             details.append(f"  - {conn}")
-        if len(disabled_connectors) > 5:
-            details.append(f"  ... and {len(disabled_connectors) - 5} more")
 
-    return {"status": "PASS", "details": details}
+    # JDK / version compatibility check (only when to_version is provided)
+    if to_version and connectors:
+        try:
+            from tools.connector_compatibility import check_connector_compatibility
+
+            compat = check_connector_compatibility(connectors, from_version, to_version)
+
+            if compat.get("jdk_upgrade"):
+                details.append(f"JDK upgrade detected: {compat['from_jdk']} → {compat['to_jdk']}")
+            else:
+                details.append(f"Target JDK: {compat.get('to_jdk', 'Unknown')} (no JDK version change)")
+
+            if compat.get("compatible"):
+                details.append(f"Compatible ({len(compat['compatible'])}):")
+                for c in compat["compatible"]:
+                    label = "enabled" if c["enabled"] else "disabled"
+                    details.append(f"  ✓ {c['name']} ({label})")
+
+            if compat.get("incompatible"):
+                details.append(f"INCOMPATIBLE ({len(compat['incompatible'])}):")
+                for c in compat["incompatible"]:
+                    label = "enabled" if c["enabled"] else "disabled"
+                    details.append(f"  ✗ {c['name']} ({label}) {c.get('notes', '')}")
+
+            if compat.get("unknown"):
+                details.append(f"Unknown compatibility ({len(compat['unknown'])}):")
+                for c in compat["unknown"]:
+                    label = "enabled" if c["enabled"] else "disabled"
+                    details.append(f"  ? {c['name']} ({label}) {c.get('notes', '')}")
+
+            # Determine overall status
+            if compat.get("blockers"):
+                status = "FAIL"
+                for b in compat["blockers"]:
+                    details.append(f"BLOCKER: {b}")
+            elif compat.get("warnings"):
+                status = "WARNING"
+                for w in compat["warnings"]:
+                    details.append(f"WARNING: {w}")
+        except Exception as e:
+            details.append(f"Compatibility check error: {e}")
+
+    return {"status": status, "details": details}
 
 
 def check_tenants(cluster_data: dict) -> dict:
@@ -274,7 +342,7 @@ def check_tenants(cluster_data: dict) -> dict:
     return {"status": "PASS", "details": details}
 
 
-def check_email_configuration(cluster_data: dict) -> dict:
+def check_email_configuration(cluster_data: dict, is_cloud: bool = False) -> dict:
     """Check SMTP/Email configuration"""
     details = []
     warnings = []
@@ -294,6 +362,14 @@ def check_email_configuration(cluster_data: dict) -> dict:
         details.append(f"  Protocol: {mail_protocol}")
         details.append(f"  SSL Enabled: {mail_ssl}")
         details.append(f"  Service email: {service_mail}")
+    elif is_cloud:
+        # Cloud clusters: SMTP is configured at tenant level, not cluster level
+        details.append("ℹ Cloud deployment: SMTP configured at tenant level via CMC Tenant Configuration")
+        if mail_host:
+            details.append(f"  Cluster-level host: {mail_host}")
+        if service_mail:
+            details.append(f"  Service email: {service_mail}")
+        return {"status": "PASS", "details": details}
     else:
         warnings.append("SMTP not fully configured")
         details.append(f"  Host: {mail_host or 'Not set'}")

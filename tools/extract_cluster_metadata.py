@@ -197,17 +197,32 @@ def detect_features(cluster_data: Dict[str, Any]) -> Dict[str, Any]:
         if node.get("kyuubi"):
             features["kyuubi"] = True
     
-    # List enabled connectors
+    # List all connectors (enabled and disabled)
     connectors = cluster_data.get("connectors", [])
     enabled_connectors = [
-        c.get("connectorName") 
-        for c in connectors 
+        c.get("connectorName")
+        for c in connectors
         if c.get("connectorEnabled", False)
     ]
-    
+    disabled_connectors = [
+        c.get("connectorName")
+        for c in connectors
+        if not c.get("connectorEnabled", False)
+    ]
+    all_connectors = [
+        {"name": c.get("connectorName"), "enabled": c.get("connectorEnabled", False)}
+        for c in connectors
+    ]
+
+    # Keep existing fields for backward compatibility
     features["connectors"] = enabled_connectors
     features["connector_count"] = len(enabled_connectors)
-    
+    # New fields for comprehensive connector tracking
+    features["disabled_connectors"] = disabled_connectors
+    features["disabled_connector_count"] = len(disabled_connectors)
+    features["all_connectors"] = all_connectors
+    features["total_connector_count"] = len(connectors)
+
     return features
 
 
@@ -561,9 +576,11 @@ def format_metadata_report(metadata: Dict[str, Any]) -> str:
     report.append(f"- **Notebook**: {'✅ Enabled' if feat['notebook'] else '❌ Disabled'}")
     report.append(f"- **Spark**: {'✅ Enabled' if feat['spark'] else '❌ Disabled'}")
     report.append(f"- **SQLi**: {'✅ Enabled' if feat['sqli'] else '❌ Disabled'}")
-    report.append(f"- **Connectors**: {feat['connector_count']} enabled")
+    report.append(f"- **Connectors**: {feat['connector_count']} enabled, {feat.get('disabled_connector_count', 0)} disabled ({feat.get('total_connector_count', feat['connector_count'])} total)")
     if feat['connectors']:
-        report.append(f"  - {', '.join(feat['connectors'])}")
+        report.append(f"  - Enabled: {', '.join(feat['connectors'])}")
+    if feat.get('disabled_connectors'):
+        report.append(f"  - Disabled: {', '.join(feat['disabled_connectors'])}")
     report.append("")
     
     # Infrastructure

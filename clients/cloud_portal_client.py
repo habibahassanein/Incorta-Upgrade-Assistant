@@ -111,25 +111,22 @@ def _get_env_preset() -> dict:
 # ---------------------------------------------------------------------------
 # Auth0 & Cloud Portal configuration
 #
-# Resolution order:
+# Resolution order (applied on every _resolve_cloud_config() call):
 #   1. Explicit env vars (CLOUD_PORTAL_URL, AUTH0_CLIENT_ID, etc.) — always win
 #   2. Auto-detect from CMC URL → select matching environment preset
 #   3. INCORTA_ENV env var → select preset (fallback when no CMC URL)
 #   4. Staging defaults — last resort
 #
-# NOTE: Initial values are set at import time using staging defaults.
-# _resolve_cloud_config() is called lazily (from CloudPortalClient.__init__)
-# to re-resolve based on the CMC URL, which may not be available at import.
+# No import-time discovery is performed. _resolve_cloud_config() runs lazily
+# (from CloudPortalClient.__init__ and _build_cp_base_url) and re-detects
+# the environment each time, so switching from staging → production CMC
+# mid-session is handled automatically without a server restart.
 # ---------------------------------------------------------------------------
-_discovered: dict = {}
-if not os.getenv("AUTH0_DOMAIN") or not os.getenv("AUTH0_AUDIENCE") or not os.getenv("AUTH0_CLIENT_ID"):
-    _discovered = discover_auth0_config(
-        os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
-    )
 
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN") or _discovered.get("domain", "auth-staging.incortalabs.com")
-AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID") or _discovered.get("client_id", "1H6oWlDKORKc6BmiYWSjECS8Zq6XesV8")
-AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE") or _discovered.get("audience", "https://cloud.server/api/")
+# Staging defaults — overridden by _resolve_cloud_config() on first use
+AUTH0_DOMAIN = "auth-staging.incortalabs.com"
+AUTH0_CLIENT_ID = "1H6oWlDKORKc6BmiYWSjECS8Zq6XesV8"
+AUTH0_AUDIENCE = "https://cloud.server/api/"
 AUTH0_SCOPES = (
     "openid profile email "
     "read:cluster create:cluster update:cluster delete:cluster manage:cluster "
@@ -139,40 +136,56 @@ CALLBACK_PORT = int(os.getenv("AUTH0_CALLBACK_PORT", "8910"))
 CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
 TOKEN_CACHE_PATH = Path(os.getenv("TOKEN_CACHE_PATH", str(Path.home() / ".incorta_cloud_token.json")))
 
-_cloud_config_resolved = False
+_last_detected_env: str | None = None  # tracks environment across calls
+_discovered: dict = {}                 # cached discover_auth0_config() result
 
 
 def _resolve_cloud_config():
     """Re-resolve Cloud Portal config based on the detected environment.
 
-    Updates the module-level globals (AUTH0_CLIENT_ID, AUTH0_DOMAIN,
-    CLOUD_PORTAL_URL, etc.) if the user hasn't set explicit env vars.
-    Called lazily from CloudPortalClient.__init__ so that the CMC token
-    cache is available.
+    Called from CloudPortalClient.__init__ and _build_cp_base_url.
+    Always re-detects the environment (reads CMC URL from env or cached
+    token). If the detected environment changed since the last call,
+    re-runs discover_auth0_config() against the correct portal URL.
+
+    This ensures that authenticating with a production CMC mid-session
+    automatically switches Auth0/Cloud Portal config to production —
+    no .env overrides or server restart required.
     """
-    global AUTH0_CLIENT_ID, AUTH0_DOMAIN, CLOUD_PORTAL_URL, _cloud_config_resolved, _discovered
+    global AUTH0_CLIENT_ID, AUTH0_DOMAIN, CLOUD_PORTAL_URL, AUTH0_AUDIENCE
+    global _last_detected_env, _discovered
 
-    if _cloud_config_resolved:
-        return
-    _cloud_config_resolved = True
-
-    preset = _get_env_preset()
     detected_env = _detect_environment()
+    preset = _get_env_preset()
 
-    # Only override if user hasn't set explicit env vars
-    if not os.getenv("CLOUD_PORTAL_URL"):
-        CLOUD_PORTAL_URL = preset["portal_url"]
+    # Re-discover Auth0 config when environment changes (or on first call)
+    if detected_env != _last_detected_env:
+        portal_url = os.getenv("CLOUD_PORTAL_URL") or preset["portal_url"]
+        if not os.getenv("AUTH0_DOMAIN") or not os.getenv("AUTH0_CLIENT_ID"):
+            _discovered = discover_auth0_config(portal_url)
+        _last_detected_env = detected_env
 
-    if not os.getenv("AUTH0_DOMAIN"):
-        # Production uses auth.incorta.com, staging uses auth-staging.incortalabs.com
-        if detected_env == "production" or not _discovered.get("domain"):
-            AUTH0_DOMAIN = preset["auth0_domain"]
+    # Apply resolution cascade: explicit env var → preset → discovered → default
+    CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL") or preset["portal_url"]
 
-    if not os.getenv("AUTH0_CLIENT_ID"):
-        # For production, auto-discovery from the JS bundle doesn't work,
-        # so use the preset client_id directly
-        if detected_env == "production" or not _discovered.get("client_id"):
-            AUTH0_CLIENT_ID = preset["auth0_client_id"]
+    if os.getenv("AUTH0_DOMAIN"):
+        AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN")
+    elif detected_env == "production" or not _discovered.get("domain"):
+        AUTH0_DOMAIN = preset["auth0_domain"]
+    else:
+        AUTH0_DOMAIN = _discovered["domain"]
+
+    if os.getenv("AUTH0_CLIENT_ID"):
+        AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID")
+    elif detected_env == "production" or not _discovered.get("client_id"):
+        AUTH0_CLIENT_ID = preset["auth0_client_id"]
+    else:
+        AUTH0_CLIENT_ID = _discovered["client_id"]
+
+    if os.getenv("AUTH0_AUDIENCE"):
+        AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE")
+    elif _discovered.get("audience"):
+        AUTH0_AUDIENCE = _discovered["audience"]
 
 
 def infer_cloud_cluster_name():
