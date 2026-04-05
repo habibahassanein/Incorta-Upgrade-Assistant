@@ -564,12 +564,26 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         try:
             our_cluster = client.search_instances(cluster_name, cmc_url)
         except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code in (401, 403):
+            status = e.response.status_code if e.response is not None else None
+            body = e.response.text[:300] if e.response is not None else ""
+            if status == 401:
+                # 401 from the cp- API usually means wrong audience in the JWT,
+                # NOT that the token is expired. Surface the raw error so we can debug.
                 return _text(
-                    "Error: Cloud Portal token rejected.\n"
-                    "Call `cloud_portal_connect` with force=true to re-authenticate."
+                    f"Error: Cloud Admin API returned 401.\n\n"
+                    f"This usually means the Auth0 audience in the token does not match "
+                    f"what cp-cloudstaging.incortalabs.com expects.\n\n"
+                    f"Current audience: {client._headers().get('Authorization', '')[:40]}...\n"
+                    f"API response: {body}\n\n"
+                    f"Ask the cloud team: what is the correct Auth0 audience for "
+                    f"client_id=0jXCrcpFe6PDm6sIMxDi7hunFCWeRLpt?"
                 )
-            return _text(f"Error fetching cluster from Cloud Portal: {e}")
+            if status == 403:
+                return _text(
+                    f"Error: Cloud Admin API returned 403 — token accepted but insufficient permissions.\n"
+                    f"API response: {body}"
+                )
+            return _text(f"Error fetching cluster from Cloud Portal (HTTP {status}): {e}")
         except Exception as e:
             return _text(f"Error: {e}")
 
@@ -839,6 +853,44 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
 # HTTP Routes
 # ===========================================================================
 
+async def debug_token(request: Request) -> HTMLResponse:
+    """
+    Debug endpoint: shows the current cached token claims for an email.
+    Usage: GET /debug-token?email=anas.ahmed@incorta.com
+    """
+    email = request.query_params.get("email", "")
+    if not email:
+        return HTMLResponse("<pre>Usage: /debug-token?email=your@email.com</pre>")
+
+    from clients.cloud_portal_client import load_token
+    import pyjwt_compat
+
+    data = load_token(email)
+    if not data:
+        return HTMLResponse(f"<pre>No token found for {email}</pre>")
+
+    access_token = data.get("access_token", "")
+    try:
+        claims = pyjwt.decode(access_token, options={"verify_signature": False})
+    except Exception as e:
+        claims = {"decode_error": str(e)}
+
+    import json as _json
+    output = {
+        "email": email,
+        "has_refresh_token": bool(data.get("refresh_token")),
+        "cached_at": data.get("cached_at"),
+        "exp": claims.get("exp"),
+        "expires_in_hours": round((claims.get("exp", 0) - time.time()) / 3600, 2) if claims.get("exp") else None,
+        "audience": claims.get("aud"),
+        "issuer": claims.get("iss"),
+        "scope": claims.get("scope"),
+        "azp": claims.get("azp"),
+        "sub": claims.get("sub"),
+    }
+    return HTMLResponse(f"<pre>{_json.dumps(output, indent=2)}</pre>")
+
+
 async def oauth_callback(request: Request) -> HTMLResponse:
     """
     OAuth 2.0 callback handler.
@@ -997,6 +1049,7 @@ starlette_app = Starlette(
     debug=False,
     routes=[
         Route("/callback", endpoint=oauth_callback, methods=["GET"]),
+        Route("/debug-token", endpoint=debug_token, methods=["GET"]),
         Mount("/mcp", app=handle_streamable_http),
     ],
     lifespan=lifespan,
