@@ -1003,4 +1003,10 @@ starlette_app = Starlette(
 
 
 if __name__ == "__main__":
-    uvicorn.run(starlette_app, host=MCP_HOST, port=MCP_PORT)
+    uvicorn.run(
+        starlette_app,
+        host=MCP_HOST,
+        port=MCP_PORT,
+        forwarded_allow_ips="*",   # trust nginx reverse proxy host headers
+        proxy_headers=True,
+    )
