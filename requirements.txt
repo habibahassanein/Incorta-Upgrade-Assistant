@@ -1,6 +1,11 @@
 # MCP Server
 mcp
 
+# ASGI server + web framework (used directly by server.py)
+uvicorn
+starlette
+
+
 # LangGraph workflows
 langgraph
 

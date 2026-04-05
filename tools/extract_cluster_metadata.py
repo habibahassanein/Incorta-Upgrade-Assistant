@@ -54,11 +54,18 @@ def extract_cluster_metadata(cluster_data: Dict[str, Any],
     if include_api_calls:
         try:
             from clients.cmc_client import CMCClient
-            client = CMCClient()
-            
+            from context.user_context import user_context
+            ctx = user_context.get()
+            client = CMCClient(
+                url=ctx.get("cmc_url"),
+                user=ctx.get("cmc_user"),
+                password=ctx.get("cmc_password"),
+                cluster_name=ctx.get("cmc_cluster_name"),
+            )
+
             # Tenant Storage (from /api/v1/clusters/{cluster}/tenants)
             metadata["tenant_storage"] = detect_tenant_storage(cluster_name, client)
-            
+
             # Integrations (from /api/v1/clusters/{cluster}/config)
             metadata["integrations"] = detect_integrations(cluster_name, client)
         except Exception as e:

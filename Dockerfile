@@ -20,17 +20,16 @@ COPY . /app
 
 EXPOSE 8080
 
-# Configure FastMCP to bind to all interfaces on port 8080
+# Bind to all interfaces
 ENV MCP_HOST=0.0.0.0
 ENV MCP_PORT=8080
 
-# Signal headless environment so Cloud Portal auth fails fast
-# instead of blocking for 2 minutes waiting for a browser callback
-ENV HEADLESS=true
+# Public URL for OAuth callbacks — set this to your persistent domain
+# e.g. https://7196.devopsportal.incortaops.com
+ENV MCP_PUBLIC_URL=""
 
-# Persist the Cloud Portal token cache in the mounted volume
-# so it survives container restarts
-ENV TOKEN_CACHE_PATH=/app/data/.incorta_cloud_token.json
-RUN mkdir -p /app/data
+# Per-user Cloud Portal JWT storage directory
+ENV TOKENS_DIR=/app/data/tokens
+RUN mkdir -p /app/data/tokens
 
 CMD ["python", "server.py"]
