@@ -134,14 +134,16 @@ def clear_jira_schema_cache():
 
 def login_to_incorta():
     """
-    Get Incorta session credentials from context.
-    Returns session details for API calls.
+    Login to the INTERNAL Incorta instance (the one with Zendesk/Jira schemas).
+
+    This always uses .env / environment variables — NOT the per-user request headers.
+    The customer's incorta-analytics-url header is for customer cluster access only
+    (used by test_datasource_connections), not for querying internal operational data.
     """
-    ctx = user_context.get()
-    env_url = ctx.get("incorta_env_url") or os.getenv("INCORTA_ENV_URL")
-    tenant = ctx.get("incorta_tenant") or os.getenv("INCORTA_TENANT")
-    username = ctx.get("incorta_username") or os.getenv("INCORTA_USERNAME")
-    password = ctx.get("incorta_password") or os.getenv("INCORTA_PASSWORD")
+    env_url  = os.getenv("INCORTA_ENV_URL")
+    tenant   = os.getenv("INCORTA_TENANT")
+    username = os.getenv("INCORTA_USERNAME")
+    password = os.getenv("INCORTA_PASSWORD")
 
     # Login
     response = requests.post(
