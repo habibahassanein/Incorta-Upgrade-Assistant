@@ -184,14 +184,22 @@ async def list_tools() -> list[types.Tool]:
                 "CREDENTIALS NOTE: All required passwords and credentials (CMC, Analytics, Cloud Portal, Internal DB) "
                 "are AUTOMATICALLY handled by the user's MCP connection headers or server environment.\n"
                 "DO NOT ask the user for any credentials or passwords. Just call the tools directly.\n\n"
-                "PREREQUISITES:\n"
-                "- Cloud Portal: call cloud_portal_connect first; without it Cloud Portal fields show N/A\n"
-                "- Ask the user for cloud_cluster_name (Cloud Portal instance name, e.g. 'habibascluster')\n\n"
+                "MANDATORY STEPS BEFORE CALLING THIS TOOL:\n"
+                "  1. ALWAYS call cloud_portal_connect first — even if you think the token is cached.\n"
+                "     This is required. Cloud Portal provides Spark version, Python version, disk sizes.\n"
+                "  2. Ask the user for cloud_cluster_name — the Cloud Portal instance name.\n"
+                "     Do NOT guess it from the CMC cluster name. They are often different.\n"
+                "  3. Ask the user for customer_name — must be a real COMPANY name from Jira.\n"
+                "     Examples: 'Apple', 'Starbucks', 'Keysight', 'Toast', 'Broadcom'.\n"
+                "     REJECT person names ('Anas', 'John') or generic words ('test', 'demo').\n\n"
                 "Args:\n"
-                "  to_version: Target Incorta version (e.g. '2024.7.0'). Required.\n"
-                "  customer_name: Customer name as it appears in Jira. Required.\n"
+                "  to_version: Target Incorta version (e.g. '2026.1.0'). Required.\n"
+                "  customer_name: Company name from Jira (e.g. 'Apple', 'Starbucks'). Optional but recommended.\n"
+                "     If provided, the report includes bugs specifically fixed for that customer.\n"
+                "     If omitted or unknown, pass 'Unknown' and the report runs without customer bug data.\n"
+                "     MUST be a company name, not a person name ('Anas', 'John' are invalid).\n"
                 "  cmc_cluster_name: CMC cluster name. Defaults to cmc-cluster-name header.\n"
-                "  from_version: Current version. Auto-detected if empty.\n"
+                "  from_version: Current version. Leave empty — auto-detected from cluster.\n"
                 "  cloud_cluster_name: Cloud Portal cluster name. REQUIRED — ask the user."
             ),
             inputSchema={
@@ -228,6 +236,12 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "[EXCEL OUTPUT] Write approved checklist values into an Excel template.\n"
                 "Call this with the <checklist_data> JSON block from generate_upgrade_readiness_report.\n\n"
+                "OUTPUT: The tool returns JSON with a 'base64' field (the Excel file), 'filename', and 'summary'.\n"
+                "To give the user a downloadable file, Claude MUST:\n"
+                "  1. Extract the base64 string from the tool result.\n"
+                "  2. Use bash_tool to decode it: echo '<base64>' | base64 -d > /mnt/user-data/outputs/<filename>\n"
+                "  3. Call present_files with the output path to give the user a download link.\n"
+                "Show the summary text to the user as well.\n\n"
                 "Args:\n"
                 "  cell_values_json: JSON string from generate_upgrade_readiness_report.\n"
                 "  filename: Suggested filename. Default: 'pre_upgrade_checklist_filled.xlsx'."
@@ -1022,15 +1036,30 @@ async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> 
         for k, v in scope.get("headers", [])
     }
 
+    cmc_url = raw_headers.get("cmc-url", "").rstrip("/")
+    
+    # Auto-detect CMC cluster name from the first subdomain if missing
+    cmc_cluster_name = raw_headers.get("cmc-cluster-name", "")
+    if not cmc_cluster_name and cmc_url:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(cmc_url)
+        if parsed.hostname:
+            cmc_cluster_name = parsed.hostname.split(".")[0]
+
+    # Auto-detect Analytics URL from CMC URL if missing
+    incorta_env_url = raw_headers.get("incorta-analytics-url", "").rstrip("/")
+    if not incorta_env_url and cmc_url.endswith("/cmc"):
+        incorta_env_url = cmc_url[:-4] + "/incorta"
+
     user_context.set({
-        "cmc_url":            raw_headers.get("cmc-url", "").rstrip("/"),
+        "cmc_url":            cmc_url,
         "cmc_user":           raw_headers.get("cmc-user", ""),
         "cmc_password":       raw_headers.get("cmc-password", ""),
-        "cmc_cluster_name":   raw_headers.get("cmc-cluster-name", ""),
-        "incorta_tenant":     raw_headers.get("incorta-tenant", ""),
+        "cmc_cluster_name":   cmc_cluster_name,
+        "incorta_tenant":     raw_headers.get("incorta-tenant", "default"),  # default fallback
         "incorta_username":   raw_headers.get("incorta-username", ""),
         "incorta_password":   raw_headers.get("incorta-password", ""),
-        "incorta_env_url":    raw_headers.get("incorta-analytics-url", "").rstrip("/"),
+        "incorta_env_url":    incorta_env_url,
         "cloud_portal_email": raw_headers.get("cloud-portal-email", ""),
     })
 
