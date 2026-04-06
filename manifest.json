@@ -1,0 +1,170 @@
+{
+    "manifest_version": "0.3",
+    "name": "incorta-upgrade-assistant",
+    "display_name": "Incorta Upgrade Assistant",
+    "version": "1.0.0",
+    "description": "AI-powered pre-upgrade readiness assistant for Incorta clusters. Validates cluster health, analyses Zendesk tickets and Jira bugs, checks Cloud Portal metadata, tests datasource connectivity, and generates a filled Excel pre-upgrade checklist — all from a single conversation.",
+    "author": {
+        "name": "Incorta"
+    },
+    "license": "Proprietary",
+    "icon": "icon.png",
+    "keywords": [
+        "incorta",
+        "upgrade",
+        "readiness",
+        "mcp",
+        "cmc",
+        "cloud-portal",
+        "pre-upgrade",
+        "checklist"
+    ],
+    "server": {
+        "type": "node",
+        "entry_point": "manifest.json",
+        "mcp_config": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote",
+                "https://7196.devopsportal.incortaops.com/mcp/",
+                "--header",
+                "cmc-url:${user_config.cmc_url}",
+                "--header",
+                "cmc-user:${user_config.cmc_user}",
+                "--header",
+                "cmc-password:${user_config.cmc_password}",
+                "--header",
+                "cmc-cluster-name:${user_config.cmc_cluster_name}",
+                "--header",
+                "incorta-tenant:${user_config.incorta_tenant}",
+                "--header",
+                "incorta-username:${user_config.incorta_username}",
+                "--header",
+                "incorta-password:${user_config.incorta_password}",
+                "--header",
+                "incorta-analytics-url:${user_config.incorta_analytics_url}",
+                "--header",
+                "cloud-portal-email:${user_config.cloud_portal_email}"
+            ]
+        }
+    },
+    "compatibility": {
+        "platforms": [
+            "darwin",
+            "linux",
+            "win32"
+        ]
+    },
+    "tools": [
+        {
+            "name": "run_pre_upgrade_validation",
+            "description": "Validate Incorta cluster health before upgrade: services, memory, topology, infrastructure, connectors, tenants, email, and datasource connectivity."
+        },
+        {
+            "name": "extract_cluster_metadata_tool",
+            "description": "Extract upgrade-relevant metadata from CMC: deployment type, DB type, topology, features, and infrastructure."
+        },
+        {
+            "name": "test_datasource_connections",
+            "description": "Test all datasource connections on the Incorta Analytics instance and report pass/fail per datasource."
+        },
+        {
+            "name": "cloud_portal_connect",
+            "description": "Authenticate with Cloud Portal via OAuth. Step 1: get a login URL. Step 2: call again to confirm and cache the token."
+        },
+        {
+            "name": "get_cloud_metadata",
+            "description": "Fetch Cloud Portal cluster metadata: Spark/Python versions, sizing, feature flags, consumption, and authorized users."
+        },
+        {
+            "name": "generate_upgrade_readiness_report",
+            "description": "Generate a comprehensive upgrade readiness report combining CMC, Cloud Portal, Zendesk, Jira, and knowledge base data. Outputs a risk rating and Excel checklist data."
+        },
+        {
+            "name": "write_checklist_excel",
+            "description": "Write the readiness report checklist data into a downloadable Excel template."
+        },
+        {
+            "name": "search_upgrade_knowledge",
+            "description": "Search Incorta documentation and community articles for upgrade guidance."
+        },
+        {
+            "name": "get_zendesk_schema_tool",
+            "description": "Get the Zendesk support ticket schema available in Incorta for upgrade ticket analysis."
+        },
+        {
+            "name": "query_upgrade_tickets",
+            "description": "Query Zendesk customer support tickets using Spark SQL for upgrade-related issue analysis."
+        },
+        {
+            "name": "get_jira_schema_tool",
+            "description": "Get the Jira engineering schema available in Incorta for bug and fix analysis."
+        },
+        {
+            "name": "query_upgrade_issues",
+            "description": "Query Jira engineering bugs and fixes using Spark SQL for upgrade impact analysis."
+        }
+    ],
+    "tools_generated": false,
+    "user_config": {
+        "cmc_url": {
+            "type": "string",
+            "title": "CMC URL",
+            "description": "Your Incorta CMC base URL. Example: https://your-cluster.cloudstaging.incortalabs.com/cmc",
+            "required": true
+        },
+        "cmc_user": {
+            "type": "string",
+            "title": "CMC Username",
+            "description": "CMC admin username (typically 'admin')",
+            "default": "admin",
+            "required": true
+        },
+        "cmc_password": {
+            "type": "string",
+            "title": "CMC Password",
+            "description": "CMC admin password",
+            "sensitive": true,
+            "required": true
+        },
+        "cmc_cluster_name": {
+            "type": "string",
+            "title": "CMC Cluster Name",
+            "description": "The cluster name as it appears in CMC. Example: customCluster",
+            "required": true
+        },
+        "incorta_tenant": {
+            "type": "string",
+            "title": "Incorta Tenant",
+            "description": "Incorta Analytics tenant name",
+            "default": "default",
+            "required": true
+        },
+        "incorta_username": {
+            "type": "string",
+            "title": "Incorta Username",
+            "description": "Incorta Analytics username for the customer cluster",
+            "required": true
+        },
+        "incorta_password": {
+            "type": "string",
+            "title": "Incorta Password",
+            "description": "Incorta Analytics password for the customer cluster",
+            "sensitive": true,
+            "required": true
+        },
+        "incorta_analytics_url": {
+            "type": "string",
+            "title": "Incorta Analytics URL",
+            "description": "Customer's Incorta Analytics URL (must end with /incorta). Example: https://your-cluster.cloudstaging.incortalabs.com/incorta",
+            "required": true
+        },
+        "cloud_portal_email": {
+            "type": "string",
+            "title": "Cloud Portal Email",
+            "description": "Your Incorta Cloud Portal email address. Used to authenticate and cache your Cloud Portal JWT.",
+            "required": true
+        }
+    }
+}

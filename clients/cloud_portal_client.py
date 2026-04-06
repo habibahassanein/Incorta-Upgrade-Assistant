@@ -370,19 +370,41 @@ class CloudPortalClient:
         return f"{parsed.scheme}://{cp_hostname}/api/v2"
 
     def search_instances(self, cluster_name: str, cmc_url: str = "") -> dict | None:
-        """Search for an instance by name using the cp- admin endpoint."""
-        cp_base = self._build_cp_base_url(cmc_url)
-        r = requests.get(
-            f"{cp_base}/instances",
-            headers=self._headers(),
-            params={"search": cluster_name},
-            timeout=30,
-        )
-        r.raise_for_status()
-        data = r.json()
-        for instance in data.get("instances", []):
-            if instance.get("name") == cluster_name:
+        """
+        Search for an instance by name.
+
+        Uses the regular Cloud Portal /users/{user_id}/clustersinfo endpoint
+        (cloudstaging.incortalabs.com) which works with a standard user token.
+
+        Falls back to the cp- admin endpoint only if the regular endpoint
+        doesn't find the cluster (requires elevated permissions).
+        """
+        # Try regular portal first — works with any authenticated user
+        try:
+            user_id = self.get_user_id()
+            instance = self.find_cluster(user_id, cluster_name)
+            if instance:
                 return instance
+        except Exception:
+            pass
+
+        # Fallback: cp- admin endpoint (requires Clusters permission)
+        try:
+            cp_base = self._build_cp_base_url(cmc_url)
+            r = requests.get(
+                f"{cp_base}/instances",
+                headers=self._headers(),
+                params={"search": cluster_name},
+                timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json()
+            for instance in data.get("instances", []):
+                if instance.get("name") == cluster_name:
+                    return instance
+        except Exception:
+            pass
+
         return None
 
     def get_clusters_info(self, user_id: str) -> dict:
