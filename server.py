@@ -187,9 +187,7 @@ async def list_tools() -> list[types.Tool]:
                 "MANDATORY STEPS BEFORE CALLING THIS TOOL:\n"
                 "  1. ALWAYS call cloud_portal_connect first — even if you think the token is cached.\n"
                 "     This is required. Cloud Portal provides Spark version, Python version, disk sizes.\n"
-                "  2. Ask the user for cloud_cluster_name — the Cloud Portal instance name.\n"
-                "     Do NOT guess it from the CMC cluster name. They are often different.\n"
-                "  3. Ask the user for customer_name — must be a real COMPANY name from Jira.\n"
+                "  2. Ask the user for customer_name — must be a real COMPANY name from Jira.\n"
                 "     Examples: 'Apple', 'Starbucks', 'Keysight', 'Toast', 'Broadcom'.\n"
                 "     REJECT person names ('Anas', 'John') or generic words ('test', 'demo').\n\n"
                 "Args:\n"
@@ -200,11 +198,11 @@ async def list_tools() -> list[types.Tool]:
                 "     MUST be a company name, not a person name ('Anas', 'John' are invalid).\n"
                 "  cmc_cluster_name: CMC cluster name. Defaults to cmc-cluster-name header.\n"
                 "  from_version: Current version. Leave empty — auto-detected from cluster.\n"
-                "  cloud_cluster_name: Cloud Portal cluster name. REQUIRED — ask the user."
+                "  cloud_cluster_name: Cloud Portal cluster name. Leave empty — auto-detected from Analytics URL."
             ),
             inputSchema={
                 "type": "object",
-                "required": ["to_version", "customer_name", "cloud_cluster_name"],
+                "required": ["to_version"],
                 "properties": {
                     "to_version": {"type": "string"},
                     "customer_name": {"type": "string"},
@@ -414,14 +412,20 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
     if name == "generate_upgrade_readiness_report":
         to_version = arguments.get("to_version", "")
         customer_name = arguments.get("customer_name", "")
+        if not customer_name:
+            customer_name = "Unknown"
+            
         cloud_cluster_name = arguments.get("cloud_cluster_name", "")
+        if not cloud_cluster_name:
+            cloud_cluster_name = user_context.get().get("auto_cloud_cluster_name", "")
+            
         from_version = arguments.get("from_version", "")
         cmc_cluster_name = _get_cmc_cluster_name(arguments.get("cmc_cluster_name"))
 
         if not cmc_cluster_name:
             return _text(
                 "Error: CMC cluster name not available.\n"
-                "Ensure cmc-cluster-name is set in your MCP client headers."
+                "Ensure cmc-cluster-name is set in your MCP client headers"
             )
         if not cloud_cluster_name:
             return _text(
@@ -1037,19 +1041,20 @@ async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> 
     }
 
     cmc_url = raw_headers.get("cmc-url", "").rstrip("/")
-    
-    # Auto-detect CMC cluster name from the first subdomain if missing
     cmc_cluster_name = raw_headers.get("cmc-cluster-name", "")
-    if not cmc_cluster_name and cmc_url:
-        import urllib.parse
-        parsed = urllib.parse.urlparse(cmc_url)
-        if parsed.hostname:
-            cmc_cluster_name = parsed.hostname.split(".")[0]
 
-    # Auto-detect Analytics URL from CMC URL if missing
+    # auto-detect Analytics url from cmc URL if missing
     incorta_env_url = raw_headers.get("incorta-analytics-url", "").rstrip("/")
     if not incorta_env_url and cmc_url.endswith("/cmc"):
         incorta_env_url = cmc_url[:-4] + "/incorta"
+        
+    # auto-detect Cloud Portal cluster name from the Analytics url first subdomain
+    auto_cloud_cluster_name = ""
+    if incorta_env_url:
+        import urllib.parse
+        parsed_env = urllib.parse.urlparse(incorta_env_url)
+        if parsed_env.hostname:
+            auto_cloud_cluster_name = parsed_env.hostname.split(".")[0]
 
     user_context.set({
         "cmc_url":            cmc_url,
@@ -1061,6 +1066,7 @@ async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> 
         "incorta_password":   raw_headers.get("incorta-password", ""),
         "incorta_env_url":    incorta_env_url,
         "cloud_portal_email": raw_headers.get("cloud-portal-email", ""),
+        "auto_cloud_cluster_name": auto_cloud_cluster_name,
     })
 
     try:
