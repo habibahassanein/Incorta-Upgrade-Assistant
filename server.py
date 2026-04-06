@@ -181,8 +181,10 @@ async def list_tools() -> list[types.Tool]:
                 "Orchestrates all data sources (CMC, Cloud Portal, knowledge base, upgrade research, "
                 "Zendesk customer support tickets, and Jira bug tracking) to produce an opinionated "
                 "readiness assessment with a rating and Excel checklist data.\n\n"
+                "CREDENTIALS NOTE: All required passwords and credentials (CMC, Analytics, Cloud Portal, Internal DB) "
+                "are AUTOMATICALLY handled by the user's MCP connection headers or server environment.\n"
+                "DO NOT ask the user for any credentials or passwords. Just call the tools directly.\n\n"
                 "PREREQUISITES:\n"
-                "- CMC credentials in headers (cmc-url, cmc-user, cmc-password, cmc-cluster-name)\n"
                 "- Cloud Portal: call cloud_portal_connect first; without it Cloud Portal fields show N/A\n"
                 "- Ask the user for cloud_cluster_name (Cloud Portal instance name, e.g. 'habibascluster')\n\n"
                 "Args:\n"
@@ -210,6 +212,7 @@ async def list_tools() -> list[types.Tool]:
                 "[HEALTH CHECK] Validates Incorta cluster health before upgrade.\n"
                 "Performs comprehensive pre-upgrade health checks: service status, memory, "
                 "topology, Spark/Zookeeper/DB, connectors, tenants, email config, DB migration.\n\n"
+                "CREDENTIALS: CMC credentials are automatically injected from MCP headers. Do not ask the user.\n\n"
                 "Args:\n"
                 "  cluster_name: CMC cluster name. Defaults to cmc-cluster-name header."
             ),
@@ -242,14 +245,12 @@ async def list_tools() -> list[types.Tool]:
             name="cloud_portal_connect",
             description=(
                 "[CLOUD AUTH] Connect your Cloud Portal account.\n\n"
+                "CREDENTIALS: The user's email is automatically injected from MCP headers.\n"
+                "If the cached token is expired, call this tool to give the user a browser login link.\n\n"
                 "TWO-STEP PROCESS:\n"
                 "  Step 1: Call this tool — you receive a login URL. Open it in your browser "
                 "and complete login (Google SSO or username/password).\n"
                 "  Step 2: Call this tool again — it confirms login and caches the token.\n\n"
-                "Prerequisites:\n"
-                "  - cloud-portal-email must be set in your MCP client headers.\n\n"
-                "The token is cached server-side for your email and auto-refreshes. "
-                "You only need to do this once per session (or after a long inactivity).\n\n"
                 "Args:\n"
                 "  force: If True, clears the existing token and forces re-authentication."
             ),
@@ -266,8 +267,8 @@ async def list_tools() -> list[types.Tool]:
                 "[CLOUD DATA] Get cloud metadata from Cloud Portal API.\n"
                 "Provides data NOT available in CMC: Spark/Python/MySQL versions, sizing, "
                 "feature flags, consumption, authorized users, upgrade history.\n\n"
-                "IMPORTANT: Call cloud_portal_connect first. "
-                "Ask the user for the Cloud Portal cluster name — do NOT guess it.\n\n"
+                "CREDENTIALS: Uses cached token from cloud_portal_connect. Do not ask for passwords.\n"
+                "IMPORTANT: Call cloud_portal_connect first. Ask the user for the Cloud Portal cluster name.\n\n"
                 "Args:\n"
                 "  cluster_name: Cloud Portal cluster name (e.g. 'habibascluster'). REQUIRED.\n"
                 "  include_consumption: Include cost data. Default: True.\n"
@@ -288,6 +289,7 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "[CLUSTER METADATA] Extract upgrade-relevant metadata from CMC cluster data.\n"
                 "Auto-detects deployment type, DB type, topology, features, infrastructure.\n\n"
+                "CREDENTIALS: CMC credentials are automatically injected from MCP headers. Do not ask the user.\n\n"
                 "Args:\n"
                 "  cluster_name: CMC cluster name. Defaults to cmc-cluster-name header.\n"
                 "  format: 'json', 'markdown', or 'both' (default)."
@@ -305,8 +307,8 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "[CONNECTIVITY CHECK] Test all datasource connections on the Incorta Analytics instance.\n"
                 "Fetches all datasources and tests each connection, reporting success/failure.\n\n"
-                "Requires Analytics headers: incorta-tenant, incorta-username, incorta-password.\n"
-                "Analytics URL is auto-derived from the cmc-url header."
+                "CREDENTIALS: ALL Analytics credentials (tenant, user, password, URL) are AUTOMATICALLY injected "
+                "from MCP headers. The LLM MUST call this tool directly WITHOUT asking the user for passwords."
             ),
             inputSchema={
                 "type": "object",
@@ -317,6 +319,7 @@ async def list_tools() -> list[types.Tool]:
             name="search_upgrade_knowledge",
             description=(
                 "[MANUAL RESEARCH] Search Incorta documentation, community, and support articles.\n\n"
+                "CREDENTIALS: API keys are handled by the server. Call directly.\n\n"
                 "Args:\n"
                 "  query: Search query (e.g. '2024.7.0 release notes')\n"
                 "  limit: Number of results. Default: 10."
@@ -334,6 +337,7 @@ async def list_tools() -> list[types.Tool]:
             name="get_zendesk_schema_tool",
             description=(
                 "[CUSTOMER TICKETS - SCHEMA] Get Zendesk schema to understand available fields.\n"
+                "CREDENTIALS: DB login is handled automatically. Call directly.\n"
                 "Call BEFORE querying customer tickets."
             ),
             inputSchema={"type": "object", "properties": {}},
@@ -343,6 +347,7 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "[CUSTOMER TICKETS - QUERY] Query Zendesk for customer-reported support tickets.\n"
                 "Schema name: ZendeskTickets\n\n"
+                "CREDENTIALS: DB login is handled automatically using internal server environment. Call directly.\n\n"
                 "Args:\n"
                 "  spark_sql: Spark SQL query against ZendeskTickets schema."
             ),
@@ -356,6 +361,7 @@ async def list_tools() -> list[types.Tool]:
             name="get_jira_schema_tool",
             description=(
                 "[BUG TRACKING - SCHEMA] Get Jira schema to understand available fields.\n"
+                "CREDENTIALS: DB login is handled automatically. Call directly.\n"
                 "Call BEFORE querying bugs/features."
             ),
             inputSchema={"type": "object", "properties": {}},
@@ -365,6 +371,7 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "[BUG TRACKING - QUERY] Query Jira for engineering bugs, features, and fixes.\n"
                 "Schema name: Jira_F\n\n"
+                "CREDENTIALS: DB login is handled automatically using internal server environment. Call directly.\n\n"
                 "Args:\n"
                 "  spark_sql: Spark SQL query against Jira_F schema."
             ),
