@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """
 Incorta Upgrade Assistant MCP Server
 
@@ -43,9 +44,21 @@ load_dotenv()
 from context.user_context import user_context
 from workflows.pre_upgrade_validation import run_validation
 from tools.qdrant_tool import search_knowledge_base
-from tools.incorta_tools import query_zendesk, query_jira, get_zendesk_schema, get_jira_schema
-from tools.extract_cluster_metadata import extract_cluster_metadata, format_metadata_report
-from tools.test_connection import derive_incorta_url_from_cmc, login_to_incorta_analytics, test_all_connections
+from tools.incorta_tools import (
+    query_zendesk,
+    query_jira,
+    get_zendesk_schema,
+    get_jira_schema,
+)
+from tools.extract_cluster_metadata import (
+    extract_cluster_metadata,
+    format_metadata_report,
+)
+from tools.test_connection import (
+    derive_incorta_url_from_cmc,
+    login_to_incorta_analytics,
+    test_all_connections,
+)
 from clients.cloud_portal_client import (
     CloudPortalClient,
     build_authorize_url,
@@ -55,7 +68,8 @@ from clients.cloud_portal_client import (
     delete_token,
     load_token,
 )
-from workflows.checklist_workflow import run_write_checklist_excel
+
+# from workflows.checklist_workflow import run_write_checklist_excel
 from workflows.readiness_report import run_readiness_report
 
 logger = logging.getLogger("incorta-upgrade-agent")
@@ -66,7 +80,9 @@ MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", "").rstrip("/")
 
 _DEFAULT_TEMPLATE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "templates", "pre_upgrade_checklist.xlsx"
+    os.path.dirname(os.path.abspath(__file__)),
+    "templates",
+    "pre_upgrade_checklist.xlsx",
 )
 
 # ---------------------------------------------------------------------------
@@ -90,9 +106,11 @@ def _purge_expired_pending_logins():
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _get_cmc_client():
     """Build a CMCClient from the current request's ContextVar."""
     from clients.cmc_client import CMCClient
+
     ctx = user_context.get()
     cmc_url = ctx.get("cmc_url") or ""
     cmc_user = ctx.get("cmc_user") or ""
@@ -190,6 +208,16 @@ async def list_tools() -> list[types.Tool]:
                 "  2. Ask the user for customer_name — must be a real COMPANY name from Jira.\n"
                 "     Examples: 'Apple', 'Starbucks', 'Keysight', 'Toast', 'Broadcom'.\n"
                 "     REJECT person names ('Anas', 'John') or generic words ('test', 'demo').\n\n"
+                "GENERATING THE EXCEL CHECKLIST:\n"
+                "  The report includes a <checklist_data> JSON block at the end with pre-mapped cell values.\n"
+                "  To generate the Excel file, use Python with openpyxl in your sandbox:\n"
+                "    1. Extract the JSON from the <checklist_data> block.\n"
+                "    2. Load the template at: /Users/anasahmed/WorkProjects/Upgrade_agent_v2/Incorta-Upgrade-Assistant/templates/pre_upgrade_checklist.xlsx\n"
+                "    3. Write values to the 'Pre-Upgrade Checklist' sheet only (column B = value, column C = status).\n"
+                "    4. Color-code column C: green (#C6EFCE) for 'Done'/'PASS', red (#FFC7CE) for 'Failed'/'FAIL',\n"
+                "       yellow (#FFEB9C) for 'Review'/'WARNING'/'Action Required', gray (#D9D9D9) for 'N/A',\n"
+                "       blue (#D9E1F2) for 'Pending'.\n"
+                "    5. Save to a new file and present it to the user.\n\n"
                 "Args:\n"
                 "  to_version: Target Incorta version (e.g. '2026.1.0'). Required.\n"
                 "  customer_name: Company name from Jira (e.g. 'Apple', 'Starbucks'). Optional but recommended.\n"
@@ -229,38 +257,40 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
-        types.Tool(
-            name="write_checklist_excel",
-            description=(
-                "[EXCEL OUTPUT] Write approved checklist values into an Excel template.\n"
-                "Call this with the <checklist_data> JSON block from generate_upgrade_readiness_report.\n\n"
-                "OUTPUT: The tool returns JSON with a 'base64' field (the Excel file), 'filename', and 'summary'.\n"
-                "To give the user a downloadable file, Claude MUST use bash_tool with this exact approach:\n"
-                "  1. Write the base64 string to a temp file first (avoids shell argument length limits):\n"
-                "     python3 -c \"import json; d=json.load(open('/tmp/xl.json')); open('/tmp/b64.txt','w').write(d['base64'])\"\n"
-                "     BUT: the tool result is already in context as a string, so instead do:\n"
-                "     python3 << 'EOF'\n"
-                "     import base64\n"
-                "     b64 = '<paste full base64 here>'\n"
-                "     open('/mnt/user-data/outputs/<filename>', 'wb').write(base64.b64decode(b64))\n"
-                "     EOF\n"
-                "  2. Call present_files with /mnt/user-data/outputs/<filename>.\n"
-                "  CRITICAL: Write the base64 as a Python string literal inside the heredoc, NOT as a shell echo argument.\n"
-                "  The heredoc approach handles strings of any length without truncation.\n"
-                "Show the summary text to the user as well.\n\n"
-                "Args:\n"
-                "  cell_values_json: JSON string from generate_upgrade_readiness_report.\n"
-                "  filename: Suggested filename. Default: 'pre_upgrade_checklist_filled.xlsx'."
-            ),
-            inputSchema={
-                "type": "object",
-                "required": ["cell_values_json"],
-                "properties": {
-                    "cell_values_json": {"type": "string"},
-                    "filename": {"type": "string"},
-                },
-            },
-        ),
+        # DISABLED: Claude can build the Excel directly from the <checklist_data> JSON
+        # using openpyxl in its sandbox. No need for this server-side tool.
+        # types.Tool(
+        #     name="write_checklist_excel",
+        #     description=(
+        #         "[EXCEL OUTPUT] Write approved checklist values into an Excel template.\n"
+        #         "Call this with the <checklist_data> JSON block from generate_upgrade_readiness_report.\n\n"
+        #         "OUTPUT: The tool returns JSON with a 'base64' field (the Excel file), 'filename', and 'summary'.\n"
+        #         "To give the user a downloadable file, Claude MUST use bash_tool with this exact approach:\n"
+        #         "  1. Write the base64 string to a temp file first (avoids shell argument length limits):\n"
+        #         "     python3 -c \"import json; d=json.load(open('/tmp/xl.json')); open('/tmp/b64.txt','w').write(d['base64'])\"\n"
+        #         "     BUT: the tool result is already in context as a string, so instead do:\n"
+        #         "     python3 << 'EOF'\n"
+        #         "     import base64\n"
+        #         "     b64 = '<paste full base64 here>'\n"
+        #         "     open('/mnt/user-data/outputs/<filename>', 'wb').write(base64.b64decode(b64))\n"
+        #         "     EOF\n"
+        #         "  2. Call present_files with /mnt/user-data/outputs/<filename>.\n"
+        #         "  CRITICAL: Write the base64 as a Python string literal inside the heredoc, NOT as a shell echo argument.\n"
+        #         "  The heredoc approach handles strings of any length without truncation.\n"
+        #         "Show the summary text to the user as well.\n\n"
+        #         "Args:\n"
+        #         "  cell_values_json: JSON string from generate_upgrade_readiness_report.\n"
+        #         "  filename: Suggested filename. Default: 'pre_upgrade_checklist_filled.xlsx'."
+        #     ),
+        #     inputSchema={
+        #         "type": "object",
+        #         "required": ["cell_values_json"],
+        #         "properties": {
+        #             "cell_values_json": {"type": "string"},
+        #             "filename": {"type": "string"},
+        #         },
+        #     },
+        # ),
         types.Tool(
             name="cloud_portal_connect",
             description=(
@@ -422,11 +452,11 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         customer_name = arguments.get("customer_name", "")
         if not customer_name:
             customer_name = "Unknown"
-            
+
         cloud_cluster_name = arguments.get("cloud_cluster_name", "")
         if not cloud_cluster_name:
             cloud_cluster_name = user_context.get().get("auto_cloud_cluster_name", "")
-            
+
         from_version = arguments.get("from_version", "")
         cmc_cluster_name = _get_cmc_cluster_name(arguments.get("cmc_cluster_name"))
 
@@ -469,23 +499,23 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
 
     # -----------------------------------------------------------------------
     # write_checklist_excel
-    # -----------------------------------------------------------------------
-    elif name == "write_checklist_excel":
-        cell_values_json = arguments.get("cell_values_json", "")
-        filename = arguments.get("filename", "pre_upgrade_checklist_filled.xlsx")
-
-        if not os.path.exists(_DEFAULT_TEMPLATE_PATH):
-            return _json({"error": f"Template not found at '{_DEFAULT_TEMPLATE_PATH}'."})
-
-        try:
-            result = run_write_checklist_excel(
-                cell_values_json=cell_values_json,
-                template_path=_DEFAULT_TEMPLATE_PATH,
-                filename=filename,
-            )
-            return _json(result)
-        except Exception as e:
-            return _json({"error": f"Error writing Excel: {e}"})
+    # DISABLED: Claude builds the Excel directly from <checklist_data> JSON using openpyxl
+    # elif name == "write_checklist_excel":
+    #     cell_values_json = arguments.get("cell_values_json", "")
+    #     filename = arguments.get("filename", "pre_upgrade_checklist_filled.xlsx")
+    #
+    #     if not os.path.exists(_DEFAULT_TEMPLATE_PATH):
+    #         return _json({"error": f"Template not found at '{_DEFAULT_TEMPLATE_PATH}'."})
+    #
+    #     try:
+    #         result = run_write_checklist_excel(
+    #             cell_values_json=cell_values_json,
+    #             template_path=_DEFAULT_TEMPLATE_PATH,
+    #             filename=filename,
+    #         )
+    #         return _json(result)
+    #     except Exception as e:
+    #         return _json({"error": f"Error writing Excel: {e}"})
 
     # -----------------------------------------------------------------------
     # cloud_portal_connect
@@ -616,7 +646,9 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
                     f"Error: Cloud Admin API returned 403 — token accepted but insufficient permissions.\n"
                     f"API response: {body}"
                 )
-            return _text(f"Error fetching cluster from Cloud Portal (HTTP {status}): {e}")
+            return _text(
+                f"Error fetching cluster from Cloud Portal (HTTP {status}): {e}"
+            )
         except Exception as e:
             return _text(f"Error: {e}")
 
@@ -629,45 +661,53 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         report_lines = [f"# Cloud Portal Metadata: {cluster_name}", ""]
 
         if cluster_status != "running":
-            report_lines.extend([
-                f"> **WARNING:** Cluster status is **{cluster_status}** (not running).",
-                "> Some data may be stale.",
-                "",
-            ])
+            report_lines.extend(
+                [
+                    f"> **WARNING:** Cluster status is **{cluster_status}** (not running).",
+                    "> Some data may be stale.",
+                    "",
+                ]
+            )
 
-        report_lines.extend([
-            "## Instance Details",
-            f"- **UUID:** `{instance_uuid}`",
-            f"- **Build:** {our_cluster.get('customBuild') or 'Vanilla'} ({our_cluster.get('customBuildName') or our_cluster.get('image')})",
-            f"- **Image:** {our_cluster.get('image')}",
-            f"- **Platform:** {our_cluster.get('platform')} - {our_cluster.get('region')}/{our_cluster.get('zone')}",
-            f"- **K8s Cluster:** {our_cluster.get('k8sClusterCode')}",
-            f"- **Status:** {cluster_status}",
-            f"- **Premium:** {'Yes' if our_cluster.get('isPremium') else 'No'}",
-            f"- **Organization:** {our_cluster.get('organization')}",
-            "",
-        ])
+        report_lines.extend(
+            [
+                "## Instance Details",
+                f"- **UUID:** `{instance_uuid}`",
+                f"- **Build:** {our_cluster.get('customBuild') or 'Vanilla'} ({our_cluster.get('customBuildName') or our_cluster.get('image')})",
+                f"- **Image:** {our_cluster.get('image')}",
+                f"- **Platform:** {our_cluster.get('platform')} - {our_cluster.get('region')}/{our_cluster.get('zone')}",
+                f"- **K8s Cluster:** {our_cluster.get('k8sClusterCode')}",
+                f"- **Status:** {cluster_status}",
+                f"- **Premium:** {'Yes' if our_cluster.get('isPremium') else 'No'}",
+                f"- **Organization:** {our_cluster.get('organization')}",
+                "",
+            ]
+        )
 
         services = our_cluster.get("instanceServices", [])
         if services:
             svc = services[0]
-            report_lines.extend([
-                "## Service Status",
-                f"- **CMC:** {svc.get('cmc_status', 'N/A')}",
-                f"- **Analytics:** {svc.get('analytics_status', 'N/A')}",
-                f"- **Loader:** {svc.get('loader_status', 'N/A')}",
-                f"- **Spark:** {svc.get('spark_status', 'N/A')}",
-                f"- **Zookeeper:** {svc.get('zookeeper_status', 'N/A')}",
-                "",
-            ])
+            report_lines.extend(
+                [
+                    "## Service Status",
+                    f"- **CMC:** {svc.get('cmc_status', 'N/A')}",
+                    f"- **Analytics:** {svc.get('analytics_status', 'N/A')}",
+                    f"- **Loader:** {svc.get('loader_status', 'N/A')}",
+                    f"- **Spark:** {svc.get('spark_status', 'N/A')}",
+                    f"- **Zookeeper:** {svc.get('zookeeper_status', 'N/A')}",
+                    "",
+                ]
+            )
 
-        report_lines.extend([
-            "## Software Versions",
-            f"- **Spark:** {our_cluster.get('incortaSparkVersion')}",
-            f"- **Python:** {our_cluster.get('pythonVersion') or 'N/A'}",
-            f"- **MySQL:** {our_cluster.get('mysqlVersion') or 'N/A'}",
-            "",
-        ])
+        report_lines.extend(
+            [
+                "## Software Versions",
+                f"- **Spark:** {our_cluster.get('incortaSparkVersion')}",
+                f"- **Python:** {our_cluster.get('pythonVersion') or 'N/A'}",
+                f"- **MySQL:** {our_cluster.get('mysqlVersion') or 'N/A'}",
+                "",
+            ]
+        )
 
         def _format_size(size_obj, label):
             if not size_obj or not isinstance(size_obj, dict):
@@ -683,12 +723,14 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         report_lines.extend(_format_size(our_cluster.get("analyticsSize"), "Analytics"))
         report_lines.extend(_format_size(our_cluster.get("loaderSize"), "Loader"))
         report_lines.extend(_format_size(our_cluster.get("cmcSize"), "CMC"))
-        report_lines.extend([
-            f"- **Analytics Nodes:** {our_cluster.get('analyticsNodes', 'N/A')}",
-            f"- **Loader Nodes:** {our_cluster.get('loaderNodes', 'N/A')}",
-            f"- **ZK Replicas:** {our_cluster.get('zkReplicas', 'N/A')}",
-            "",
-        ])
+        report_lines.extend(
+            [
+                f"- **Analytics Nodes:** {our_cluster.get('analyticsNodes', 'N/A')}",
+                f"- **Loader Nodes:** {our_cluster.get('loaderNodes', 'N/A')}",
+                f"- **ZK Replicas:** {our_cluster.get('zkReplicas', 'N/A')}",
+                "",
+            ]
+        )
 
         if include_consumption:
             try:
@@ -700,68 +742,86 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
 
                 report_lines.append("## Consumption & Cost")
                 if daily_data:
-                    avg_pu = sum(d.get("powerUnit", 0) for d in daily_data) / len(daily_data)
+                    avg_pu = sum(d.get("powerUnit", 0) for d in daily_data) / len(
+                        daily_data
+                    )
                     recent_7 = daily_data[-7:] if len(daily_data) >= 7 else daily_data
-                    report_lines.extend([
-                        f"- **Total (This Month):** {total_pu:.6f} Power Units",
-                        f"- **Daily Average:** {avg_pu:.6f} PU/day",
-                        f"- **Estimated Downtime Cost (4h):** {(avg_pu / 24 * 4):.6f} PU",
-                        "",
-                        "**Recent Trend (Last 7 Days):**",
-                    ])
+                    report_lines.extend(
+                        [
+                            f"- **Total (This Month):** {total_pu:.6f} Power Units",
+                            f"- **Daily Average:** {avg_pu:.6f} PU/day",
+                            f"- **Estimated Downtime Cost (4h):** {(avg_pu / 24 * 4):.6f} PU",
+                            "",
+                            "**Recent Trend (Last 7 Days):**",
+                        ]
+                    )
                     for day in recent_7:
-                        report_lines.append(f"  - {day.get('startTime', 'Unknown')}: {day.get('powerUnit', 0):.6f} PU")
+                        report_lines.append(
+                            f"  - {day.get('startTime', 'Unknown')}: {day.get('powerUnit', 0):.6f} PU"
+                        )
                 elif total_pu:
-                    report_lines.append(f"- **Total (This Month):** {total_pu:.6f} Power Units")
+                    report_lines.append(
+                        f"- **Total (This Month):** {total_pu:.6f} Power Units"
+                    )
                 else:
                     report_lines.append("- No consumption data available.")
                 report_lines.append("")
             except Exception as e:
-                report_lines.extend(["## Consumption & Cost", f"Could not fetch: {e}", ""])
+                report_lines.extend(
+                    ["## Consumption & Cost", f"Could not fetch: {e}", ""]
+                )
 
         if include_users:
             try:
                 user_id = client.get_user_id()
                 users_data = client.get_authorized_users(user_id, cluster_name)
                 users_list = users_data.get("authorizedUserRoles", [])
-                report_lines.extend([f"## Authorized Users ({len(users_list)} total)", ""])
+                report_lines.extend(
+                    [f"## Authorized Users ({len(users_list)} total)", ""]
+                )
                 for user_item in users_list:
                     u = user_item.get("user", {})
-                    role = user_item.get("authorizedRoles", [{}])[0].get("role", "unknown")
+                    role = user_item.get("authorizedRoles", [{}])[0].get(
+                        "role", "unknown"
+                    )
                     status = user_item.get("status", "unknown")
                     report_lines.append(
                         f"- **{u.get('email')}** ({role.capitalize()}) - {status} - Last: {u.get('lastLoginAt', 'Never')}"
                     )
                 report_lines.append("")
             except Exception as e:
-                report_lines.extend(["## Authorized Users", f"Could not fetch: {e}", ""])
+                report_lines.extend(
+                    ["## Authorized Users", f"Could not fetch: {e}", ""]
+                )
 
-        report_lines.extend([
-            "## Feature Flags",
-            f"- **SQLi:** {'Enabled' if our_cluster.get('sqliEnabled') else 'Disabled'}",
-            f"- **Incorta X:** {'Enabled' if our_cluster.get('incortaXEnabled') else 'Disabled'}",
-            f"- **Data Agent:** {'Enabled' if our_cluster.get('enableDataAgent') else 'Disabled'}",
-            f"- **Chat/OpenAI:** {'Enabled' if our_cluster.get('enableChat') else 'Disabled'}",
-            f"- **MLflow:** {'Enabled' if our_cluster.get('mlflowEnabled') else 'Disabled'}",
-            f"- **Data Studio:** {'Enabled' if our_cluster.get('enableDataStudio') else 'Disabled'}",
-            "",
-            "## Spark Configuration",
-            f"- **Min Executors:** {our_cluster.get('minExecutors', 'N/A')}",
-            f"- **Max Executors:** {our_cluster.get('maxExecutors', 'N/A')}",
-            f"- **Spark Memory:** {our_cluster.get('sparkMem', 'N/A')} MB",
-            f"- **Spark CPU:** {our_cluster.get('sparkCpu', 'N/A')} millicores",
-            "",
-            "## Storage",
-            f"- **Data Size:** {our_cluster.get('dsize')} GB",
-            f"- **Loader Size:** {our_cluster.get('dsizeLoader')} GB",
-            f"- **CMC Size:** {our_cluster.get('dsizeCmc')} GB",
-            f"- **Available Disk:** {our_cluster.get('availableDisk')} GB",
-            "",
-            "## Upgrade History",
-            f"- **Last Upgrade:** {our_cluster.get('initiatedUpgradeAt') or 'Never'}",
-            f"- **Created:** {our_cluster.get('createdAt')}",
-            f"- **Last Updated:** {our_cluster.get('updatedAt')}",
-        ])
+        report_lines.extend(
+            [
+                "## Feature Flags",
+                f"- **SQLi:** {'Enabled' if our_cluster.get('sqliEnabled') else 'Disabled'}",
+                f"- **Incorta X:** {'Enabled' if our_cluster.get('incortaXEnabled') else 'Disabled'}",
+                f"- **Data Agent:** {'Enabled' if our_cluster.get('enableDataAgent') else 'Disabled'}",
+                f"- **Chat/OpenAI:** {'Enabled' if our_cluster.get('enableChat') else 'Disabled'}",
+                f"- **MLflow:** {'Enabled' if our_cluster.get('mlflowEnabled') else 'Disabled'}",
+                f"- **Data Studio:** {'Enabled' if our_cluster.get('enableDataStudio') else 'Disabled'}",
+                "",
+                "## Spark Configuration",
+                f"- **Min Executors:** {our_cluster.get('minExecutors', 'N/A')}",
+                f"- **Max Executors:** {our_cluster.get('maxExecutors', 'N/A')}",
+                f"- **Spark Memory:** {our_cluster.get('sparkMem', 'N/A')} MB",
+                f"- **Spark CPU:** {our_cluster.get('sparkCpu', 'N/A')} millicores",
+                "",
+                "## Storage",
+                f"- **Data Size:** {our_cluster.get('dsize')} GB",
+                f"- **Loader Size:** {our_cluster.get('dsizeLoader')} GB",
+                f"- **CMC Size:** {our_cluster.get('dsizeCmc')} GB",
+                f"- **Available Disk:** {our_cluster.get('availableDisk')} GB",
+                "",
+                "## Upgrade History",
+                f"- **Last Upgrade:** {our_cluster.get('initiatedUpgradeAt') or 'Never'}",
+                f"- **Created:** {our_cluster.get('createdAt')}",
+                f"- **Last Updated:** {our_cluster.get('updatedAt')}",
+            ]
+        )
 
         return _text("\n".join(report_lines))
 
@@ -829,7 +889,9 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         incorta_url = derive_incorta_url_from_cmc(cmc_url)
 
         try:
-            session = login_to_incorta_analytics(incorta_url, tenant, username, password)
+            session = login_to_incorta_analytics(
+                incorta_url, tenant, username, password
+            )
         except RuntimeError as e:
             return _text(f"Error: Analytics login failed: {e}")
 
@@ -886,6 +948,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
 # HTTP Routes
 # ===========================================================================
 
+
 async def debug_token(request: Request) -> HTMLResponse:
     """
     Debug endpoint: shows the current cached token claims for an email.
@@ -909,12 +972,15 @@ async def debug_token(request: Request) -> HTMLResponse:
         claims = {"decode_error": str(e)}
 
     import json as _json
+
     output = {
         "email": email,
         "has_refresh_token": bool(data.get("refresh_token")),
         "cached_at": data.get("cached_at"),
         "exp": claims.get("exp"),
-        "expires_in_hours": round((claims.get("exp", 0) - time.time()) / 3600, 2) if claims.get("exp") else None,
+        "expires_in_hours": round((claims.get("exp", 0) - time.time()) / 3600, 2)
+        if claims.get("exp")
+        else None,
         "audience": claims.get("aud"),
         "issuer": claims.get("iss"),
         "scope": claims.get("scope"),
@@ -956,8 +1022,11 @@ async def oauth_callback(request: Request) -> HTMLResponse:
 
     # Validate state
     if not state or state not in pending_logins:
-        return _html(400, "Login Error",
-                     "Login session not found or expired.<br>Please start over from Claude.")
+        return _html(
+            400,
+            "Login Error",
+            "Login session not found or expired.<br>Please start over from Claude.",
+        )
 
     login_info = pending_logins.pop(state)
     email = login_info["email"]
@@ -968,28 +1037,45 @@ async def oauth_callback(request: Request) -> HTMLResponse:
     if error:
         error_desc = params.get("error_description", error)
         completed_logins[email] = {"success": False, "error": error_desc}
-        return _html(400, "Login Failed", f"{error_desc}<br><br>Return to Claude and try again.")
+        return _html(
+            400, "Login Failed", f"{error_desc}<br><br>Return to Claude and try again."
+        )
 
     if not code:
-        completed_logins[email] = {"success": False, "error": "No authorization code received."}
-        return _html(400, "Login Failed",
-                     "No authorization code received.<br>Return to Claude and try again.")
+        completed_logins[email] = {
+            "success": False,
+            "error": "No authorization code received.",
+        }
+        return _html(
+            400,
+            "Login Failed",
+            "No authorization code received.<br>Return to Claude and try again.",
+        )
 
     # Exchange code for tokens
     try:
         token_data = exchange_code_for_token(code, redirect_uri, code_verifier, cmc_url)
     except RuntimeError as e:
         completed_logins[email] = {"success": False, "error": str(e)}
-        return _html(500, "Login Failed",
-                     f"Token exchange error: {e}<br>Return to Claude and try again.")
+        return _html(
+            500,
+            "Login Failed",
+            f"Token exchange error: {e}<br>Return to Claude and try again.",
+        )
 
     access_token = token_data.get("access_token")
     refresh_token = token_data.get("refresh_token")
 
     if not access_token:
-        completed_logins[email] = {"success": False, "error": "No access_token in Auth0 response."}
-        return _html(500, "Login Failed",
-                     "Auth0 did not return an access token.<br>Return to Claude and try again.")
+        completed_logins[email] = {
+            "success": False,
+            "error": "No access_token in Auth0 response.",
+        }
+        return _html(
+            500,
+            "Login Failed",
+            "Auth0 did not return an access token.<br>Return to Claude and try again.",
+        )
 
     # Verify email claim matches
     try:
@@ -998,9 +1084,7 @@ async def oauth_callback(request: Request) -> HTMLResponse:
         claims = {}
 
     jwt_email = (
-        claims.get("email")
-        or claims.get("https://namespace/email")
-        or ""
+        claims.get("email") or claims.get("https://namespace/email") or ""
     ).lower()
 
     if jwt_email and jwt_email != email.lower():
@@ -1018,9 +1102,12 @@ async def oauth_callback(request: Request) -> HTMLResponse:
         hours = (exp - time.time()) / 3600
         expiry_msg = f" Token valid for {hours:.1f} hours."
 
-    return _html(200, "✅ Connected!",
-                 f"Authenticated as <strong>{email}</strong>.{expiry_msg}<br><br>"
-                 "You can close this tab and return to Claude.")
+    return _html(
+        200,
+        "✅ Connected!",
+        f"Authenticated as <strong>{email}</strong>.{expiry_msg}<br><br>"
+        "You can close this tab and return to Claude.",
+    )
 
 
 # ===========================================================================
@@ -1055,27 +1142,32 @@ async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> 
     incorta_env_url = raw_headers.get("incorta-analytics-url", "").rstrip("/")
     if not incorta_env_url and cmc_url.endswith("/cmc"):
         incorta_env_url = cmc_url[:-4] + "/incorta"
-        
+
     # auto-detect Cloud Portal cluster name from the Analytics url first subdomain
     auto_cloud_cluster_name = ""
     if incorta_env_url:
         import urllib.parse
+
         parsed_env = urllib.parse.urlparse(incorta_env_url)
         if parsed_env.hostname:
             auto_cloud_cluster_name = parsed_env.hostname.split(".")[0]
 
-    user_context.set({
-        "cmc_url":            cmc_url,
-        "cmc_user":           raw_headers.get("cmc-user", ""),
-        "cmc_password":       raw_headers.get("cmc-password", ""),
-        "cmc_cluster_name":   cmc_cluster_name,
-        "incorta_tenant":     raw_headers.get("incorta-tenant", "default"),  # default fallback
-        "incorta_username":   raw_headers.get("incorta-username", ""),
-        "incorta_password":   raw_headers.get("incorta-password", ""),
-        "incorta_env_url":    incorta_env_url,
-        "cloud_portal_email": raw_headers.get("cloud-portal-email", ""),
-        "auto_cloud_cluster_name": auto_cloud_cluster_name,
-    })
+    user_context.set(
+        {
+            "cmc_url": cmc_url,
+            "cmc_user": raw_headers.get("cmc-user", ""),
+            "cmc_password": raw_headers.get("cmc-password", ""),
+            "cmc_cluster_name": cmc_cluster_name,
+            "incorta_tenant": raw_headers.get(
+                "incorta-tenant", "default"
+            ),  # default fallback
+            "incorta_username": raw_headers.get("incorta-username", ""),
+            "incorta_password": raw_headers.get("incorta-password", ""),
+            "incorta_env_url": incorta_env_url,
+            "cloud_portal_email": raw_headers.get("cloud-portal-email", ""),
+            "auto_cloud_cluster_name": auto_cloud_cluster_name,
+        }
+    )
 
     try:
         await session_manager.handle_request(scope, receive, send)
@@ -1088,7 +1180,9 @@ async def lifespan(_app: Starlette) -> AsyncIterator[None]:
     async with session_manager.run():
         logger.info(f"Incorta Upgrade Assistant MCP server started")
         logger.info(f"  StreamableHTTP: http://{MCP_HOST}:{MCP_PORT}/mcp")
-        logger.info(f"  OAuth callback: {MCP_PUBLIC_URL or f'http://localhost:{MCP_PORT}'}/callback")
+        logger.info(
+            f"  OAuth callback: {MCP_PUBLIC_URL or f'http://localhost:{MCP_PORT}'}/callback"
+        )
         try:
             yield
         finally:
@@ -1111,6 +1205,6 @@ if __name__ == "__main__":
         starlette_app,
         host=MCP_HOST,
         port=MCP_PORT,
-        forwarded_allow_ips="*",   # trust nginx reverse proxy host headers
+        forwarded_allow_ips="*",  # trust nginx reverse proxy host headers
         proxy_headers=True,
     )
