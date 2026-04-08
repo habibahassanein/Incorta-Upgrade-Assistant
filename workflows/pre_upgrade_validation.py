@@ -1,8 +1,7 @@
 """
-in this folder, we will define the langraph workflows, where the large sequence actions will be as nodes inside this workflow 
-with ability to add agentic decisions on those outputs, and further with more complex endpoints we can deal with it's output internally
+Pre-upgrade validation workflow.
 
-
+CMC credentials are read from the request ContextVar (set by handle_streamable_http).
 """
 
 import os
@@ -14,6 +13,7 @@ from langgraph.graph import StateGraph, END
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from clients.cmc_client import CMCClient
+from context.user_context import user_context
 from tools.validation_checks import (
     check_service_status,
     check_memory_status,
@@ -41,9 +41,15 @@ class ValidationState(TypedDict):
 # --- Workflow Nodes ---
 
 def fetch_cluster_data(state: ValidationState) -> ValidationState:
-    """Node 1: Fetch cluster data from CMC"""
+    """Node 1: Fetch cluster data from CMC using credentials from request context."""
     try:
-        client = CMCClient()
+        ctx = user_context.get()
+        client = CMCClient(
+            url=ctx.get("cmc_url"),
+            user=ctx.get("cmc_user"),
+            password=ctx.get("cmc_password"),
+            cluster_name=ctx.get("cmc_cluster_name"),
+        )
         cluster_data = client.get_cluster(state["cluster_name"])
         return {**state, "cluster_data": cluster_data}
     except Exception as e:
@@ -51,28 +57,31 @@ def fetch_cluster_data(state: ValidationState) -> ValidationState:
 
 
 def check_datasource_connectivity() -> dict:
-    """Check datasource connectivity using cached Incorta Analytics session.
+    """Check datasource connectivity using Analytics headers from request context.
 
-    Returns a validation check result dict with status and details.
-    Skips gracefully if no Analytics session is available.
+    Skips gracefully if Analytics credentials weren't provided in headers.
+    Use the test_datasource_connections tool directly for a dedicated check.
     """
-    # Import the cached session from server module
-    try:
-        from server import _incorta_session_cache
-    except ImportError:
-        _incorta_session_cache = {}
+    from tools.test_connection import derive_incorta_url_from_cmc, login_to_incorta_analytics, test_all_connections
+    ctx = user_context.get()
+    cmc_url = ctx.get("cmc_url", "")
+    tenant = ctx.get("incorta_tenant", "")
+    username = ctx.get("incorta_username", "")
+    password = ctx.get("incorta_password", "")
 
-    if not _incorta_session_cache.get("authorization"):
+    if not (cmc_url and tenant and username and password):
         return {
             "status": "WARN",
             "details": [
-                "Datasource connectivity not checked — Incorta Analytics login required.",
-                "Call the **test_datasource_connections** tool to authenticate and test connections.",
+                "Datasource connectivity not checked — Analytics credentials not provided.",
+                "Add incorta-tenant, incorta-username, incorta-password headers to enable this check.",
             ],
         }
 
     try:
-        result = test_all_connections(_incorta_session_cache)
+        incorta_url = derive_incorta_url_from_cmc(cmc_url)
+        session = login_to_incorta_analytics(incorta_url, tenant, username, password)
+        result = test_all_connections(session)
     except Exception as e:
         return {
             "status": "WARN",
@@ -80,16 +89,9 @@ def check_datasource_connectivity() -> dict:
         }
 
     if "error" in result:
-        return {
-            "status": "WARN",
-            "details": [result["error"]],
-        }
+        return {"status": "WARN", "details": [result["error"]]}
 
-    details = [
-        f"Tested {result['tested']}/{result['total']} datasources "
-        f"({result['skipped']} skipped — no test support)",
-    ]
-
+    details = [f"Tested {result['tested']}/{result['total']} datasources ({result['skipped']} skipped)."]
     if result["failed"] == 0:
         status = "PASS"
         details.append(f"All {result['passed']} tested datasources connected successfully.")
@@ -99,10 +101,8 @@ def check_datasource_connectivity() -> dict:
         for r in result["results"]:
             mark = "OK" if r["success"] else "FAIL"
             details.append(f"  [{mark}] {r['name']} ({r.get('type', 'unknown')}): {r['message']}")
-
-    if result["skipped_datasources"]:
+    if result.get("skipped_datasources"):
         details.append(f"Skipped: {', '.join(result['skipped_datasources'])}")
-
     return {"status": status, "details": details}
 
 

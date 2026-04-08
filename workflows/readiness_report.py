@@ -64,6 +64,7 @@ def collect_cmc_data(state: ReadinessState) -> ReadinessState:
     errors = list(state.get("errors", []))
     try:
         from clients.cmc_client import CMCClient
+        from context.user_context import user_context
         from tools.extract_cluster_metadata import extract_cluster_metadata
         from tools.validation_checks import (
             check_service_status,
@@ -78,7 +79,13 @@ def collect_cmc_data(state: ReadinessState) -> ReadinessState:
             check_database_migration,
         )
 
-        client = CMCClient()
+        ctx = user_context.get()
+        client = CMCClient(
+            url=ctx.get("cmc_url"),
+            user=ctx.get("cmc_user"),
+            password=ctx.get("cmc_password"),
+            cluster_name=ctx.get("cmc_cluster_name"),
+        )
         cluster_data = client.get_cluster(state["cmc_cluster_name"])
         metadata = extract_cluster_metadata(cluster_data)
 
@@ -93,6 +100,35 @@ def collect_cmc_data(state: ReadinessState) -> ReadinessState:
             "Connectors": check_connectors(cluster_data, to_version=state.get("to_version", ""), from_version=state.get("from_version", "")),
             "Tenants": check_tenants(cluster_data),
             "Email Configuration": check_email_configuration(cluster_data, is_cloud=is_cloud),
+            "Notebook & SQLi": check_notebook_sqli_status(cluster_data),
+            "Database Migration": check_database_migration(cluster_data),
+        }
+
+        return {
+            **state,
+            "cluster_data": cluster_data,
+            "cluster_metadata": metadata,
+            "validation_checks": checks,
+        }
+    except Exception as e:
+        errors.append(f"CMC data collection failed: {e}")
+        return {
+            **state,
+            "cluster_data": {},
+            "cluster_metadata": {},
+            "validation_checks": {},
+            "errors": errors,
+        }
+
+        checks = {
+            "Service Status": check_service_status(cluster_data),
+            "Memory Status": check_memory_status(cluster_data),
+            "Cluster Configuration": check_cluster_configuration(cluster_data),
+            "Infrastructure Services": check_infrastructure_services(cluster_data),
+            "Node Topology": check_node_topology(cluster_data),
+            "Connectors": check_connectors(cluster_data),
+            "Tenants": check_tenants(cluster_data),
+            "Email Configuration": check_email_configuration(cluster_data),
             "Notebook & SQLi": check_notebook_sqli_status(cluster_data),
             "Database Migration": check_database_migration(cluster_data),
         }
@@ -181,7 +217,7 @@ def collect_jira_data(state: ReadinessState) -> ReadinessState:
 # ---------------------------------------------------------------------------
 
 def collect_cloud_data(state: ReadinessState) -> ReadinessState:
-    """Fetch cloud metadata from Cloud Portal API using the cp- search endpoint."""
+    """Fetch cloud metadata from Cloud Portal API using the cached per-user JWT."""
     errors = list(state.get("errors", []))
     cloud_cluster_name = state.get("cloud_cluster_name", "")
 
@@ -190,10 +226,30 @@ def collect_cloud_data(state: ReadinessState) -> ReadinessState:
         return {**state, "cloud_metadata": {}, "errors": errors}
 
     try:
-        from clients.cloud_portal_client import CloudPortalClient
+        from clients.cloud_portal_client import CloudPortalClient, get_valid_token
+        from context.user_context import user_context
 
-        cloud_client = CloudPortalClient()
-        cluster = cloud_client.search_instances(cloud_cluster_name)
+        ctx = user_context.get()
+        email = ctx.get("cloud_portal_email", "").strip()
+        cmc_url = ctx.get("cmc_url", "")
+
+        if not email:
+            errors.append(
+                "Cloud Portal data skipped — cloud-portal-email header not set. "
+                "Add 'cloud-portal-email' to your MCP client config headers."
+            )
+            return {**state, "cloud_metadata": {}, "errors": errors}
+
+        token = get_valid_token(email, cmc_url)
+        if not token:
+            errors.append(
+                f"Cloud Portal data skipped — no valid token for {email}. "
+                "Call the cloud_portal_connect tool to authenticate."
+            )
+            return {**state, "cloud_metadata": {}, "errors": errors}
+
+        cloud_client = CloudPortalClient(bearer_token=token, cmc_url=cmc_url)
+        cluster = cloud_client.search_instances(cloud_cluster_name, cmc_url)
 
         if not cluster:
             errors.append(f"Cloud cluster '{cloud_cluster_name}' not found in Cloud Portal")

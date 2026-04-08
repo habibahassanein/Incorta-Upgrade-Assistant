@@ -1,1499 +1,1289 @@
+from __future__ import annotations
 
+"""
+Incorta Upgrade Assistant MCP Server
+
+Authentication design:
+  - CMC & Analytics: stateless, credentials passed as HTTP headers per-request
+  - Cloud Portal:    OAuth 2.0 PKCE flow via `cloud_portal_connect` tool;
+                     JWTs cached per-user in data/tokens/{email}.json
+
+Headers read from every MCP request:
+  cmc-url, cmc-user, cmc-password, cmc-cluster-name
+  incorta-tenant, incorta-username, incorta-password
+  cloud-portal-email
+"""
+
+import contextlib
 import json
+import logging
 import os
+import secrets
 import sys
+import tempfile
 import time
-from typing import Literal
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any, Dict, Literal
 
+import jwt as pyjwt
 import requests
+import uvicorn
+from dotenv import load_dotenv
+from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse
+from starlette.responses import FileResponse, HTMLResponse, Response
+from starlette.routing import Mount, Route
+from starlette.types import Receive, Scope, Send
+
+import mcp.types as types
+from mcp.server.lowlevel import Server
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from dotenv import load_dotenv
 load_dotenv()
 
-from mcp.server.fastmcp import FastMCP
-
+from context.user_context import user_context
 from workflows.pre_upgrade_validation import run_validation
 from tools.qdrant_tool import search_knowledge_base
-from tools.incorta_tools import query_zendesk, query_jira, get_zendesk_schema, get_jira_schema
-from tools.extract_cluster_metadata import extract_cluster_metadata, format_metadata_report
-from tools.test_connection import derive_incorta_url_from_cmc, login_to_incorta_analytics, test_all_connections
-from clients.cloud_portal_client import CloudPortalClient
+from tools.incorta_tools import (
+    query_zendesk,
+    query_jira,
+    get_zendesk_schema,
+    get_jira_schema,
+)
+from tools.extract_cluster_metadata import (
+    extract_cluster_metadata,
+    format_metadata_report,
+)
+from tools.test_connection import (
+    derive_incorta_url_from_cmc,
+    login_to_incorta_analytics,
+    test_all_connections,
+)
+from clients.cloud_portal_client import (
+    CloudPortalClient,
+    build_authorize_url,
+    exchange_code_for_token,
+    get_valid_token,
+    save_token,
+    delete_token,
+    load_token,
+)
+
 from workflows.checklist_workflow import run_write_checklist_excel
 from workflows.readiness_report import run_readiness_report
 
+logger = logging.getLogger("incorta-upgrade-agent")
+logging.basicConfig(level=logging.INFO)
 
-app = FastMCP("incorta-upgrade-agent", stateless_http=True)
+MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
+MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
+MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", "").rstrip("/")
+
+# Temp directory for generated Excel files (served via /download/<token>)
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/tmp/upgrade-assistant-downloads"))
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_TTL = int(os.getenv("DOWNLOAD_TTL", "3600"))  # 1 hour
+
+_DEFAULT_TEMPLATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "templates",
+    "pre_upgrade_checklist.xlsx",
+)
+
+# ---------------------------------------------------------------------------
+# OAuth state storage (in-memory)
+# pending_logins:   state_token → {email, code_verifier, redirect_uri, expires_at}
+# completed_logins: email       → {success: bool, error: str|None}
+# ---------------------------------------------------------------------------
+pending_logins: Dict[str, Dict] = {}
+completed_logins: Dict[str, Dict] = {}
 
 
-# ==========================================
-# HELPERS
-# ==========================================
+def _purge_expired_pending_logins():
+    """Remove stale pending login states (older than 10 minutes)."""
+    now = time.time()
+    expired = [s for s, v in pending_logins.items() if v.get("expires_at", 0) < now]
+    for s in expired:
+        del pending_logins[s]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_cmc_client():
+    """Build a CMCClient from the current request's ContextVar."""
+    from clients.cmc_client import CMCClient
+
+    ctx = user_context.get()
+    cmc_url = ctx.get("cmc_url") or ""
+    cmc_user = ctx.get("cmc_user") or ""
+    cmc_password = ctx.get("cmc_password") or ""
+    cmc_cluster_name = ctx.get("cmc_cluster_name") or ""
+
+    if not cmc_url or not cmc_user or not cmc_password:
+        raise RuntimeError(
+            "CMC credentials not configured.\n"
+            "Add cmc-url, cmc-user, and cmc-password to your MCP client headers."
+        )
+
+    return CMCClient(
+        url=cmc_url,
+        user=cmc_user,
+        password=cmc_password,
+        cluster_name=cmc_cluster_name,
+    )
 
 
 def _get_cmc_cluster_name(explicit: str | None = None) -> str | None:
-    """Resolve CMC cluster name from: explicit param → cached config → env var.
-
-    Returns the cluster name string, or None if not found anywhere.
-    """
+    """Resolve CMC cluster name from explicit param or request context."""
     if explicit:
         return explicit
-
-    # Check cached config from portal login
-    from clients.cmc_client import CMCClient
-    cached = CMCClient.load_cached_config()
-    if cached.get("cluster_name"):
-        return cached["cluster_name"]
-
-    # Fall back to environment variable
-    return os.getenv("CMC_CLUSTER_NAME") or None
+    ctx = user_context.get()
+    return ctx.get("cmc_cluster_name") or os.getenv("CMC_CLUSTER_NAME") or None
 
 
-# ==========================================
-# CUSTOMER UPGRADE RECOMMENDATION WORKFLOW
-# ==========================================
-
-
-@app.tool()
-def generate_upgrade_readiness_report(
-    to_version: str,
-    customer_name: str,
-    cmc_cluster_name: str | None = None,
-    from_version: str = "",
-    cloud_cluster_name: str | None = None,
-) -> str:
+def _get_cloud_portal_client() -> tuple[CloudPortalClient | None, str | None]:
     """
-    [CORE - RUN FIRST] Generate a comprehensive Upgrade Readiness Report.
-    Orchestrates all data sources (CMC, Cloud Portal, knowledge base, upgrade research,
-    Zendesk customer support tickets, and Jira bug tracking) to produce an opinionated
-    readiness assessment with a rating and Excel checklist data.
+    Get a CloudPortalClient loaded with the current user's cached JWT.
 
-    This is the recommended single-command way to assess upgrade readiness.
-    It runs ALL other tools internally and produces a unified report.
-
-    IMPORTANT: Before calling this tool, the agent MUST ask the user for their
-    customer name in conversation. Do not assume or guess the customer name.
-    The name is used for fuzzy matching in both Jira (Customer field) and
-    Zendesk (organization name), so partial names work (e.g., "Acme" matches
-    "Acme Corp" in Jira and "Acme Corporation" in Zendesk).
-
-    PREREQUISITES:
-    - Ask the user for the Cloud Portal cluster name (e.g., 'habibascluster') and
-      make sure the cluster is running before calling this tool.
-    - For Cloud Portal data, call `cloud_portal_login` first. Without it, these
-      fields will appear as N/A in the report.
-
-    AUTOMATIC ZENDESK ANALYSIS: The report automatically queries Zendesk for:
-    - Known issues for this specific upgrade path (tag-based filtering)
-    - Risk assessment (critical issues, resolution times)
-    - Environment-specific issues (cloud vs on-prem)
-    - Customer satisfaction metrics
-    - Jira keys linked to ALL of this customer's Zendesk tickets (fuzzy org match)
-    No manual SQL or Zendesk tool calls needed — this runs automatically.
-
-    AUTOMATIC JIRA BUG ANALYSIS: The report automatically queries Jira for:
-    - Customer-reported bugs filtered by affected version (from_version)
-    - Bugs linked from Zendesk tickets (both upgrade-tagged and all customer tickets)
-    - Bugs from other customers affecting versions in the upgrade path
-    - Classification: fixed in target / still open / won't fix / requires later release
-    - Rich bug details: Created, Updated, ResolutionName, Labels, Description
-    Requires customer_name to match bugs in Jira.
-
-    OUTPUT INCLUDES:
-    - Overall Readiness Rating: READY / READY WITH CAVEATS / NOT READY
-    - Environment summary (deployment type, DB, topology, versions)
-    - Known upgrade issues from customer support data
-    - Customer bug fix status from Jira
-    - Blockers that must be resolved before upgrade
-    - Warnings to review
-    - Validation checks summary (10 health checks)
-    - Key upgrade considerations (DB migration, HA, version-specific notes)
-    - Version research (release notes, known issues)
-    - Data gaps (if any data sources failed)
-    - Pre-Upgrade Checklist JSON (for write_checklist_excel)
-
-    NEXT STEP: After getting this report, pass the <checklist_data> JSON block
-    at the bottom to `write_checklist_excel` to download the filled Excel checklist.
-
-    Args:
-        to_version: Target Incorta version (e.g., '2024.7.0'). Required.
-        customer_name: Customer name exactly as it appears in Jira's Customer field (e.g., 'Acme Corp'). Required for Jira bug analysis.
-        cmc_cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
-        from_version: Current Incorta version (e.g., '2024.1.0'). Auto-detected from cluster if empty.
-        cloud_cluster_name: Cloud Portal cluster name (e.g., 'habibascluster'). REQUIRED — ask the user.
+    Returns (client, None) on success.
+    Returns (None, error_message) if no valid token — includes login URL.
     """
-    # Resolve CMC cluster name (explicit → cached → env)
-    cmc_cluster_name = _get_cmc_cluster_name(cmc_cluster_name)
-    if not cmc_cluster_name:
-        return (
-            "Error: CMC cluster name not available.\n"
-            "Please call the **cmc_login** tool first to authenticate via the login portal, "
-            "or provide the cmc_cluster_name parameter."
+    ctx = user_context.get()
+    email = ctx.get("cloud_portal_email", "").strip()
+    cmc_url = ctx.get("cmc_url", "")
+
+    if not email:
+        return None, (
+            "Error: cloud-portal-email not configured.\n"
+            "Add 'cloud-portal-email' to your MCP client config headers."
         )
 
-    # Cloud Portal cluster name is required — do not infer
-    if not cloud_cluster_name:
-        return (
-            "Error: cloud_cluster_name is required.\n"
-            "Please ask the user for the Cloud Portal cluster name "
-            "(e.g., 'habibascluster') and make sure the cluster is running."
-        )
-
-    try:
-        return run_readiness_report(
-            cmc_cluster_name=cmc_cluster_name,
-            to_version=to_version,
-            customer_name=customer_name,
-            cloud_cluster_name=cloud_cluster_name,
-        )
-    except Exception as e:
-        return f"Error generating readiness report: {str(e)}"
-
-@app.tool()
-def run_pre_upgrade_validation(cluster_name: str | None = None) -> str:
-    """
-    [HEALTH CHECK] Validates Incorta cluster health before upgrade.
-    Performs comprehensive pre-upgrade health checks including: service status (Analytics, Loader),
-    memory usage, node topology, infrastructure services (Spark, Zookeeper, DB), connectors, tenants,
-    email configuration, and database migration status.
-
-    USE CASE: Run at the START of any upgrade conversation to baseline cluster health.
-    Results identify BLOCKERS (critical issues that must be resolved before upgrade) and
-    WARNINGS (issues to monitor). Store results for comparison with post-upgrade validation.
-
-    OUTPUT: Markdown report with Healthy, Warnings, Blockers sections.
-    Use blockers to determine upgrade risk level (HIGH/MEDIUM/LOW).
-
-    Args:
-        cluster_name: CMC cluster name (e.g., 'customCluster'). Defaults to CMC_CLUSTER_NAME env var.
-    """
-    cluster_name = _get_cmc_cluster_name(cluster_name)
-    if not cluster_name:
-        return (
-            "Error: CMC cluster name not available.\n"
-            "Please call the **cmc_login** tool first to authenticate via the login portal, "
-            "or provide the cluster_name parameter."
-        )
-    try:
-        return run_validation(cluster_name)
-    except Exception as e:
-        return f"Error running pre-upgrade validation: {str(e)}"
-
-
-
-_DEFAULT_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "pre_upgrade_checklist.xlsx")
-
-
-@app.tool()
-def write_checklist_excel(
-    cell_values_json: str,
-    filename: str = "pre_upgrade_checklist_filled.xlsx",
-) -> str:
-    """
-    [EXCEL OUTPUT] Write approved checklist values into an Excel template.
-    Call this with the `<checklist_data>` JSON block from `generate_upgrade_readiness_report`.
-
-    Takes the JSON data embedded in the readiness report output (potentially modified by the user),
-    fills the bundled 'Pre-Upgrade Checklist' template, and returns the result as a
-    base64-encoded Excel file. Claude Desktop will offer it as a download — no file
-    paths or VM access needed.
-
-    All other sheets in the workbook are left untouched.
-
-    Args:
-        cell_values_json: JSON string of cell values from generate_upgrade_readiness_report (the <checklist_data> block).
-        filename: Suggested filename for the downloaded file. Defaults to 'pre_upgrade_checklist_filled.xlsx'.
-    """
-    template_path = _DEFAULT_TEMPLATE_PATH
-
-    if not os.path.exists(template_path):
-        return json.dumps({
-            "error": f"Bundled template not found at '{template_path}'. "
-                     "Ensure pre_upgrade_checklist.xlsx is in the templates/ directory."
-        })
-
-    try:
-        result = run_write_checklist_excel(
-            cell_values_json=cell_values_json,
-            template_path=template_path,
-            filename=filename,
-        )
-        return json.dumps(result)
-    except Exception as e:
-        return json.dumps({"error": f"Error writing Excel: {str(e)}"})
-
-
-
-# Module-level state for the non-blocking login flows.
-# Tracks a pending Authorization Code + PKCE login (public Cloudflare or local browser).
-_login_state = {
-    "active": False,
-    "flow": None,             # "public" or "browser"
-    # Shared PKCE state
-    "state": None,            # CSRF state token
-    "event": None,           # threading.Event — set when callback received
-    "auth_code_holder": None, # {"code": str|None, "error": str|None}
-    "code_verifier": None,
-    "redirect_uri": None,
-    "authorize_url": None,
-    "server": None,           # HTTPServer instance (browser flow only)
-    "server_thread": None,    # Background daemon thread (browser flow only)
-    "client": None,           # CloudPortalClient instance
-}
-
-
-def _cleanup_login_state():
-    """Reset the module-level login state and stop any running server."""
-    if _login_state.get("server"):
-        try:
-            _login_state["server"].server_close()
-        except Exception:
-            pass
-    _login_state.update({
-        "active": False,
-        "flow": None,
-        "state": None,
-        "event": None,
-        "auth_code_holder": None,
-        "code_verifier": None,
-        "redirect_uri": None,
-        "authorize_url": None,
-        "server": None,
-        "server_thread": None,
-        "client": None,
-    })
-
-
-@app.custom_route("/callback", methods=["GET"])
-async def oauth_callback(request: Request) -> HTMLResponse:
-    """OAuth Authorization Code callback handler.
-
-    Receives the redirect from Auth0 after user login, validates state,
-    exchanges the code for a token, and completes the login flow.
-    Used when MCP_PUBLIC_URL is set in headless mode with a persistent, pre-registered domain.
-    """
-    from clients.cloud_portal_client import CloudPortalClient as _CPC
-    params = dict(request.query_params)
-    returned_state = params.get("state")
-    error = params.get("error")
-    code = params.get("code")
-
-    def _html(status: int, title: str, body: str) -> HTMLResponse:
-        content = (
-            f"<html><head><title>{title}</title>"
-            "<style>body{{font-family:sans-serif;max-width:600px;margin:60px auto;text-align:center}}"
-            "h2{{color:#333}}p{{color:#666}}</style></head>"
-            f"<body><h2>{title}</h2><p>{body}</p></body></html>"
-        )
-        return HTMLResponse(content=content, status_code=status)
-
-    if not _login_state["active"] or _login_state.get("flow") != "public":
-        return _html(400, "Login Error", "No active login flow. Please start login from Claude again.")
-
-    expected_state = _login_state.get("state")
-    if returned_state != expected_state:
-        _cleanup_login_state()
-        return _html(400, "Login Failed", "State mismatch — possible CSRF attack. Please try again.")
-
-    if error:
-        error_desc = params.get("error_description", error)
-        _login_state["auth_code_holder"] = {"code": None, "error": error_desc}
-        if _login_state.get("event"):
-            _login_state["event"].set()
-        return _html(400, "Login Failed", f"{error_desc}")
-
-    if not code:
-        _login_state["auth_code_holder"] = {"code": None, "error": "No authorization code received"}
-        if _login_state.get("event"):
-            _login_state["event"].set()
-        return _html(400, "Login Failed", "No authorization code received. Please try again.")
-
-    # Exchange code for token immediately in the callback
-    client = _login_state.get("client") or _CPC()
-    code_verifier = _login_state["code_verifier"]
-    redirect_uri = _login_state["redirect_uri"]
-    try:
-        client.exchange_code_for_token(code, redirect_uri, code_verifier)
-        _login_state["auth_code_holder"] = {"code": code, "error": None}
-        if _login_state.get("event"):
-            _login_state["event"].set()
-        return _html(200, "Login Successful",
-                     "You are now logged in. You can close this tab and return to Claude.")
-    except RuntimeError as e:
-        _login_state["auth_code_holder"] = {"code": None, "error": str(e)}
-        if _login_state.get("event"):
-            _login_state["event"].set()
-        return _html(500, "Login Failed", f"Token exchange failed: {e}")
-
-
-# ==========================================
-# CMC LOGIN PORTAL (browser-based form)
-# ==========================================
-
-# Module-level flag: set to True after successful CMC portal login
-_cmc_login_success = False
-
-# Module-level state for test-connection portal
-_test_conn_login_success = False
-_incorta_session_cache = {}
-
-_INCORTA_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Mulish:wght@400;600;700&display=swap');
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'Mulish', sans-serif; background: #f3f5f6; min-height: 100vh;
-       display: flex; align-items: center; justify-content: center; }
-.card { background: #fff; border-radius: 15px; box-shadow: 7px 7px 55px #f2f3f6;
-        padding: 40px 36px; max-width: 440px; width: 100%; }
-.logo { text-align: center; margin-bottom: 24px; }
-.logo svg { height: 36px; }
-h2 { color: #15152b; font-size: 22px; font-weight: 700; text-align: center; margin-bottom: 8px; }
-.subtitle { color: #818192; font-size: 14px; text-align: center; margin-bottom: 28px; }
-label { display: block; color: #15152b; font-weight: 600; font-size: 14px; margin-bottom: 6px; }
-input[type=text], input[type=password] {
-    width: 100%; padding: 10px 14px; border: 1.5px solid #d0d5dd; border-radius: 8px;
-    font-family: 'Mulish', sans-serif; font-size: 15px; margin-bottom: 18px;
-    transition: border-color 0.2s; outline: none;
-}
-input[type=text]:focus, input[type=password]:focus { border-color: #4854fe; box-shadow: 0 0 0 3px rgba(72,84,254,0.12); }
-.btn { display: block; width: 100%; padding: 12px; background: #241c55; color: #fff; border: none;
-       border-radius: 11.354px; font-family: 'Mulish', sans-serif; font-size: 16px; font-weight: 700;
-       cursor: pointer; transition: background 0.2s; }
-.btn:hover { background: #4854fe; }
-.error-box { background: #fef3f2; border: 1px solid #fecaca; border-radius: 8px;
-             padding: 12px 16px; color: #b42318; font-size: 14px; margin-bottom: 18px; }
-.success-box { background: #ecfdf3; border: 1px solid #bbf7d0; border-radius: 8px;
-               padding: 16px; color: #027a48; font-size: 14px; text-align: center; margin-top: 20px; }
-.hint { color: #818192; font-size: 12px; margin-top: -14px; margin-bottom: 18px; }
-"""
-
-_INCORTA_LOGO_SVG = """<svg width="160" height="36" viewBox="0 0 555.63 125.85" xmlns="http://www.w3.org/2000/svg">
-  <defs><style>.cls-1{fill:#15152b;}</style></defs>
-  <path class="cls-1" d="M133.93,124.28h-25.43v-52.31c0-7.92-6.42-14.33-14.33-14.33s-14.33,6.42-14.33,14.33v52.31h-25.43v-52.31c0-21.96,17.8-39.76,39.76-39.76s39.76,17.8,39.76,39.76v52.31h0Z"/>
-  <path class="cls-1" d="M233.19,91.7c-2.89,9.97-8.89,18.76-17.13,25.08-13.7,9.65-31.35,11.73-46.93,5.53-5.74-2.48-10.9-6.14-15.14-10.73-4.21-4.43-7.53-9.63-9.78-15.32-2.21-5.68-3.34-11.72-3.31-17.81-.02-6.05,1.17-12.04,3.5-17.62,2.38-5.6,5.8-10.69,10.08-15.01,4.27-4.44,9.38-7.99,15.04-10.44,5.63-2.35,11.68-3.54,17.77-3.48,10.28-.27,20.36,2.88,28.66,8.95,8.31,6.59,14.34,15.64,17.23,25.84h-27.67c-1.73-2.99-4.27-5.42-7.33-7.02-3.44-1.69-7.23-2.52-11.06-2.42-5.49-.1-10.77,2.08-14.6,6-3.83,4.12-5.9,9.58-5.78,15.2-.25,5.94,1.86,11.73,5.88,16.11,6.8,6.22,16.69,7.69,25,3.71,2.99-1.57,5.58-3.82,7.55-6.56h28.02Z"/>
-  <path class="cls-1" d="M252.23,46.14c4.36-4.38,9.53-7.89,15.22-10.31,5.56-2.37,11.54-3.59,17.58-3.6,6.15-.05,12.25,1.07,17.97,3.29,11.57,4.65,20.85,13.66,25.82,25.1,2.45,5.63,3.73,11.69,3.75,17.83.08,6.3-1.06,12.55-3.36,18.41-2.29,5.65-5.72,10.78-10.07,15.06-4.36,4.43-9.55,7.96-15.28,10.38-5.87,2.4-12.17,3.61-18.51,3.55-6.34.09-12.63-1.11-18.49-3.52-5.74-2.49-10.89-6.14-15.14-10.73-4.21-4.35-7.54-9.48-9.78-15.11-2.22-5.64-3.34-11.65-3.31-17.71-.02-6.07,1.17-12.08,3.5-17.69,2.35-5.6,5.78-10.68,10.08-14.95ZM285.53,100.98c5.62-.01,10.99-2.33,14.87-6.4,3.99-4.16,6.2-9.71,6.17-15.47.04-5.81-2.18-11.4-6.17-15.62-7.75-8.21-20.68-8.59-28.9-.84-.29.27-.57.55-.84.84-4,4.21-6.21,9.81-6.17,15.62-.02,5.77,2.21,11.32,6.22,15.47,3.87,4.06,9.22,6.37,14.82,6.4h0Z"/>
-  <path class="cls-1" d="M339.57,82.33v41.95h25.43v-41.95c.01-13.63,11.06-24.68,24.69-24.69v-25.43c-27.67.03-50.09,22.45-50.12,50.12Z"/>
-  <path class="cls-1" d="M443.86,57.67v-25.48h-18.73V12.72h-25.43v111.54h25.43v-55.63c0-5.67,4.59-10.95,10.26-10.95h8.47Z"/>
-  <path class="cls-1" d="M41.91,41.36v-9.15H0l.2,25.44h6.22c5.67,0,10.06,4.8,10.06,10.46v56.15h25.43V41.36h0Z"/>
-  <circle class="cls-1" cx="29.71" cy="12.97" r="12.97"/>
-  <path class="cls-1" d="M539.35,88.28v-56.2h-22.28v7.08c-2.36-1.49-4.86-2.75-7.45-3.78-5.74-2.23-11.85-3.35-18.01-3.3-6.05,0-12.05,1.22-17.62,3.59-5.7,2.43-10.89,5.93-15.26,10.32-4.32,4.28-7.75,9.37-10.1,14.98-2.33,5.61-3.52,11.64-3.51,17.72-.03,6.07,1.1,12.09,3.32,17.74,2.25,5.63,5.57,10.77,9.79,15.12,4.26,4.6,9.42,8.26,15.17,10.75,5.87,2.42,12.17,3.62,18.52,3.53,6.36.06,12.66-1.15,18.55-3.55,2.59-1.08,5.08-2.41,7.42-3.95v6.73h37.74v-26.42h-5.9c-5.73.02-10.39-4.62-10.39-10.35ZM507,94.55c-7.75,8.21-20.69,8.58-28.9.83-.28-.27-.56-.55-.83-.83-4.02-4.16-6.26-9.72-6.25-15.5-.04-5.82,2.18-11.42,6.19-15.64,7.75-8.23,20.71-8.61,28.93-.86.29.28.58.56.86.86,4.01,4.22,6.22,9.83,6.19,15.64.03,5.77-2.19,11.33-6.19,15.5h0Z"/>
-</svg>"""
-
-
-def _cmc_html_page(title: str, body_html: str, status: int = 200) -> HTMLResponse:
-    """Return an Incorta-branded HTML page."""
-    html = (
-        f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        f"<title>{title}</title><style>{_INCORTA_CSS}</style></head>"
-        f"<body><div class='card'>"
-        f"<div class='logo'>{_INCORTA_LOGO_SVG}</div>"
-        f"{body_html}"
-        f"</div></body></html>"
-    )
-    return HTMLResponse(content=html, status_code=status)
-
-
-@app.custom_route("/cmc-login", methods=["GET"])
-async def cmc_login_form(request: Request) -> HTMLResponse:
-    """Serve the CMC login form."""
-    form_html = (
-        "<h2>CMC Login</h2>"
-        "<p class='subtitle'>Enter your CMC credentials to authenticate.</p>"
-        "<form method='POST' action='/cmc-login'>"
-        "<label for='env'>Environment</label>"
-        "<select id='env' name='env' onchange='updateCmcUrl()' "
-        "style='width:100%;padding:10px;margin-bottom:12px;border:1px solid #D1D5DB;"
-        "border-radius:8px;font-size:14px;background:#fff;'>"
-        "<option value='staging'>Staging (cloudstaging.incortalabs.com)</option>"
-        "<option value='production'>Production (cloud2.incorta.com)</option>"
-        "<option value='custom'>Custom</option>"
-        "</select>"
-        "<label for='cmc_url'>CMC URL</label>"
-        "<input type='text' id='cmc_url' name='cmc_url' "
-        "placeholder='https://yourcluster.cloudstaging.incortalabs.com/cmc' required />"
-        "<p class='hint' id='cmc_url_hint'>"
-        "Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc</p>"
-        "<label for='username'>Username</label>"
-        "<input type='text' id='username' name='username' placeholder='admin' required />"
-        "<label for='password'>Password</label>"
-        "<input type='password' id='password' name='password' required />"
-        "<label for='cluster_name'>CMC Cluster Name</label>"
-        "<input type='text' id='cluster_name' name='cluster_name' placeholder='customCluster' required />"
-        "<p class='hint'>The cluster name as shown in CMC (e.g., customCluster)</p>"
-        "<button type='submit' class='btn'>Login</button>"
-        "</form>"
-        "<script>"
-        "function updateCmcUrl() {"
-        "  var env = document.getElementById('env').value;"
-        "  var urlInput = document.getElementById('cmc_url');"
-        "  var hint = document.getElementById('cmc_url_hint');"
-        "  if (env === 'staging') {"
-        "    urlInput.placeholder = 'https://yourcluster.cloudstaging.incortalabs.com/cmc';"
-        "    hint.innerHTML = 'Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc';"
-        "  } else if (env === 'production') {"
-        "    urlInput.placeholder = 'https://yourcluster.cloud2.incorta.com/cmc';"
-        "    hint.innerHTML = 'Format: https://&lt;cluster&gt;.cloud2.incorta.com/cmc';"
-        "  } else {"
-        "    urlInput.placeholder = 'https://your-cmc-url/cmc';"
-        "    hint.innerHTML = 'Enter the full CMC URL';"
-        "  }"
-        "}"
-        "</script>"
-    )
-    return _cmc_html_page("CMC Login", form_html)
-
-
-@app.custom_route("/cmc-login", methods=["POST"])
-async def cmc_login_submit(request: Request) -> HTMLResponse:
-    """Process the CMC login form submission."""
-    global _cmc_login_success
-
-    form = await request.form()
-    cmc_url = (form.get("cmc_url") or "").strip().rstrip("/")
-    username = (form.get("username") or "").strip()
-    password = (form.get("password") or "").strip()
-    cluster_name = (form.get("cluster_name") or "").strip()
-
-    # Validate all fields are provided
-    missing = []
-    if not cmc_url:
-        missing.append("CMC URL")
-    if not username:
-        missing.append("Username")
-    if not password:
-        missing.append("Password")
-    if not cluster_name:
-        missing.append("CMC Cluster Name")
-
-    if missing:
-        error_html = (
-            "<h2>CMC Login</h2>"
-            f"<div class='error-box'>Missing required fields: {', '.join(missing)}</div>"
-            "<p style='text-align:center; margin-top:16px;'>"
-            "<a href='/cmc-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
-        )
-        return _cmc_html_page("CMC Login - Error", error_html, status=400)
-
-    # Try authenticating against CMC
-    from clients.cmc_client import CMCClient
-
-    try:
-        client = CMCClient(url=cmc_url, user=username, password=password, cluster_name=cluster_name)
-        client.login()  # This caches the token + url + cluster_name to disk
-    except RuntimeError as e:
-        error_msg = str(e)
-        # Truncate long error messages for display
-        if len(error_msg) > 300:
-            error_msg = error_msg[:300] + "..."
-        error_html = (
-            "<h2>CMC Login</h2>"
-            f"<div class='error-box'>{error_msg}</div>"
-            "<p style='text-align:center; margin-top:16px;'>"
-            "<a href='/cmc-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
-        )
-        return _cmc_html_page("CMC Login - Failed", error_html, status=401)
-
-    # Success!
-    _cmc_login_success = True
-
-    # Decode JWT for display
-    expiry_info = ""
-    try:
-        import jwt as pyjwt
-        claims = pyjwt.decode(client.token, options={"verify_signature": False})
-        exp = claims.get("exp")
-        if exp:
-            remaining = (exp - time.time()) / 3600
-            expiry_info = f"<br>Token expires in <strong>{remaining:.1f} hours</strong>."
-    except Exception:
-        pass
-
-    success_html = (
-        "<h2>Login Successful</h2>"
-        "<div class='success-box'>"
-        f"<strong>Authenticated as {username}</strong><br>"
-        f"CMC URL: <code>{cmc_url}</code><br>"
-        f"Cluster: <code>{cluster_name}</code>"
-        f"{expiry_info}"
-        "</div>"
-        "<p style='text-align:center; margin-top:20px; color:#6B7280; font-size:14px;'>"
-        "You can close this tab and return to Claude.</p>"
-    )
-    return _cmc_html_page("CMC Login - Success", success_html)
-
-
-# ==========================================
-# TEST CONNECTION LOGIN PORTAL (combined CMC + Analytics)
-# ==========================================
-
-
-@app.custom_route("/test-connection-login", methods=["GET"])
-async def test_connection_login_form(request: Request) -> HTMLResponse:
-    """Serve the combined CMC + Incorta Analytics login form."""
-    form_html = (
-        "<h2>Test Connection Login</h2>"
-        "<p class='subtitle'>Enter your CMC and Incorta Analytics credentials to test datasource connections.</p>"
-        "<form method='POST' action='/test-connection-login'>"
-
-        # CMC Section
-        "<div style='margin-bottom:8px;'>"
-        "<h3 style='color:#15152b;font-size:16px;font-weight:700;margin-bottom:12px;"
-        "padding-bottom:8px;border-bottom:1px solid #e5e7eb;'>CMC Credentials</h3>"
-        "</div>"
-        "<label for='env'>Environment</label>"
-        "<select id='env' name='env' onchange='updateCmcUrl()' "
-        "style='width:100%;padding:10px;margin-bottom:12px;border:1px solid #D1D5DB;"
-        "border-radius:8px;font-size:14px;background:#fff;'>"
-        "<option value='staging'>Staging (cloudstaging.incortalabs.com)</option>"
-        "<option value='production'>Production (cloud2.incorta.com)</option>"
-        "<option value='custom'>Custom</option>"
-        "</select>"
-        "<label for='cmc_url'>CMC URL</label>"
-        "<input type='text' id='cmc_url' name='cmc_url' "
-        "placeholder='https://yourcluster.cloudstaging.incortalabs.com/cmc' required />"
-        "<p class='hint' id='cmc_url_hint'>"
-        "Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc</p>"
-        "<label for='cmc_username'>CMC Username</label>"
-        "<input type='text' id='cmc_username' name='cmc_username' placeholder='admin' required />"
-        "<label for='cmc_password'>CMC Password</label>"
-        "<input type='password' id='cmc_password' name='cmc_password' required />"
-        "<label for='cluster_name'>CMC Cluster Name</label>"
-        "<input type='text' id='cluster_name' name='cluster_name' placeholder='customCluster' required />"
-        "<p class='hint'>The cluster name as shown in CMC (e.g., customCluster)</p>"
-
-        # Incorta Analytics Section
-        "<div style='margin-top:24px;margin-bottom:8px;'>"
-        "<h3 style='color:#15152b;font-size:16px;font-weight:700;margin-bottom:4px;"
-        "padding-bottom:8px;border-bottom:1px solid #e5e7eb;'>Incorta Analytics Credentials</h3>"
-        "</div>"
-        "<p class='hint' style='margin-top:0;margin-bottom:14px;'>"
-        "Analytics URL will be auto-derived from CMC URL. "
-        "<a href='#' id='analytics_link' target='_blank' style='color:#4854fe;'>Open Analytics Login</a>"
-        "</p>"
-        "<label for='tenant'>Tenant</label>"
-        "<input type='text' id='tenant' name='tenant' placeholder='default' required />"
-        "<label for='incorta_username'>Username</label>"
-        "<input type='text' id='incorta_username' name='incorta_username' required />"
-        "<label for='incorta_password'>Password</label>"
-        "<input type='password' id='incorta_password' name='incorta_password' required />"
-
-        "<button type='submit' class='btn' style='margin-top:8px;'>Login & Test Connections</button>"
-        "</form>"
-
-        "<script>"
-        "function updateCmcUrl() {"
-        "  var env = document.getElementById('env').value;"
-        "  var urlInput = document.getElementById('cmc_url');"
-        "  var hint = document.getElementById('cmc_url_hint');"
-        "  if (env === 'staging') {"
-        "    urlInput.placeholder = 'https://yourcluster.cloudstaging.incortalabs.com/cmc';"
-        "    hint.innerHTML = 'Format: https://&lt;cluster&gt;.cloudstaging.incortalabs.com/cmc';"
-        "  } else if (env === 'production') {"
-        "    urlInput.placeholder = 'https://yourcluster.cloud2.incorta.com/cmc';"
-        "    hint.innerHTML = 'Format: https://&lt;cluster&gt;.cloud2.incorta.com/cmc';"
-        "  } else {"
-        "    urlInput.placeholder = 'https://your-cmc-url/cmc';"
-        "    hint.innerHTML = 'Enter the full CMC URL';"
-        "  }"
-        "  updateAnalyticsLink();"
-        "}"
-        "function updateAnalyticsLink() {"
-        "  var cmcUrl = document.getElementById('cmc_url').value.replace(/\\/+$/, '');"
-        "  var link = document.getElementById('analytics_link');"
-        "  if (cmcUrl) {"
-        "    var base = cmcUrl.endsWith('/cmc') ? cmcUrl.slice(0, -4) : cmcUrl;"
-        "    link.href = base + '/incorta/#/login';"
-        "    link.textContent = 'Open Analytics Login (' + base + '/incorta)';"
-        "  } else {"
-        "    link.href = '#';"
-        "    link.textContent = 'Open Analytics Login';"
-        "  }"
-        "}"
-        "document.getElementById('cmc_url').addEventListener('input', updateAnalyticsLink);"
-        "</script>"
-    )
-    return _cmc_html_page("Test Connection Login", form_html)
-
-
-@app.custom_route("/test-connection-login", methods=["POST"])
-async def test_connection_login_submit(request: Request) -> HTMLResponse:
-    """Process the combined login form: authenticate CMC + Incorta Analytics."""
-    global _test_conn_login_success, _incorta_session_cache
-
-    form = await request.form()
-    cmc_url = (form.get("cmc_url") or "").strip().rstrip("/")
-    cmc_username = (form.get("cmc_username") or "").strip()
-    cmc_password = (form.get("cmc_password") or "").strip()
-    cluster_name = (form.get("cluster_name") or "").strip()
-    tenant = (form.get("tenant") or "").strip()
-    incorta_username = (form.get("incorta_username") or "").strip()
-    incorta_password = (form.get("incorta_password") or "").strip()
-
-    # Validate all fields
-    missing = []
-    if not cmc_url:
-        missing.append("CMC URL")
-    if not cmc_username:
-        missing.append("CMC Username")
-    if not cmc_password:
-        missing.append("CMC Password")
-    if not cluster_name:
-        missing.append("CMC Cluster Name")
-    if not tenant:
-        missing.append("Tenant")
-    if not incorta_username:
-        missing.append("Analytics Username")
-    if not incorta_password:
-        missing.append("Analytics Password")
-
-    if missing:
-        error_html = (
-            "<h2>Test Connection Login</h2>"
-            f"<div class='error-box'>Missing required fields: {', '.join(missing)}</div>"
-            "<p style='text-align:center; margin-top:16px;'>"
-            "<a href='/test-connection-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
-        )
-        return _cmc_html_page("Test Connection Login - Error", error_html, status=400)
-
-    # Step 1: Login to CMC
-    from clients.cmc_client import CMCClient
-
-    try:
-        cmc_client = CMCClient(url=cmc_url, user=cmc_username, password=cmc_password, cluster_name=cluster_name)
-        cmc_client.login()
-    except RuntimeError as e:
-        error_msg = str(e)
-        if len(error_msg) > 300:
-            error_msg = error_msg[:300] + "..."
-        error_html = (
-            "<h2>Test Connection Login</h2>"
-            f"<div class='error-box'><strong>CMC Login Failed:</strong> {error_msg}</div>"
-            "<p style='text-align:center; margin-top:16px;'>"
-            "<a href='/test-connection-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
-        )
-        return _cmc_html_page("Test Connection Login - Failed", error_html, status=401)
-
-    # Step 2: Derive Incorta Analytics URL
-    incorta_url = derive_incorta_url_from_cmc(cmc_url)
-
-    # Step 3: Login to Incorta Analytics
-    try:
-        session = login_to_incorta_analytics(incorta_url, tenant, incorta_username, incorta_password)
-    except RuntimeError as e:
-        error_msg = str(e)
-        if len(error_msg) > 300:
-            error_msg = error_msg[:300] + "..."
-        error_html = (
-            "<h2>Test Connection Login</h2>"
-            "<div class='success-box' style='background:#ecfdf3;color:#027a48;margin-bottom:16px;'>"
-            f"<strong>CMC Login Successful</strong> (as {cmc_username})</div>"
-            f"<div class='error-box'><strong>Analytics Login Failed:</strong> {error_msg}</div>"
-            "<p style='text-align:center; margin-top:16px;'>"
-            "<a href='/test-connection-login' style='color:#4854fe; font-weight:600;'>Try Again</a></p>"
-        )
-        return _cmc_html_page("Test Connection Login - Partial", error_html, status=401)
-
-    # Both logins successful
-    _incorta_session_cache = session
-    _test_conn_login_success = True
-
-    success_html = (
-        "<h2>Login Successful</h2>"
-        "<div class='success-box'>"
-        f"<strong>CMC:</strong> Authenticated as <code>{cmc_username}</code><br>"
-        f"Cluster: <code>{cluster_name}</code><br><br>"
-        f"<strong>Analytics:</strong> Authenticated as <code>{incorta_username}</code><br>"
-        f"Tenant: <code>{tenant}</code><br>"
-        f"URL: <code>{incorta_url}</code>"
-        "</div>"
-        "<p style='text-align:center; margin-top:20px; color:#6B7280; font-size:14px;'>"
-        "You can close this tab and return to Claude.<br>"
-        "Call <strong>test_datasource_connections</strong> again to run the tests.</p>"
-    )
-    return _cmc_html_page("Test Connection Login - Success", success_html)
-
-
-@app.tool()
-def cloud_portal_login() -> str:
-    """
-    [CLOUD AUTH] Log in to the Cloud Portal via browser-based OAuth.
-
-    TWO-STEP PROCESS:
-      Step 1: Call this tool — you receive a login URL. Open it in your browser and complete login.
-      Step 2: Call this tool again — it confirms login and caches the token for future calls.
-
-    After authentication, the token is cached and subsequent Cloud Portal API calls
-    will work automatically (including inside generate_upgrade_readiness_report).
-
-    WHEN TO USE: Call this BEFORE generate_upgrade_readiness_report for cloud deployments.
-    Without it, Spark/Python versions, disk sizes, and Data Agent status will be N/A.
-    Also call this when get_cloud_metadata returns an authentication error.
-
-    Supports two environments:
-    - Local/browser (recommended): redirect always goes to localhost:8910/callback,
-      regardless of MCP_PUBLIC_URL. Works whenever a browser is available.
-    - Headless with persistent URL: set MCP_PUBLIC_URL to a domain registered in Auth0.
-      Ephemeral Cloudflare tunnel URLs (*.trycloudflare.com) are rejected automatically.
-
-    NOTE: Headless environments (Docker, no browser) cannot authenticate directly.
-    Authenticate locally first — the token is cached and auto-refreshes across restarts.
-    """
-    cloud_client = CloudPortalClient()
-
-    # 1. Check if already authenticated with a valid token
-    if cloud_client.bearer_token and not cloud_client._is_token_expired(cloud_client.bearer_token):
-        _cleanup_login_state()
-        try:
-            user_id = cloud_client.get_user_id()
-        except RuntimeError:
-            user_id = "unknown"
-        return (
-            "## Already Authenticated\n\n"
-            f"- **User ID:** `{user_id}`\n"
-            "- Token is still valid.\n"
-            "\nYou can use `get_cloud_metadata` directly."
-        )
-
-    # 2. Try silent refresh (no browser needed)
-    if cloud_client._refresh_access_token():
-        _cleanup_login_state()
-        try:
-            user_id = cloud_client.get_user_id()
-        except RuntimeError:
-            user_id = "unknown"
-        return (
-            "## Token Refreshed\n\n"
-            f"- **User ID:** `{user_id}`\n"
-            "- Token refreshed successfully (no browser login needed).\n"
-            "\nYou can use `get_cloud_metadata` directly."
-        )
-
-    # 3. If a login flow is active, check for completion
-    if _login_state["active"]:
-        flow = _login_state.get("flow")
-
-        if flow in ("public", "browser"):
-            # Check if the callback route (public) or local server (browser) completed
-            event = _login_state.get("event")
-            holder = _login_state.get("auth_code_holder") or {}
-
-            if event and event.is_set():
-                if holder.get("error"):
-                    err = holder["error"]
-                    _cleanup_login_state()
-                    return f"## Login Failed\n\n{err}"
-
-                # For "public" flow, token was already exchanged in the /callback route
-                if flow == "public":
-                    _cleanup_login_state()
-                    try:
-                        # Reload client to pick up the saved token
-                        fresh_client = CloudPortalClient()
-                        user_id = fresh_client.get_user_id()
-                    except RuntimeError:
-                        user_id = "unknown"
-                    return (
-                        f"## Cloud Portal Login Successful\n\n"
-                        f"- **User ID:** `{user_id}`\n"
-                        f"- Token cached and will auto-refresh.\n"
-                        f"\nYou can now use `get_cloud_metadata` to query your clusters."
-                    )
-
-                # "browser" flow: exchange code now
-                auth_code = holder.get("code")
-                if not auth_code:
-                    _cleanup_login_state()
-                    return "## Login Failed\n\nNo authorization code received."
-
-                client = _login_state.get("client") or cloud_client
-                code_verifier = _login_state["code_verifier"]
-                redirect_uri = _login_state["redirect_uri"]
-                _cleanup_login_state()
-
-                try:
-                    client.exchange_code_for_token(auth_code, redirect_uri, code_verifier)
-                    user_id = client.get_user_id()
-                    return (
-                        f"## Cloud Portal Login Successful\n\n"
-                        f"- **User ID:** `{user_id}`\n"
-                        f"- Token cached and will auto-refresh.\n"
-                        f"\nYou can now use `get_cloud_metadata` to query your clusters."
-                    )
-                except RuntimeError as e:
-                    return f"## Login Failed\n\nToken exchange error: {str(e)}"
-            else:
-                # Still waiting
-                authorize_url = _login_state.get("authorize_url", "")
-                return (
-                    f"## Login In Progress\n\n"
-                    f"Still waiting for you to complete login.\n\n"
-                    f"**Open this URL if you haven't already:**\n"
-                    f"{authorize_url}\n\n"
-                    f"After completing login in the browser, call this tool again."
-                )
-
-    # 4. No active flow — determine which flow to use and start it
-    public_url = os.getenv("MCP_PUBLIC_URL", "").rstrip("/")
-
-    if public_url and ".trycloudflare.com" in public_url:
-        import logging
-        logging.getLogger(__name__).warning(
-            "MCP_PUBLIC_URL is a trycloudflare.com URL which changes every session "
-            "and cannot be registered in Auth0. OAuth will use localhost instead."
-        )
-
-    if not cloud_client._is_headless():
-        # PREFERRED: Browser available — always use localhost callback.
-        # OAuth redirects happen in the user's browser, which can reach localhost:8910
-        # regardless of whether the MCP server is exposed via a tunnel.
-        try:
-            login_info = cloud_client.login_for_mcp()
-        except RuntimeError as e:
-            return f"## Login Error\n\n{str(e)}"
-
-        _login_state.update({
-            "active": True,
-            "flow": "browser",
-            "event": login_info["event"],
-            "auth_code_holder": login_info["auth_code_holder"],
-            "code_verifier": login_info["code_verifier"],
-            "redirect_uri": login_info["redirect_uri"],
-            "authorize_url": login_info["authorize_url"],
-            "server": login_info["server"],
-            "server_thread": login_info["server_thread"],
-            "client": cloud_client,
-        })
-
-        return (
-            f"## Cloud Portal Login\n\n"
-            f"**Open this URL in your browser:**\n"
-            f"{login_info['authorize_url']}\n\n"
-            f"Complete login (including MFA if required), then **call this tool again** to confirm.\n"
-        )
-
-    if public_url and ".trycloudflare.com" not in public_url:
-        # FALLBACK: Headless with a persistent, pre-registered public URL.
+    token = get_valid_token(email, cmc_url)
+
+    if not token:
+        # Build a fresh login URL so the user can immediately act
+        public_url = MCP_PUBLIC_URL or f"http://localhost:{MCP_PORT}"
         redirect_uri = f"{public_url}/callback"
-        login_info = cloud_client.build_authorize_url(redirect_uri)
-        event = __import__("threading").Event()
-
-        _login_state.update({
-            "active": True,
-            "flow": "public",
-            "state": login_info["state"],
+        login_info = build_authorize_url(redirect_uri, cmc_url)
+        state = login_info["state"]
+        pending_logins[state] = {
+            "email": email,
             "code_verifier": login_info["code_verifier"],
             "redirect_uri": redirect_uri,
-            "authorize_url": login_info["authorize_url"],
-            "auth_code_holder": {"code": None, "error": None},
-            "event": event,
-            "client": cloud_client,
+            "cmc_url": cmc_url,
+            "expires_at": time.time() + 600,
+        }
+
+        return None, (
+            f"Cloud Portal session expired or not set up for **{email}**.\n\n"
+            f"Call the **`cloud_portal_connect`** tool — it will return a login URL.\n"
+            f"Or open this URL directly in your browser:\n{login_info['authorize_url']}\n\n"
+            f"After logging in, call this tool again."
+        )
+
+    return CloudPortalClient(bearer_token=token, cmc_url=cmc_url), None
+
+
+# ===========================================================================
+# MCP Server
+# ===========================================================================
+
+app = Server("incorta-upgrade-agent")
+
+
+@app.list_tools()
+async def list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="generate_upgrade_readiness_report",
+            description=(
+                "[CORE - RUN FIRST] Generate a comprehensive Upgrade Readiness Report. "
+                "Orchestrates all data sources (CMC, Cloud Portal, knowledge base, upgrade research, "
+                "Zendesk customer support tickets, and Jira bug tracking) to produce an opinionated "
+                "readiness assessment with a rating and Excel checklist data.\n\n"
+                "CREDENTIALS NOTE: All required passwords and credentials (CMC, Analytics, Cloud Portal, Internal DB) "
+                "are AUTOMATICALLY handled by the user's MCP connection headers or server environment.\n"
+                "DO NOT ask the user for any credentials or passwords. Just call the tools directly.\n\n"
+                "MANDATORY STEPS BEFORE CALLING THIS TOOL:\n"
+                "  1. ALWAYS call cloud_portal_connect first — even if you think the token is cached.\n"
+                "     This is required. Cloud Portal provides Spark version, Python version, disk sizes.\n"
+                "  2. Ask the user for customer_name — must be a real COMPANY name from Jira.\n"
+                "     Examples: 'Apple', 'Starbucks', 'Keysight', 'Toast', 'Broadcom'.\n"
+                "     REJECT person names ('Anas', 'John') or generic words ('test', 'demo').\n\n"
+                "GENERATING THE EXCEL CHECKLIST (MANDATORY AFTER REPORT):\n"
+                "  The report includes a <checklist_data> JSON block. Use it to fill the official template:\n"
+                "  1. Copy the template to Claude's sandbox:\n"
+                "     Use Filesystem:copy_file_user_to_claude with path:\n"
+                "     /Users/anasahmed/WorkProjects/Upgrade_agent_v2/Incorta-Upgrade-Assistant/templates/pre_upgrade_checklist.xlsx\n"
+                "  2. Use bash_tool to fill it with openpyxl:\n"
+                "     python3 << 'PYEOF'\n"
+                "     import json; from openpyxl import load_workbook; from openpyxl.styles import PatternFill, Alignment\n"
+                "     wb = load_workbook('/mnt/user-data/uploads/pre_upgrade_checklist.xlsx')\n"
+                "     ws = wb['Pre-Upgrade Checklist']\n"
+                "     fills = {\n"
+                "       'Done': PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid'),\n"
+                "       'PASS': PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid'),\n"
+                "       'Failed': PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid'),\n"
+                "       'FAIL': PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid'),\n"
+                "       'Review': PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid'),\n"
+                "       'WARNING': PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid'),\n"
+                "       'Pending': PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid'),\n"
+                "       'N/A': PatternFill(start_color='D9D9D9', end_color='D9D9D9', fill_type='solid'),\n"
+                "     }\n"
+                "     data = json.loads('<checklist_data_json_here>')\n"
+                "     for row, cols in data.items():\n"
+                "       b = ws.cell(row=int(row), column=2); b.value = cols.get('B', ''); b.alignment = Alignment(wrap_text=True, vertical='top')\n"
+                "       c = ws.cell(row=int(row), column=3); c.value = cols.get('C', ''); c.alignment = Alignment(horizontal='center', vertical='center')\n"
+                "       if cols.get('C') in fills: c.fill = fills[cols['C']]\n"
+                "     wb.save('/mnt/user-data/outputs/<filename>.xlsx')\n"
+                "     PYEOF\n"
+                "  3. Call present_files with /mnt/user-data/outputs/<filename>.xlsx\n"
+                "  NOTE: The template has 8 sheets — only Pre-Upgrade Checklist is modified. Column B = value, C = status.\n\n"
+                "Args:\n"
+                "  to_version: Target Incorta version (e.g. '2026.1.0'). Required.\n"
+                "  customer_name: Company name from Jira (e.g. 'Apple', 'Starbucks'). Optional but recommended.\n"
+                "     If provided, the report includes bugs specifically fixed for that customer.\n"
+                "     If omitted or unknown, pass 'Unknown' and the report runs without customer bug data.\n"
+                "     MUST be a company name, not a person name ('Anas', 'John' are invalid).\n"
+                "  cmc_cluster_name: CMC cluster name. Defaults to cmc-cluster-name header.\n"
+                "  from_version: Current version. Leave empty — auto-detected from cluster.\n"
+                "  cloud_cluster_name: Cloud Portal cluster name. Leave empty — auto-detected from Analytics URL."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["to_version"],
+                "properties": {
+                    "to_version": {"type": "string"},
+                    "customer_name": {"type": "string"},
+                    "cmc_cluster_name": {"type": "string"},
+                    "from_version": {"type": "string"},
+                    "cloud_cluster_name": {"type": "string"},
+                },
+            },
+        ),
+        types.Tool(
+            name="run_pre_upgrade_validation",
+            description=(
+                "[HEALTH CHECK] Validates Incorta cluster health before upgrade.\n"
+                "Performs comprehensive pre-upgrade health checks: service status, memory, "
+                "topology, Spark/Zookeeper/DB, connectors, tenants, email config, DB migration.\n\n"
+                "CREDENTIALS: CMC credentials are automatically injected from MCP headers. Do not ask the user.\n\n"
+                "Args:\n"
+                "  cluster_name: CMC cluster name. Defaults to cmc-cluster-name header."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "cluster_name": {"type": "string"},
+                },
+            },
+        ),
+        types.Tool(
+            name="write_checklist_excel",
+            description=(
+                "[EXCEL OUTPUT] Fills the official 8-sheet Incorta pre-upgrade checklist template\n"
+                "with the collected data and returns a direct download link for the xlsx file.\n\n"
+                "ALWAYS call this after generate_upgrade_readiness_report.\n"
+                "Pass the entire <checklist_data> JSON block from the report output.\n\n"
+                "OUTPUT: Returns JSON with:\n"
+                "  - 'download_url': A direct HTTPS link to download the filled Excel file.\n"
+                "  - 'filename': The suggested filename.\n"
+                "  - 'summary': A human-readable summary of what was filled.\n"
+                "  - 'expires_in': How long the link is valid (1 hour).\n\n"
+                "HOW TO DELIVER:\n"
+                "  1. Show the summary to the user.\n"
+                "  2. Present the download_url as a clickable markdown link:\n"
+                "     [Download Checklist](download_url)\n"
+                "  3. Tell the user the link expires in 1 hour.\n"
+                "  DO NOT attempt to decode base64 or write files yourself — the server handles everything.\n"
+                "  DO NOT build the Excel yourself with openpyxl — this tool uses the official template.\n\n"
+                "Args:\n"
+                "  cell_values_json: The <checklist_data> JSON from generate_upgrade_readiness_report.\n"
+                "  filename: Output filename. Default: 'pre_upgrade_checklist_filled.xlsx'."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["cell_values_json"],
+                "properties": {
+                    "cell_values_json": {"type": "string"},
+                    "filename": {"type": "string"},
+                },
+            },
+        ),
+        types.Tool(
+            name="cloud_portal_connect",
+            description=(
+                "[CLOUD AUTH] Connect your Cloud Portal account.\n\n"
+                "CREDENTIALS: The user's email is automatically injected from MCP headers.\n"
+                "If the cached token is expired, call this tool to give the user a browser login link.\n\n"
+                "TWO-STEP PROCESS:\n"
+                "  Step 1: Call this tool — you receive a login URL. Open it in your browser "
+                "and complete login (Google SSO or username/password).\n"
+                "  Step 2: Call this tool again — it confirms login and caches the token.\n\n"
+                "Args:\n"
+                "  force: If True, clears the existing token and forces re-authentication."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "force": {"type": "boolean"},
+                },
+            },
+        ),
+        types.Tool(
+            name="get_cloud_metadata",
+            description=(
+                "[CLOUD DATA] Get cloud metadata from Cloud Portal API.\n"
+                "Provides data NOT available in CMC: Spark/Python/MySQL versions, sizing, "
+                "feature flags, consumption, authorized users, upgrade history.\n\n"
+                "CREDENTIALS: Uses cached token from cloud_portal_connect. Do not ask for passwords.\n"
+                "IMPORTANT: Call cloud_portal_connect first. Ask the user for the Cloud Portal cluster name.\n\n"
+                "Args:\n"
+                "  cluster_name: Cloud Portal cluster name (e.g. 'habibascluster'). REQUIRED.\n"
+                "  include_consumption: Include cost data. Default: True.\n"
+                "  include_users: Include authorized users. Default: True."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["cluster_name"],
+                "properties": {
+                    "cluster_name": {"type": "string"},
+                    "include_consumption": {"type": "boolean"},
+                    "include_users": {"type": "boolean"},
+                },
+            },
+        ),
+        types.Tool(
+            name="extract_cluster_metadata_tool",
+            description=(
+                "[CLUSTER METADATA] Extract upgrade-relevant metadata from CMC cluster data.\n"
+                "Auto-detects deployment type, DB type, topology, features, infrastructure.\n\n"
+                "CREDENTIALS: CMC credentials are automatically injected from MCP headers. Do not ask the user.\n\n"
+                "Args:\n"
+                "  cluster_name: CMC cluster name. Defaults to cmc-cluster-name header.\n"
+                "  format: 'json', 'markdown', or 'both' (default)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "cluster_name": {"type": "string"},
+                    "format": {"type": "string", "enum": ["json", "markdown", "both"]},
+                },
+            },
+        ),
+        types.Tool(
+            name="test_datasource_connections",
+            description=(
+                "[CONNECTIVITY CHECK] Test all datasource connections on the Incorta Analytics instance.\n"
+                "Fetches all datasources and tests each connection, reporting success/failure.\n\n"
+                "CREDENTIALS: ALL Analytics credentials (tenant, user, password, URL) are AUTOMATICALLY injected "
+                "from MCP headers. The LLM MUST call this tool directly WITHOUT asking the user for passwords."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        types.Tool(
+            name="search_upgrade_knowledge",
+            description=(
+                "[MANUAL RESEARCH] Search Incorta documentation, community, and support articles.\n\n"
+                "CREDENTIALS: API keys are handled by the server. Call directly.\n\n"
+                "Args:\n"
+                "  query: Search query (e.g. '2024.7.0 release notes')\n"
+                "  limit: Number of results. Default: 10."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+            },
+        ),
+        types.Tool(
+            name="get_zendesk_schema_tool",
+            description=(
+                "[CUSTOMER TICKETS - SCHEMA] Get Zendesk schema to understand available fields.\n"
+                "CREDENTIALS: DB login is handled automatically. Call directly.\n"
+                "Call BEFORE querying customer tickets."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="query_upgrade_tickets",
+            description=(
+                "[CUSTOMER TICKETS - QUERY] Query Zendesk for customer-reported support tickets.\n"
+                "Schema name: ZendeskTickets\n\n"
+                "CREDENTIALS: DB login is handled automatically using internal server environment. Call directly.\n\n"
+                "Args:\n"
+                "  spark_sql: Spark SQL query against ZendeskTickets schema."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["spark_sql"],
+                "properties": {"spark_sql": {"type": "string"}},
+            },
+        ),
+        types.Tool(
+            name="get_jira_schema_tool",
+            description=(
+                "[BUG TRACKING - SCHEMA] Get Jira schema to understand available fields.\n"
+                "CREDENTIALS: DB login is handled automatically. Call directly.\n"
+                "Call BEFORE querying bugs/features."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="query_upgrade_issues",
+            description=(
+                "[BUG TRACKING - QUERY] Query Jira for engineering bugs, features, and fixes.\n"
+                "Schema name: Jira_F\n\n"
+                "CREDENTIALS: DB login is handled automatically using internal server environment. Call directly.\n\n"
+                "Args:\n"
+                "  spark_sql: Spark SQL query against Jira_F schema."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["spark_sql"],
+                "properties": {"spark_sql": {"type": "string"}},
+            },
+        ),
+    ]
+
+
+@app.call_tool()
+async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextContent]:
+    """Dispatch tool calls."""
+
+    def _text(content: str) -> list[types.TextContent]:
+        return [types.TextContent(type="text", text=content)]
+
+    def _json(obj: Any) -> list[types.TextContent]:
+        return [types.TextContent(type="text", text=json.dumps(obj, indent=2))]
+
+    # -----------------------------------------------------------------------
+    # generate_upgrade_readiness_report
+    # -----------------------------------------------------------------------
+    if name == "generate_upgrade_readiness_report":
+        to_version = arguments.get("to_version", "")
+        customer_name = arguments.get("customer_name", "")
+        if not customer_name:
+            customer_name = "Unknown"
+
+        cloud_cluster_name = arguments.get("cloud_cluster_name", "")
+        if not cloud_cluster_name:
+            cloud_cluster_name = user_context.get().get("auto_cloud_cluster_name", "")
+
+        from_version = arguments.get("from_version", "")
+        cmc_cluster_name = _get_cmc_cluster_name(arguments.get("cmc_cluster_name"))
+
+        if not cmc_cluster_name:
+            return _text(
+                "Error: CMC cluster name not available.\n"
+                "Ensure cmc-cluster-name is set in your MCP client headers"
+            )
+        if not cloud_cluster_name:
+            return _text(
+                "Error: cloud_cluster_name is required.\n"
+                "Ask the user for the Cloud Portal cluster name (e.g. 'habibascluster')."
+            )
+
+        try:
+            result = run_readiness_report(
+                cmc_cluster_name=cmc_cluster_name,
+                to_version=to_version,
+                customer_name=customer_name,
+                cloud_cluster_name=cloud_cluster_name,
+            )
+            return _text(result)
+        except Exception as e:
+            return _text(f"Error generating readiness report: {e}")
+
+    # -----------------------------------------------------------------------
+    # run_pre_upgrade_validation
+    # -----------------------------------------------------------------------
+    elif name == "run_pre_upgrade_validation":
+        cluster_name = _get_cmc_cluster_name(arguments.get("cluster_name"))
+        if not cluster_name:
+            return _text(
+                "Error: CMC cluster name not available.\n"
+                "Ensure cmc-cluster-name is set in your MCP client headers."
+            )
+        try:
+            return _text(run_validation(cluster_name))
+        except Exception as e:
+            return _text(f"Error running pre-upgrade validation: {e}")
+
+    # -----------------------------------------------------------------------
+    # write_checklist_excel
+    # -----------------------------------------------------------------------
+    elif name == "write_checklist_excel":
+        cell_values_json = arguments.get("cell_values_json", "")
+        filename = arguments.get("filename", "pre_upgrade_checklist_filled.xlsx")
+        if not filename.endswith(".xlsx"):
+            filename += ".xlsx"
+
+        if not os.path.exists(_DEFAULT_TEMPLATE_PATH):
+            return _json({"error": f"Template not found at '{_DEFAULT_TEMPLATE_PATH}'."})
+
+        try:
+            result = run_write_checklist_excel(
+                cell_values_json=cell_values_json,
+                template_path=_DEFAULT_TEMPLATE_PATH,
+                filename=filename,
+            )
+        except Exception as e:
+            return _json({"error": f"Error writing Excel: {e}"})
+
+        # Save to DOWNLOAD_DIR and return a URL — no base64 in tool result
+        token = secrets.token_hex(16) + ".xlsx"
+        dest = DOWNLOAD_DIR / token
+        try:
+            import base64 as _b64
+            dest.write_bytes(_b64.b64decode(result["base64"]))
+        except Exception as e:
+            return _json({"error": f"Error saving file to disk: {e}"})
+
+        public_base = MCP_PUBLIC_URL or f"http://localhost:{MCP_PORT}"
+        download_url = f"{public_base}/download/{token}?filename={filename}"
+
+        return _json({
+            "download_url": download_url,
+            "filename": filename,
+            "summary": result.get("summary", ""),
+            "expires_in": "1 hour",
         })
 
-        return (
-            f"## Cloud Portal Login\n\n"
-            f"**Open this URL in your browser to log in:**\n"
+    # -----------------------------------------------------------------------
+    # cloud_portal_connect
+    # -----------------------------------------------------------------------
+    elif name == "cloud_portal_connect":
+        ctx = user_context.get()
+        email = ctx.get("cloud_portal_email", "").strip()
+        cmc_url = ctx.get("cmc_url", "")
+        force = arguments.get("force", False)
+
+        if not email:
+            return _text(
+                "Error: cloud-portal-email not configured.\n"
+                "Add 'cloud-portal-email' to your MCP client config headers."
+            )
+
+        # Force re-auth — clear existing token
+        if force:
+            delete_token(email)
+            completed_logins.pop(email, None)
+
+        # Already have a valid token
+        token = get_valid_token(email, cmc_url)
+        if token:
+            try:
+                claims = pyjwt.decode(token, options={"verify_signature": False})
+                exp = claims.get("exp")
+                if exp:
+                    hours = (exp - time.time()) / 3600
+                    expiry = f"Token valid for {hours:.1f} more hours."
+                else:
+                    expiry = "Token valid."
+            except Exception:
+                expiry = "Token valid."
+            return _text(
+                f"## Cloud Portal — Already Connected\n\n"
+                f"- **Email:** {email}\n"
+                f"- {expiry}\n\n"
+                f"Cloud Portal tools are ready. "
+                f"Use `force=true` to re-authenticate."
+            )
+
+        # Check if user just completed login (callback was received)
+        _purge_expired_pending_logins()
+        if email in completed_logins:
+            result = completed_logins.pop(email)
+            if result.get("success"):
+                token_data = load_token(email)
+                exp = token_data.get("exp") if token_data else None
+                expiry = ""
+                if exp:
+                    hours = (exp - time.time()) / 3600
+                    expiry = f"\n- **Token valid for:** {hours:.1f} hours"
+                return _text(
+                    f"## Cloud Portal — Connected ✅\n\n"
+                    f"- **Email:** {email}"
+                    f"{expiry}\n\n"
+                    f"Cloud Portal tools are now ready to use."
+                )
+            else:
+                return _text(
+                    f"## Cloud Portal — Login Failed\n\n"
+                    f"{result.get('error', 'Unknown error')}\n\n"
+                    f"Call this tool again to get a new login URL."
+                )
+
+        # Start a new OAuth flow
+        public_url = MCP_PUBLIC_URL or f"http://localhost:{MCP_PORT}"
+        redirect_uri = f"{public_url}/callback"
+        login_info = build_authorize_url(redirect_uri, cmc_url)
+        state = login_info["state"]
+
+        pending_logins[state] = {
+            "email": email,
+            "code_verifier": login_info["code_verifier"],
+            "redirect_uri": redirect_uri,
+            "cmc_url": cmc_url,
+            "expires_at": time.time() + 600,
+        }
+
+        return _text(
+            f"## Cloud Portal Connect\n\n"
+            f"**Open this URL in your browser to connect `{email}`:**\n\n"
             f"{login_info['authorize_url']}\n\n"
+            f"Log in with your Incorta account (Google SSO or email/password).\n"
             f"After completing login, **call this tool again** to confirm."
         )
 
-    # No browser available and no valid public URL — cannot authenticate.
-    return (
-        "## Login Not Available in Headless Mode\n\n"
-        "Cloud Portal authentication requires a browser (OAuth/PKCE) and cannot run "
-        "in a headless or Docker environment without a public URL.\n\n"
-        "**To authenticate:**\n"
-        "1. Run the MCP server locally (without `HEADLESS=true` and outside Docker)\n"
-        "2. Call `cloud_portal_login` — a browser window opens automatically at `localhost:8910`\n"
-        "3. Complete login once — the token is cached and auto-refreshes across restarts\n\n"
-        "**Alternatively:** Set `MCP_PUBLIC_URL` to a *persistent* public URL that is "
-        "registered as a callback in Auth0 (quick-tunnel URLs like Cloudflare change "
-        "each session and are not registered)."
-    )
+    # -----------------------------------------------------------------------
+    # get_cloud_metadata
+    # -----------------------------------------------------------------------
+    elif name == "get_cloud_metadata":
+        cluster_name = arguments.get("cluster_name", "")
+        include_consumption = arguments.get("include_consumption", True)
+        include_users = arguments.get("include_users", True)
+        ctx = user_context.get()
+        cmc_url = ctx.get("cmc_url", "")
 
+        if not cluster_name:
+            return _text(
+                "Error: cluster_name is required.\n"
+                "Ask the user for the Cloud Portal cluster name (e.g. 'habibascluster')."
+            )
 
-@app.tool()
-def cmc_login() -> str:
-    """
-    [CMC AUTH] Authenticate with CMC via a browser-based login portal.
+        client, error = _get_cloud_portal_client()
+        if error:
+            return _text(error)
 
-    TWO-STEP PROCESS:
-      Step 1: Call this tool — you receive a URL for the login portal.
-              Ask the user to open it in their browser, fill in the form, and submit.
-      Step 2: Call this tool again — it detects the cached token and confirms authentication.
-
-    The login portal collects: CMC URL, username, password, and cluster name.
-    After successful login, the JWT and config are cached at ~/.incorta_cmc_token.json.
-    Subsequent CMC tool calls (extract_cluster_metadata, run_pre_upgrade_validation, etc.)
-    will use the cached token automatically — no .env variables needed.
-
-    The cached token auto-expires (checked on each use). When it expires,
-    call this tool again to re-open the login portal.
-    """
-    global _cmc_login_success
-    from clients.cmc_client import CMCClient
-
-    # Check if already authenticated (cached token on disk)
-    cached = CMCClient.load_cached_config()
-    if cached.get("access_token"):
-        user = cached.get("user", "unknown")
-        url = cached.get("url", "unknown")
-        cluster = cached.get("cluster_name", "unknown")
-
-        # Decode JWT for expiry info
-        expiry_info = ""
         try:
-            import jwt as pyjwt
-            claims = pyjwt.decode(cached["access_token"], options={"verify_signature": False})
-            exp = claims.get("exp")
-            if exp:
-                remaining = (exp - time.time()) / 3600
-                expiry_info = f"- **Expires in:** {remaining:.1f} hours\n"
-        except Exception:
-            pass
-
-        _cmc_login_success = False  # Reset for next round
-        return (
-            f"## CMC Authenticated\n\n"
-            f"- **User:** `{user}`\n"
-            f"- **CMC URL:** `{url}`\n"
-            f"- **Cluster Name:** `{cluster}`\n"
-            f"- **Token cached at:** `~/.incorta_cmc_token.json`\n"
-            f"{expiry_info}\n"
-            f"CMC tools are ready to use."
-        )
-
-    # Check if the portal form was just submitted successfully
-    if _cmc_login_success:
-        _cmc_login_success = False
-        # Re-check cache (should be populated now)
-        cached = CMCClient.load_cached_config()
-        if cached.get("access_token"):
-            user = cached.get("user", "unknown")
-            url = cached.get("url", "unknown")
-            cluster = cached.get("cluster_name", "unknown")
-            return (
-                f"## CMC Login Successful\n\n"
-                f"- **User:** `{user}`\n"
-                f"- **CMC URL:** `{url}`\n"
-                f"- **Cluster Name:** `{cluster}`\n"
-                f"- **Token cached at:** `~/.incorta_cmc_token.json`\n\n"
-                f"CMC tools are now ready to use."
+            our_cluster = client.search_instances(cluster_name, cmc_url)
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            body = e.response.text[:300] if e.response is not None else ""
+            if status == 401:
+                # 401 from the cp- API usually means wrong audience in the JWT,
+                # NOT that the token is expired. Surface the raw error so we can debug.
+                return _text(
+                    f"Error: Cloud Admin API returned 401.\n\n"
+                    f"This usually means the Auth0 audience in the token does not match "
+                    f"what cp-cloudstaging.incortalabs.com expects.\n\n"
+                    f"Current audience: {client._headers().get('Authorization', '')[:40]}...\n"
+                    f"API response: {body}\n\n"
+                    f"Ask the cloud team: what is the correct Auth0 audience for "
+                    f"client_id=0jXCrcpFe6PDm6sIMxDi7hunFCWeRLpt?"
+                )
+            if status == 403:
+                return _text(
+                    f"Error: Cloud Admin API returned 403 — token accepted but insufficient permissions.\n"
+                    f"API response: {body}"
+                )
+            return _text(
+                f"Error fetching cluster from Cloud Portal (HTTP {status}): {e}"
             )
-
-    # No cached token — direct user to the login portal
-    port = int(os.getenv("MCP_PORT", "8000"))
-    host = os.getenv("MCP_HOST", "127.0.0.1")
-    portal_url = f"http://{host}:{port}/cmc-login"
-
-    return (
-        f"## CMC Login Required\n\n"
-        f"**Open this URL in your browser to log in:**\n"
-        f"{portal_url}\n\n"
-        f"Fill in the form with your CMC URL, username, password, and cluster name, "
-        f"then click **Login**.\n\n"
-        f"After successful login, **call this tool again** to confirm authentication."
-    )
-
-
-@app.tool()
-def get_cloud_metadata(
-    cluster_name: str | None = None,
-    include_consumption: bool = True,
-    include_users: bool = True
-) -> str:
-    """
-    [CLOUD DATA] Get cloud metadata from Cloud Portal API.
-    Provides data NOT available in CMC API. Call AFTER extract_cluster_metadata.
-
-    IMPORTANT: You MUST ask the user for the cluster name. Do NOT infer or guess it.
-    The cluster name is the Cloud Portal instance name (e.g., 'habibascluster').
-
-    NOTE: Cloud Portal and CMC use different cluster names for the same cluster.
-    - CMC name (e.g., 'customCluster') is used by extract_cluster_metadata_tool
-    - Cloud Portal name (e.g., 'habibascluster') is used by this tool
-
-    DATA AVAILABLE:
-    - Instance details, build info, platform, service statuses
-    - Software versions (Spark, Python, MySQL)
-    - Sizing (analytics, loader, CMC memory/CPU/IPU)
-    - Feature flags, feature bits
-    - Consumption & cost data
-    - Authorized users
-    - Upgrade history
-
-    Args:
-        cluster_name: Cloud Portal cluster name. REQUIRED — ask the user for this value.
-        include_consumption: Include consumption/cost data (default: True)
-        include_users: Include authorized users (default: True)
-    """
-    if not cluster_name:
-        return (
-            "Error: cluster_name is required.\n"
-            "Please ask the user for the Cloud Portal cluster name "
-            "(e.g., 'habibascluster') and make sure the cluster is running."
-        )
-
-    cloud_client = CloudPortalClient()
-
-    # Use the cp- search endpoint (no user_id needed, richer response)
-    try:
-        our_cluster = cloud_client.search_instances(cluster_name)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code in (401, 403):
-            return (
-                "Error: Not authenticated with Cloud Portal.\n"
-                "Please call the **cloud_portal_login** tool first to log in.\n"
-                "After logging in, retry this tool."
-            )
-        return f"Error: Failed to search instances from Cloud Portal: {str(e)}"
-    except RuntimeError as e:
-        error_msg = str(e)
-        if "AUTHENTICATION_REQUIRED" in error_msg:
-            return (
-                "Error: Not authenticated with Cloud Portal.\n"
-                "Please call the **cloud_portal_login** tool first to log in.\n"
-                "After logging in, retry this tool."
-            )
-        return f"Error: {error_msg}"
-
-    if not our_cluster:
-        return f"Error: Cluster '{cluster_name}' not found in Cloud Portal."
-
-    instance_uuid = our_cluster.get("id")
-    cluster_status = our_cluster.get("status", "unknown")
-
-    # --- Build report ---
-    report_lines = [
-        f"# Cloud Portal Metadata: {cluster_name}",
-        "",
-    ]
-
-    # Warning if cluster is not running
-    if cluster_status != "running":
-        report_lines.extend([
-            f"> **WARNING:** Cluster status is **{cluster_status}** (not running).",
-            "> Some data may be stale. Please ensure the cluster is running for accurate results.",
-            "",
-        ])
-
-    report_lines.extend([
-        "## Instance Details",
-        f"- **UUID:** `{instance_uuid}`",
-        f"- **Build:** {our_cluster.get('customBuild') or 'Vanilla'} ({our_cluster.get('customBuildName') or our_cluster.get('image')})",
-        f"- **Image:** {our_cluster.get('image')}",
-        f"- **Platform:** {our_cluster.get('platform')} - {our_cluster.get('region')}/{our_cluster.get('zone')}",
-        f"- **K8s Cluster:** {our_cluster.get('k8sClusterCode')}",
-        f"- **Status:** {cluster_status}",
-        f"- **Premium:** {'Yes' if our_cluster.get('isPremium') else 'No'}",
-        f"- **Organization:** {our_cluster.get('organization')}",
-        "",
-    ])
-
-    # Service statuses from instanceServices
-    services = our_cluster.get("instanceServices", [])
-    if services:
-        svc = services[0]
-        report_lines.extend([
-            "## Service Status",
-            f"- **CMC:** {svc.get('cmc_status', 'N/A')}",
-            f"- **Analytics:** {svc.get('analytics_status', 'N/A')}",
-            f"- **Loader:** {svc.get('loader_status', 'N/A')}",
-            f"- **Spark:** {svc.get('spark_status', 'N/A')}",
-            f"- **Zookeeper:** {svc.get('zookeeper_status', 'N/A')}",
-            "",
-        ])
-
-    report_lines.extend([
-        "## Software Versions",
-        f"- **Spark:** {our_cluster.get('incortaSparkVersion')}",
-        f"- **Python:** {our_cluster.get('pythonVersion') or 'N/A'}",
-        f"- **MySQL:** {our_cluster.get('mysqlVersion') or 'N/A'}",
-        "",
-    ])
-
-    # Sizing details from nested objects
-    def _format_size(size_obj, label):
-        if not size_obj or not isinstance(size_obj, dict):
-            return [f"- **{label}:** N/A"]
-        return [
-            f"- **{label}:** {size_obj.get('displayName', 'N/A')} "
-            f"(Memory: {size_obj.get('memoryRequest', '?')}-{size_obj.get('memoryLimit', '?')} GB, "
-            f"CPU: {size_obj.get('cpu', 'N/A')} vCPU, "
-            f"IPU: {size_obj.get('ipu', 'N/A')})",
-        ]
-
-    report_lines.append("## Cluster Sizing")
-    report_lines.extend(_format_size(our_cluster.get("analyticsSize"), "Analytics"))
-    report_lines.extend(_format_size(our_cluster.get("loaderSize"), "Loader"))
-    report_lines.extend(_format_size(our_cluster.get("cmcSize"), "CMC"))
-    report_lines.extend([
-        f"- **Analytics Nodes:** {our_cluster.get('analyticsNodes', 'N/A')}",
-        f"- **Loader Nodes:** {our_cluster.get('loaderNodes', 'N/A')}",
-        f"- **ZK Replicas:** {our_cluster.get('zkReplicas', 'N/A')}",
-        "",
-    ])
-
-    # Consumption (still uses the separate endpoint — needs user_id)
-    if include_consumption:
-        try:
-            user_id = cloud_client.get_user_id()
-            consumption = cloud_client.get_consumption(user_id, instance_uuid)
-            consumption_agg = consumption.get('consumptionAgg', {})
-            total_pu = consumption_agg.get('totalAgg', 0)
-            daily_data = consumption_agg.get('total', {}).get('daily', [])
-
-            report_lines.append("## Consumption & Cost")
-
-            if daily_data:
-                avg_pu = sum(d.get('powerUnit', 0) for d in daily_data) / len(daily_data)
-                recent_7 = daily_data[-7:] if len(daily_data) >= 7 else daily_data
-
-                report_lines.extend([
-                    f"- **Total (This Month):** {total_pu:.6f} Power Units",
-                    f"- **Daily Average:** {avg_pu:.6f} PU/day",
-                    f"- **Estimated Downtime Cost (4h):** {(avg_pu / 24 * 4):.6f} PU",
-                    "",
-                    "**Recent Trend (Last 7 Days):**",
-                ])
-
-                for day in recent_7:
-                    date = day.get('startTime', 'Unknown')
-                    pu = day.get('powerUnit', 0)
-                    report_lines.append(f"  - {date}: {pu:.6f} PU")
-            elif total_pu:
-                report_lines.extend([
-                    f"- **Total (This Month):** {total_pu:.6f} Power Units",
-                    "- *Daily breakdown not available*",
-                ])
-            else:
-                report_lines.append("- No consumption data available for this period.")
-
-            report_lines.append("")
-
         except Exception as e:
-            report_lines.extend([
-                "## Consumption & Cost",
-                f"Could not fetch consumption data: {str(e)}",
-                ""
-            ])
+            return _text(f"Error: {e}")
 
-    # Authorized users (still uses the separate endpoint — needs user_id)
-    if include_users:
-        try:
-            user_id = cloud_client.get_user_id()
-            users_data = cloud_client.get_authorized_users(user_id, cluster_name)
-            users_list = users_data.get('authorizedUserRoles', [])
+        if not our_cluster:
+            return _text(f"Error: Cluster '{cluster_name}' not found in Cloud Portal.")
 
-            report_lines.extend([
-                f"## Authorized Users ({len(users_list)} total)",
-                ""
-            ])
+        instance_uuid = our_cluster.get("id")
+        cluster_status = our_cluster.get("status", "unknown")
 
-            for user_item in users_list:
-                user = user_item.get('user', {})
-                role = user_item.get('authorizedRoles', [{}])[0].get('role', 'unknown')
-                status = user_item.get('status', 'unknown')
-                email = user.get('email')
-                last_login = user.get('lastLoginAt', 'Never')
+        report_lines = [f"# Cloud Portal Metadata: {cluster_name}", ""]
 
-                report_lines.append(
-                    f"- **{email}** ({role.capitalize()}) - Status: {status} - Last login: {last_login}"
+        if cluster_status != "running":
+            report_lines.extend(
+                [
+                    f"> **WARNING:** Cluster status is **{cluster_status}** (not running).",
+                    "> Some data may be stale.",
+                    "",
+                ]
+            )
+
+        report_lines.extend(
+            [
+                "## Instance Details",
+                f"- **UUID:** `{instance_uuid}`",
+                f"- **Build:** {our_cluster.get('customBuild') or 'Vanilla'} ({our_cluster.get('customBuildName') or our_cluster.get('image')})",
+                f"- **Image:** {our_cluster.get('image')}",
+                f"- **Platform:** {our_cluster.get('platform')} - {our_cluster.get('region')}/{our_cluster.get('zone')}",
+                f"- **K8s Cluster:** {our_cluster.get('k8sClusterCode')}",
+                f"- **Status:** {cluster_status}",
+                f"- **Premium:** {'Yes' if our_cluster.get('isPremium') else 'No'}",
+                f"- **Organization:** {our_cluster.get('organization')}",
+                "",
+            ]
+        )
+
+        services = our_cluster.get("instanceServices", [])
+        if services:
+            svc = services[0]
+            report_lines.extend(
+                [
+                    "## Service Status",
+                    f"- **CMC:** {svc.get('cmc_status', 'N/A')}",
+                    f"- **Analytics:** {svc.get('analytics_status', 'N/A')}",
+                    f"- **Loader:** {svc.get('loader_status', 'N/A')}",
+                    f"- **Spark:** {svc.get('spark_status', 'N/A')}",
+                    f"- **Zookeeper:** {svc.get('zookeeper_status', 'N/A')}",
+                    "",
+                ]
+            )
+
+        report_lines.extend(
+            [
+                "## Software Versions",
+                f"- **Spark:** {our_cluster.get('incortaSparkVersion')}",
+                f"- **Python:** {our_cluster.get('pythonVersion') or 'N/A'}",
+                f"- **MySQL:** {our_cluster.get('mysqlVersion') or 'N/A'}",
+                "",
+            ]
+        )
+
+        def _format_size(size_obj, label):
+            if not size_obj or not isinstance(size_obj, dict):
+                return [f"- **{label}:** N/A"]
+            return [
+                f"- **{label}:** {size_obj.get('displayName', 'N/A')} "
+                f"(Memory: {size_obj.get('memoryRequest', '?')}-{size_obj.get('memoryLimit', '?')} GB, "
+                f"CPU: {size_obj.get('cpu', 'N/A')} vCPU, "
+                f"IPU: {size_obj.get('ipu', 'N/A')})",
+            ]
+
+        report_lines.append("## Cluster Sizing")
+        report_lines.extend(_format_size(our_cluster.get("analyticsSize"), "Analytics"))
+        report_lines.extend(_format_size(our_cluster.get("loaderSize"), "Loader"))
+        report_lines.extend(_format_size(our_cluster.get("cmcSize"), "CMC"))
+        report_lines.extend(
+            [
+                f"- **Analytics Nodes:** {our_cluster.get('analyticsNodes', 'N/A')}",
+                f"- **Loader Nodes:** {our_cluster.get('loaderNodes', 'N/A')}",
+                f"- **ZK Replicas:** {our_cluster.get('zkReplicas', 'N/A')}",
+                "",
+            ]
+        )
+
+        if include_consumption:
+            try:
+                user_id = client.get_user_id()
+                consumption = client.get_consumption(user_id, instance_uuid)
+                consumption_agg = consumption.get("consumptionAgg", {})
+                total_pu = consumption_agg.get("totalAgg", 0)
+                daily_data = consumption_agg.get("total", {}).get("daily", [])
+
+                report_lines.append("## Consumption & Cost")
+                if daily_data:
+                    avg_pu = sum(d.get("powerUnit", 0) for d in daily_data) / len(
+                        daily_data
+                    )
+                    recent_7 = daily_data[-7:] if len(daily_data) >= 7 else daily_data
+                    report_lines.extend(
+                        [
+                            f"- **Total (This Month):** {total_pu:.6f} Power Units",
+                            f"- **Daily Average:** {avg_pu:.6f} PU/day",
+                            f"- **Estimated Downtime Cost (4h):** {(avg_pu / 24 * 4):.6f} PU",
+                            "",
+                            "**Recent Trend (Last 7 Days):**",
+                        ]
+                    )
+                    for day in recent_7:
+                        report_lines.append(
+                            f"  - {day.get('startTime', 'Unknown')}: {day.get('powerUnit', 0):.6f} PU"
+                        )
+                elif total_pu:
+                    report_lines.append(
+                        f"- **Total (This Month):** {total_pu:.6f} Power Units"
+                    )
+                else:
+                    report_lines.append("- No consumption data available.")
+                report_lines.append("")
+            except Exception as e:
+                report_lines.extend(
+                    ["## Consumption & Cost", f"Could not fetch: {e}", ""]
                 )
 
-            report_lines.append("")
-
-        except Exception as e:
-            report_lines.extend([
-                "## Authorized Users",
-                f"Could not fetch user data: {str(e)}",
-                ""
-            ])
-
-    report_lines.extend([
-        "## Feature Flags",
-        f"- **SQLi:** {'Enabled' if our_cluster.get('sqliEnabled') else 'Disabled'}",
-        f"- **Incorta X:** {'Enabled' if our_cluster.get('incortaXEnabled') else 'Disabled'}",
-        f"- **Data Agent:** {'Enabled' if our_cluster.get('enableDataAgent') else 'Disabled'}",
-        f"- **Chat/OpenAI:** {'Enabled' if our_cluster.get('enableChat') else 'Disabled'}",
-        f"- **OpenAI:** {'Enabled' if our_cluster.get('enableOpenAI') else 'Disabled'}",
-        f"- **MLflow:** {'Enabled' if our_cluster.get('mlflowEnabled') else 'Disabled'}",
-        f"- **Data Studio:** {'Enabled' if our_cluster.get('enableDataStudio') else 'Disabled'}",
-        f"- **On-Demand Loader:** {'Enabled' if (our_cluster.get('onDemandLoader') or {}).get('enabled') else 'Disabled'}",
-        "",
-    ])
-
-    # Feature bits
-    feature_bits = our_cluster.get("featureBits", [])
-    if feature_bits:
-        report_lines.append("## Feature Bits")
-        for fb in feature_bits:
-            fb_details = fb.get("featureBits", {})
-            report_lines.append(
-                f"- **{fb_details.get('name', 'Unknown')}** (`{fb_details.get('key', '')}`) — "
-                f"{'Enabled' if fb_details.get('enabled') else 'Disabled'}"
-            )
-        report_lines.append("")
-
-    report_lines.extend([
-        "## Spark Configuration",
-        f"- **Min Executors:** {our_cluster.get('minExecutors', 'N/A')}",
-        f"- **Max Executors:** {our_cluster.get('maxExecutors', 'N/A')}",
-        f"- **Spark Memory:** {our_cluster.get('sparkMem', 'N/A')} MB",
-        f"- **Spark CPU:** {our_cluster.get('sparkCpu', 'N/A')} millicores",
-        "",
-        "## Storage",
-        f"- **Analytics Pod (dsize):** {our_cluster.get('dsize')} GB (allocated)",
-        f"- **Loader Pod (dsizeLoader):** {our_cluster.get('dsizeLoader')} GB (allocated)",
-        f"- **CMC Pod (dsizeCmc):** {our_cluster.get('dsizeCmc')} GB (allocated)",
-        "- _Per-pod utilization not available (API limited)_",
-        f"- **Available Disk:** {our_cluster.get('availableDisk')} GB",
-        f"- **Tenant Folder Size (consumedData):** {our_cluster.get('consumedData')} GB",
-        "",
-        "## Cluster Configuration",
-        f"- **Timezone:** {our_cluster.get('timezone', 'N/A')}",
-        f"- **Auto-Suspend:** {'Enabled' if our_cluster.get('sleeppable') else 'Disabled'}",
-        f"- **Idle Time:** {our_cluster.get('idleTime', 'N/A')} hours",
-        "",
-        "## Upgrade History",
-        f"- **Last Upgrade:** {our_cluster.get('initiatedUpgradeAt') or 'Never'}",
-        f"- **Created:** {our_cluster.get('createdAt')}",
-        f"- **Last Updated:** {our_cluster.get('updatedAt')}",
-        f"- **Last Running:** {our_cluster.get('runningAt')}",
-    ])
-
-    return "\n".join(report_lines)
-
-
-
-@app.tool()
-def extract_cluster_metadata_tool(
-    cluster_name: str | None = None,
-    format: Literal["json", "markdown", "both"] = "both"
-) -> str:
-    """
-    [CLUSTER METADATA] Automatically extracts upgrade-relevant metadata from cluster data.
-    Eliminates need to ask user questions - infers everything from CMC cluster JSON!
-
-    CLUSTER NAMING: This tool uses the CMC API and requires the CMC cluster name.
-    Example: If CMC shows 'customCluster', use that name (NOT the Cloud Portal name like 'habibascluster').
-
-    AUTO-DETECTS (No User Input Needed):
-    - Deployment Type: Cloud (GCP/AWS/Azure) vs On-Premises (from storage path)
-    - Database Type: MySQL/Oracle/PostgreSQL + migration requirements
-    - Topology: Typical (1 node) vs Clustered/Custom (2+ nodes), HA status
-    - Features: Notebook, Spark, SQLi, Kyuubi enabled/disabled status
-    - Infrastructure: Spark mode (K8s/External/Embedded), Zookeeper (External/Embedded)
-    - Service Status: All service states (Analytics, Loader, Notebook, SQLi)
-    - Connectors: List of enabled connectors
-    - Risk Assessment: AUTO-CLASSIFY as HIGH/MEDIUM/LOW risk based on blockers
-
-    Args:
-        cluster_name: CMC cluster name. Defaults to CMC_CLUSTER_NAME env var.
-        format: Output format - 'json', 'markdown', or 'both' (default).
-    """
-    cluster_name = _get_cmc_cluster_name(cluster_name)
-    if not cluster_name:
-        return (
-            "Error: CMC cluster name not available.\n"
-            "Please call the **cmc_login** tool first to authenticate via the login portal, "
-            "or provide the cluster_name parameter."
-        )
-    from clients.cmc_client import CMCClient
-    client = CMCClient()
-    try:
-        cluster_data = client.get_cluster(cluster_name)
-    except (RuntimeError, requests.exceptions.RequestException) as e:
-        return f"Error: Failed to fetch cluster data from CMC: {e}"
-
-    try:
-        metadata = extract_cluster_metadata(cluster_data)
-    except Exception as e:
-        return f"Error: Failed to extract metadata: {e}"
-
-    if format == "json":
-        return json.dumps(metadata, indent=2)
-    elif format == "markdown":
-        return format_metadata_report(metadata)
-    else:  # "both" is default
-        markdown_report = format_metadata_report(metadata)
-        json_data = json.dumps(metadata, indent=2)
-        return f"{markdown_report}\n\n---\n\n## Raw Metadata (JSON)\n\n```json\n{json_data}\n```"
-
-
-@app.tool()
-def test_datasource_connections() -> str:
-    """
-    [CONNECTIVITY CHECK] Test all datasource connections on the Incorta Analytics instance.
-
-    TWO-STEP PROCESS:
-      Step 1: Call this tool — you receive a URL for the login portal.
-              Ask the user to open it in their browser and fill in the combined
-              CMC + Incorta Analytics credentials form.
-      Step 2: Call this tool again — it tests all datasource connections and returns results.
-
-    The login portal collects:
-      - CMC: URL, username, password, cluster name
-      - Analytics: tenant, username, password
-
-    After login, the tool fetches all datasources and tests each connection,
-    reporting which succeeded and which failed.
-    Datasources that don't support test queries (e.g., LocalFiles) are skipped.
-    """
-    global _test_conn_login_success, _incorta_session_cache
-
-    # Check if we have a cached Incorta Analytics session
-    if _incorta_session_cache.get("authorization"):
-        try:
-            result = test_all_connections(_incorta_session_cache)
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            return json.dumps({"error": f"Failed to test connections: {str(e)}"})
-
-    # Check if the portal was just submitted successfully
-    if _test_conn_login_success:
-        _test_conn_login_success = False
-        if _incorta_session_cache.get("authorization"):
+        if include_users:
             try:
-                result = test_all_connections(_incorta_session_cache)
-                return json.dumps(result, indent=2)
+                user_id = client.get_user_id()
+                users_data = client.get_authorized_users(user_id, cluster_name)
+                users_list = users_data.get("authorizedUserRoles", [])
+                report_lines.extend(
+                    [f"## Authorized Users ({len(users_list)} total)", ""]
+                )
+                for user_item in users_list:
+                    u = user_item.get("user", {})
+                    role = user_item.get("authorizedRoles", [{}])[0].get(
+                        "role", "unknown"
+                    )
+                    status = user_item.get("status", "unknown")
+                    report_lines.append(
+                        f"- **{u.get('email')}** ({role.capitalize()}) - {status} - Last: {u.get('lastLoginAt', 'Never')}"
+                    )
+                report_lines.append("")
             except Exception as e:
-                return json.dumps({"error": f"Failed to test connections: {str(e)}"})
+                report_lines.extend(
+                    ["## Authorized Users", f"Could not fetch: {e}", ""]
+                )
 
-    # No session — direct user to the login portal
-    port = int(os.getenv("MCP_PORT", "8000"))
-    host = os.getenv("MCP_HOST", "127.0.0.1")
-    portal_url = f"http://{host}:{port}/test-connection-login"
+        report_lines.extend(
+            [
+                "## Feature Flags",
+                f"- **SQLi:** {'Enabled' if our_cluster.get('sqliEnabled') else 'Disabled'}",
+                f"- **Incorta X:** {'Enabled' if our_cluster.get('incortaXEnabled') else 'Disabled'}",
+                f"- **Data Agent:** {'Enabled' if our_cluster.get('enableDataAgent') else 'Disabled'}",
+                f"- **Chat/OpenAI:** {'Enabled' if our_cluster.get('enableChat') else 'Disabled'}",
+                f"- **MLflow:** {'Enabled' if our_cluster.get('mlflowEnabled') else 'Disabled'}",
+                f"- **Data Studio:** {'Enabled' if our_cluster.get('enableDataStudio') else 'Disabled'}",
+                "",
+                "## Spark Configuration",
+                f"- **Min Executors:** {our_cluster.get('minExecutors', 'N/A')}",
+                f"- **Max Executors:** {our_cluster.get('maxExecutors', 'N/A')}",
+                f"- **Spark Memory:** {our_cluster.get('sparkMem', 'N/A')} MB",
+                f"- **Spark CPU:** {our_cluster.get('sparkCpu', 'N/A')} millicores",
+                "",
+                "## Storage",
+                f"- **Analytics Pod (dsize):** {our_cluster.get('dsize')} GB (allocated)",
+                f"- **Loader Pod (dsizeLoader):** {our_cluster.get('dsizeLoader')} GB (allocated)",
+                f"- **CMC Pod (dsizeCmc):** {our_cluster.get('dsizeCmc')} GB (allocated)",
+                "- _Per-pod utilization not available (API limited)_",
+                f"- **Available Disk:** {our_cluster.get('availableDisk')} GB",
+                f"- **Tenant Folder Size (consumedData):** {our_cluster.get('consumedData')} GB",
+                "",
+                "## Cluster Configuration",
+                f"- **Timezone:** {our_cluster.get('timezone', 'N/A')}",
+                f"- **Auto-Suspend:** {'Enabled' if our_cluster.get('sleeppable') else 'Disabled'}",
+                f"- **Idle Time:** {our_cluster.get('idleTime', 'N/A')} hours",
+                "",
+                "## Upgrade History",
+                f"- **Last Upgrade:** {our_cluster.get('initiatedUpgradeAt') or 'Never'}",
+                f"- **Created:** {our_cluster.get('createdAt')}",
+                f"- **Last Updated:** {our_cluster.get('updatedAt')}",
+            ]
+        )
 
-    return (
-        "## Test Connection Login Required\n\n"
-        "**Open this URL in your browser to log in:**\n"
-        f"{portal_url}\n\n"
-        "Fill in your **CMC credentials** (URL, username, password, cluster name) "
-        "and **Incorta Analytics credentials** (tenant, username, password), "
-        "then click **Login & Test Connections**.\n\n"
-        "After successful login, **call this tool again** to run the datasource connection tests."
+        return _text("\n".join(report_lines))
+
+    # -----------------------------------------------------------------------
+    # extract_cluster_metadata_tool
+    # -----------------------------------------------------------------------
+    elif name == "extract_cluster_metadata_tool":
+        cluster_name = _get_cmc_cluster_name(arguments.get("cluster_name"))
+        fmt = arguments.get("format", "both")
+
+        if not cluster_name:
+            return _text(
+                "Error: CMC cluster name not available.\n"
+                "Ensure cmc-cluster-name is set in your MCP client headers."
+            )
+
+        try:
+            client = _get_cmc_client()
+            cluster_data = client.get_cluster(cluster_name)
+        except (RuntimeError, requests.exceptions.RequestException) as e:
+            return _text(f"Error: Failed to fetch cluster data from CMC: {e}")
+
+        try:
+            metadata = extract_cluster_metadata(cluster_data)
+        except Exception as e:
+            return _text(f"Error: Failed to extract metadata: {e}")
+
+        if fmt == "json":
+            return _json(metadata)
+        elif fmt == "markdown":
+            return _text(format_metadata_report(metadata))
+        else:
+            md = format_metadata_report(metadata)
+            js = json.dumps(metadata, indent=2)
+            return _text(f"{md}\n\n---\n\n## Raw Metadata (JSON)\n\n```json\n{js}\n```")
+
+    # -----------------------------------------------------------------------
+    # test_datasource_connections
+    # -----------------------------------------------------------------------
+    elif name == "test_datasource_connections":
+        ctx = user_context.get()
+        cmc_url = ctx.get("cmc_url", "")
+        tenant = ctx.get("incorta_tenant", "")
+        username = ctx.get("incorta_username", "")
+        password = ctx.get("incorta_password", "")
+
+        if not cmc_url:
+            return _text(
+                "Error: cmc-url not configured.\n"
+                "Ensure cmc-url is set in your MCP client headers."
+            )
+        missing = []
+        if not tenant:
+            missing.append("incorta-tenant")
+        if not username:
+            missing.append("incorta-username")
+        if not password:
+            missing.append("incorta-password")
+        if missing:
+            return _text(
+                f"Error: Analytics credentials not configured: {', '.join(missing)}.\n"
+                f"Add these headers to your MCP client config."
+            )
+
+        incorta_url = derive_incorta_url_from_cmc(cmc_url)
+
+        try:
+            session = login_to_incorta_analytics(
+                incorta_url, tenant, username, password
+            )
+        except RuntimeError as e:
+            return _text(f"Error: Analytics login failed: {e}")
+
+        try:
+            result = test_all_connections(session)
+            return _json(result)
+        except Exception as e:
+            return _json({"error": f"Failed to test connections: {e}"})
+
+    # -----------------------------------------------------------------------
+    # search_upgrade_knowledge
+    # -----------------------------------------------------------------------
+    elif name == "search_upgrade_knowledge":
+        query = arguments.get("query", "")
+        limit = arguments.get("limit", 10)
+        result = search_knowledge_base({"query": query, "limit": limit})
+        return _json(result)
+
+    # -----------------------------------------------------------------------
+    # get_zendesk_schema_tool
+    # -----------------------------------------------------------------------
+    elif name == "get_zendesk_schema_tool":
+        result = get_zendesk_schema({"fetch_schema": True})
+        return _json(result)
+
+    # -----------------------------------------------------------------------
+    # query_upgrade_tickets
+    # -----------------------------------------------------------------------
+    elif name == "query_upgrade_tickets":
+        spark_sql = arguments.get("spark_sql", "")
+        result = query_zendesk({"spark_sql": spark_sql})
+        return _json(result)
+
+    # -----------------------------------------------------------------------
+    # get_jira_schema_tool
+    # -----------------------------------------------------------------------
+    elif name == "get_jira_schema_tool":
+        result = get_jira_schema({"fetch_schema": True})
+        return _json(result)
+
+    # -----------------------------------------------------------------------
+    # query_upgrade_issues
+    # -----------------------------------------------------------------------
+    elif name == "query_upgrade_issues":
+        spark_sql = arguments.get("spark_sql", "")
+        result = query_jira({"spark_sql": spark_sql})
+        return _json(result)
+
+    else:
+        return _text(f"Unknown tool: {name}")
+
+
+# ===========================================================================
+# HTTP Routes
+# ===========================================================================
+
+
+async def serve_download(request: Request) -> Response:
+    """Serve a generated Excel file by token. Files auto-expire after DOWNLOAD_TTL seconds."""
+    token = request.path_params.get("token", "")
+    if not token or "/" in token or ".." in token:
+        return Response("Not found", status_code=404)
+
+    # Opportunistic cleanup of expired files
+    now = time.time()
+    for f in DOWNLOAD_DIR.glob("*.xlsx"):
+        try:
+            if now - f.stat().st_mtime > DOWNLOAD_TTL:
+                f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    file_path = DOWNLOAD_DIR / token
+    if not file_path.exists() or not file_path.is_file():
+        return Response("File not found or expired (files expire after 1 hour)", status_code=404)
+
+    filename = request.query_params.get("filename", token)
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 
-@app.tool()
-def search_upgrade_knowledge(query: str, limit: int = 10) -> str:
+async def debug_token(request: Request) -> HTMLResponse:
     """
-    [MANUAL RESEARCH] Search Incorta documentation, community, and support articles.
-    Primary tool for building customer-specific upgrade recommendations.
-
-    REQUIRED SEARCHES FOR CUSTOMER UPGRADES:
-    1. START: 'Incorta Release Support Policy' - Get ALL versions with release dates
-    2. BUILD PATH: Identify ALL versions between current -> target (ordered by release date)
-    3. FOR EACH VERSION: Search '[VERSION] release notes', '[VERSION] upgrade considerations'
-    4. DEPENDENCIES: '[VERSION] python version', '[VERSION] spark version'
-    5. TRANSITIONS: 'upgrade from [V1] to [V2]' for critical version jumps
-
-    Args:
-        query: Search query (e.g., 'Incorta Release Support Policy', '2024.7.0 release notes')
-        limit: Number of results to return (default: 10)
+    Debug endpoint: shows the current cached token claims for an email.
+    Usage: GET /debug-token?email=anas.ahmed@incorta.com
     """
-    result = search_knowledge_base({"query": query, "limit": limit})
-    return json.dumps(result, indent=2)
+    email = request.query_params.get("email", "")
+    if not email:
+        return HTMLResponse("<pre>Usage: /debug-token?email=your@email.com</pre>")
+
+    from clients.cloud_portal_client import load_token
+    import pyjwt_compat
+
+    data = load_token(email)
+    if not data:
+        return HTMLResponse(f"<pre>No token found for {email}</pre>")
+
+    access_token = data.get("access_token", "")
+    try:
+        claims = pyjwt.decode(access_token, options={"verify_signature": False})
+    except Exception as e:
+        claims = {"decode_error": str(e)}
+
+    import json as _json
+
+    output = {
+        "email": email,
+        "has_refresh_token": bool(data.get("refresh_token")),
+        "cached_at": data.get("cached_at"),
+        "exp": claims.get("exp"),
+        "expires_in_hours": round((claims.get("exp", 0) - time.time()) / 3600, 2)
+        if claims.get("exp")
+        else None,
+        "audience": claims.get("aud"),
+        "issuer": claims.get("iss"),
+        "scope": claims.get("scope"),
+        "azp": claims.get("azp"),
+        "sub": claims.get("sub"),
+    }
+    return HTMLResponse(f"<pre>{_json.dumps(output, indent=2)}</pre>")
 
 
-@app.tool()
-def get_zendesk_schema_tool() -> str:
+async def oauth_callback(request: Request) -> HTMLResponse:
     """
-    [CUSTOMER TICKETS - SCHEMA] Get Zendesk schema to understand available fields.
-    Call this BEFORE querying customer tickets to see table structure.
+    OAuth 2.0 callback handler.
 
-    KEY TABLES FOR UPGRADES:
-    - ticket (44 cols): Main ticket data - id, subject, priority, status, organization_id
-    - ticket_customfields_v (15 cols): Severity, Deployment_Type, Release, Fixed_in
-    - Ticket_Current_Release (2 cols): ticket_id, custom_field_value (current version)
-    - Ticket_Target_Release (2 cols): ticket_id, custom_field_value (target version)
-    - organization (15 cols): Customer data - id, name, region
-    - ticket_jira_links (5 cols): Zendesk <-> Jira linkage
-
-    UPGRADE ANALYSIS TABLES (used by automatic Zendesk collection):
-    - ticket_tags: Tag-based filtering — most reliable way to find upgrade issues
-    - Upgrade_tickets: Version tracking — from/to version for each upgrade ticket
-    - Tickets_Env_Release: Environment context — cloud/onprem, release, account name
-    - ticket_comments: Full communication history — problem descriptions, resolutions
-    - ticket_audits/ticket_audit_events: Change tracking — escalations, reassignments
-    - satisfaction_ratings: Customer satisfaction — scores, resolution quality
-
-    Returns upgrade_analysis_ready=True if all required tables are present.
-    Schema is cached within session to avoid redundant calls.
+    Receives Auth0 redirect after user login, validates state (links to the
+    user's email), exchanges the authorization code for tokens, verifies the
+    email claim, and saves the JWT to data/tokens/{email}.json.
     """
-    result = get_zendesk_schema({"fetch_schema": True})
-    return json.dumps(result, indent=2)
+    params = dict(request.query_params)
+    state = params.get("state")
+    code = params.get("code")
+    error = params.get("error")
+
+    def _html(status: int, title: str, body: str) -> HTMLResponse:
+        content = (
+            "<!DOCTYPE html><html><head>"
+            f"<title>{title}</title>"
+            "<style>"
+            "body{font-family:sans-serif;max-width:560px;margin:80px auto;text-align:center;color:#15152b}"
+            "h2{margin-bottom:12px}"
+            "p{color:#555;font-size:15px}"
+            ".code{font-size:24px;font-weight:700;color:#4854fe;margin:20px 0}"
+            ".ok{color:#027a48}"
+            ".err{color:#b42318}"
+            "</style></head><body>"
+            f"<h2>{title}</h2><p>{body}</p>"
+            "</body></html>"
+        )
+        return HTMLResponse(content=content, status_code=status)
+
+    # Validate state
+    if not state or state not in pending_logins:
+        return _html(
+            400,
+            "Login Error",
+            "Login session not found or expired.<br>Please start over from Claude.",
+        )
+
+    login_info = pending_logins.pop(state)
+    email = login_info["email"]
+    code_verifier = login_info["code_verifier"]
+    redirect_uri = login_info["redirect_uri"]
+    cmc_url = login_info.get("cmc_url", "")
+
+    if error:
+        error_desc = params.get("error_description", error)
+        completed_logins[email] = {"success": False, "error": error_desc}
+        return _html(
+            400, "Login Failed", f"{error_desc}<br><br>Return to Claude and try again."
+        )
+
+    if not code:
+        completed_logins[email] = {
+            "success": False,
+            "error": "No authorization code received.",
+        }
+        return _html(
+            400,
+            "Login Failed",
+            "No authorization code received.<br>Return to Claude and try again.",
+        )
+
+    # Exchange code for tokens
+    try:
+        token_data = exchange_code_for_token(code, redirect_uri, code_verifier, cmc_url)
+    except RuntimeError as e:
+        completed_logins[email] = {"success": False, "error": str(e)}
+        return _html(
+            500,
+            "Login Failed",
+            f"Token exchange error: {e}<br>Return to Claude and try again.",
+        )
+
+    access_token = token_data.get("access_token")
+    refresh_token = token_data.get("refresh_token")
+
+    if not access_token:
+        completed_logins[email] = {
+            "success": False,
+            "error": "No access_token in Auth0 response.",
+        }
+        return _html(
+            500,
+            "Login Failed",
+            "Auth0 did not return an access token.<br>Return to Claude and try again.",
+        )
+
+    # Verify email claim matches
+    try:
+        claims = pyjwt.decode(access_token, options={"verify_signature": False})
+    except pyjwt.DecodeError:
+        claims = {}
+
+    jwt_email = (
+        claims.get("email") or claims.get("https://namespace/email") or ""
+    ).lower()
+
+    if jwt_email and jwt_email != email.lower():
+        msg = f"You logged in as {jwt_email} but your config says {email}. Please update cloud-portal-email in your config."
+        completed_logins[email] = {"success": False, "error": msg}
+        return _html(400, "Email Mismatch", msg)
+
+    # Save token per-user
+    save_token(email, access_token, refresh_token, claims)
+    completed_logins[email] = {"success": True}
+
+    exp = claims.get("exp")
+    expiry_msg = ""
+    if exp:
+        hours = (exp - time.time()) / 3600
+        expiry_msg = f" Token valid for {hours:.1f} hours."
+
+    return _html(
+        200,
+        "✅ Connected!",
+        f"Authenticated as <strong>{email}</strong>.{expiry_msg}<br><br>"
+        "You can close this tab and return to Claude.",
+    )
 
 
-@app.tool()
-def query_upgrade_tickets(spark_sql: str) -> str:
+# ===========================================================================
+# Starlette Application
+# ===========================================================================
+
+session_manager = StreamableHTTPSessionManager(
+    app=app,
+    event_store=None,
+    json_response=True,
+    stateless=True,
+)
+
+
+async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
     """
-    [CUSTOMER TICKETS - QUERY] Query Zendesk for customer-reported support tickets.
-    Essential for customer-specific upgrade recommendations. Schema: ZendeskTickets
+    StreamableHTTP MCP endpoint.
 
-    Example query for customer's open issues:
-    SELECT t.id, t.subject, t.priority, t.status, tcf.Severity, o.name AS customer_name
-    FROM ZendeskTickets.ticket t
-    JOIN ZendeskTickets.organization o ON t.organization_id = o.id
-    LEFT JOIN ZendeskTickets.ticket_customfields_v tcf ON t.id = tcf.ticket_id
-    WHERE o.name LIKE '%[CUSTOMER_NAME]%'
-    AND t.status IN ('open', 'pending', 'hold')
-    ORDER BY t.priority DESC LIMIT 50
-
-    Args:
-        spark_sql: Spark SQL query to execute on ZendeskTickets schema
+    Extracts all credential headers and stores them in the user_context
+    ContextVar before delegating to the session manager.
+    Each request is fully isolated — ContextVar is per-coroutine.
     """
-    result = query_zendesk({"spark_sql": spark_sql})
-    return json.dumps(result, indent=2)
+    raw_headers = {
+        k.decode("utf-8", errors="replace").lower(): v.decode("utf-8", errors="replace")
+        for k, v in scope.get("headers", [])
+    }
+
+    cmc_url = raw_headers.get("cmc-url", "").rstrip("/")
+    cmc_cluster_name = raw_headers.get("cmc-cluster-name", "")
+
+    # auto-detect Analytics url from cmc URL if missing
+    incorta_env_url = raw_headers.get("incorta-analytics-url", "").rstrip("/")
+    if not incorta_env_url and cmc_url.endswith("/cmc"):
+        incorta_env_url = cmc_url[:-4] + "/incorta"
+
+    # auto-detect Cloud Portal cluster name from the Analytics url first subdomain
+    auto_cloud_cluster_name = ""
+    if incorta_env_url:
+        import urllib.parse
+
+        parsed_env = urllib.parse.urlparse(incorta_env_url)
+        if parsed_env.hostname:
+            auto_cloud_cluster_name = parsed_env.hostname.split(".")[0]
+
+    user_context.set(
+        {
+            "cmc_url": cmc_url,
+            "cmc_user": raw_headers.get("cmc-user", ""),
+            "cmc_password": raw_headers.get("cmc-password", ""),
+            "cmc_cluster_name": cmc_cluster_name,
+            "incorta_tenant": raw_headers.get(
+                "incorta-tenant", "default"
+            ),  # default fallback
+            "incorta_username": raw_headers.get("incorta-username", ""),
+            "incorta_password": raw_headers.get("incorta-password", ""),
+            "incorta_env_url": incorta_env_url,
+            "cloud_portal_email": raw_headers.get("cloud-portal-email", ""),
+            "auto_cloud_cluster_name": auto_cloud_cluster_name,
+        }
+    )
+
+    try:
+        await session_manager.handle_request(scope, receive, send)
+    except Exception as e:
+        logger.exception(f"Error handling StreamableHTTP request: {e}")
 
 
-@app.tool()
-def get_jira_schema_tool() -> str:
-    """
-    [STEP 4A - BEFORE JIRA QUERIES] Get Jira schema to understand available fields.
-    Call this BEFORE querying bugs/features to see table structure.
-
-    Returns bug_analysis_ready flag indicating whether all required tables
-    (Issues, IssueFixVersions, IssueAffectedVersions, IssueLinks, IssueComponents)
-    are present. Schema is cached after first successful fetch.
-
-    KEY TABLES FOR UPGRADES:
-    - Issues (324 cols): Main issue data - Key, Summary, StatusName, PriorityName, Customer
-    - IssueFixVersions (10 cols): Which versions fix each issue
-    - IssueAffectedVersions (8 cols): Versions affected by bugs
-    - IssueLinks (11 cols): Issue relationships
-    - IssueComponents (7 cols): Product areas
-    """
-    result = get_jira_schema({"fetch_schema": True})
-    return json.dumps(result, indent=2)
+@contextlib.asynccontextmanager
+async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+    async with session_manager.run():
+        logger.info(f"Incorta Upgrade Assistant MCP server started")
+        logger.info(f"  StreamableHTTP: http://{MCP_HOST}:{MCP_PORT}/mcp")
+        logger.info(
+            f"  OAuth callback: {MCP_PUBLIC_URL or f'http://localhost:{MCP_PORT}'}/callback"
+        )
+        try:
+            yield
+        finally:
+            logger.info("Server shutting down.")
 
 
-@app.tool()
-def query_upgrade_issues(spark_sql: str) -> str:
-    """
-    [BUG TRACKING - QUERY] Query Jira for engineering bugs, features, and fixes.
-    Critical for determining if customer's issues are fixed in target version. Schema: Jira_F
-
-    Example query for bugs fixed in target version:
-    SELECT i.Key, i.Summary, i.StatusName, ifv.Name AS fix_version
-    FROM Jira_F.Issues i
-    JOIN Jira_F.IssueFixVersions ifv ON i.Key = ifv.IssueKey
-    WHERE ifv.Name = '[TARGET_VERSION]' AND i.IssueTypeName = 'Bug'
-    ORDER BY i.PriorityName DESC LIMIT 100
-
-    Args:
-        spark_sql: Spark SQL query to execute on Jira_F schema
-    """
-    result = query_jira({"spark_sql": spark_sql})
-    return json.dumps(result, indent=2)
+starlette_app = Starlette(
+    debug=False,
+    routes=[
+        Route("/callback", endpoint=oauth_callback, methods=["GET"]),
+        Route("/debug-token", endpoint=debug_token, methods=["GET"]),
+        Route("/download/{token}", endpoint=serve_download, methods=["GET"]),
+        Mount("/mcp", app=handle_streamable_http),
+    ],
+    lifespan=lifespan,
+)
 
 
 if __name__ == "__main__":
-    host = os.getenv("MCP_HOST", "127.0.0.1")
-    port = int(os.getenv("MCP_PORT", "8000"))
-    app.settings.host = host
-    app.settings.port = port
-    app.run(transport="streamable-http")
+    uvicorn.run(
+        starlette_app,
+        host=MCP_HOST,
+        port=MCP_PORT,
+        forwarded_allow_ips="*",  # trust nginx reverse proxy host headers
+        proxy_headers=True,
+    )
