@@ -97,7 +97,7 @@ def collect_cmc_data(state: ReadinessState) -> ReadinessState:
             "Cluster Configuration": check_cluster_configuration(cluster_data, is_cloud=is_cloud),
             "Infrastructure Services": check_infrastructure_services(cluster_data),
             "Node Topology": check_node_topology(cluster_data),
-            "Connectors": check_connectors(cluster_data, to_version=state.get("to_version", ""), from_version=state.get("from_version", "")),
+            "Connectors": check_connectors(cluster_data),
             "Tenants": check_tenants(cluster_data),
             "Email Configuration": check_email_configuration(cluster_data, is_cloud=is_cloud),
             "Notebook & SQLi": check_notebook_sqli_status(cluster_data),

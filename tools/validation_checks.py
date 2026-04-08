@@ -238,14 +238,8 @@ def check_node_topology(cluster_data: dict) -> dict:
     return {"status": "PASS", "details": details}
 
 
-def check_connectors(cluster_data: dict, to_version: str = "", from_version: str = "") -> dict:
-    """Check all connectors (enabled and disabled) and their JDK/version compatibility.
-
-    Args:
-        cluster_data: Cluster JSON from CMC API.
-        to_version: Target Incorta version (optional, enables compatibility check).
-        from_version: Source Incorta version (optional).
-    """
+def check_connectors(cluster_data: dict) -> dict:
+    """Check all connectors (enabled and disabled)."""
     details = []
     status = "PASS"
 
@@ -264,48 +258,6 @@ def check_connectors(cluster_data: dict, to_version: str = "", from_version: str
         details.append(f"Disabled ({len(disabled_connectors)} total):")
         for conn in disabled_connectors:
             details.append(f"  - {conn}")
-
-    # JDK / version compatibility check (only when to_version is provided)
-    if to_version and connectors:
-        try:
-            from tools.connector_compatibility import check_connector_compatibility
-
-            compat = check_connector_compatibility(connectors, from_version, to_version)
-
-            if compat.get("jdk_upgrade"):
-                details.append(f"JDK upgrade detected: {compat['from_jdk']} → {compat['to_jdk']}")
-            else:
-                details.append(f"Target JDK: {compat.get('to_jdk', 'Unknown')} (no JDK version change)")
-
-            if compat.get("compatible"):
-                details.append(f"Compatible ({len(compat['compatible'])}):")
-                for c in compat["compatible"]:
-                    label = "enabled" if c["enabled"] else "disabled"
-                    details.append(f"  ✓ {c['name']} ({label})")
-
-            if compat.get("incompatible"):
-                details.append(f"INCOMPATIBLE ({len(compat['incompatible'])}):")
-                for c in compat["incompatible"]:
-                    label = "enabled" if c["enabled"] else "disabled"
-                    details.append(f"  ✗ {c['name']} ({label}) {c.get('notes', '')}")
-
-            if compat.get("unknown"):
-                details.append(f"Unknown compatibility ({len(compat['unknown'])}):")
-                for c in compat["unknown"]:
-                    label = "enabled" if c["enabled"] else "disabled"
-                    details.append(f"  ? {c['name']} ({label}) {c.get('notes', '')}")
-
-            # Determine overall status
-            if compat.get("blockers"):
-                status = "FAIL"
-                for b in compat["blockers"]:
-                    details.append(f"BLOCKER: {b}")
-            elif compat.get("warnings"):
-                status = "WARNING"
-                for w in compat["warnings"]:
-                    details.append(f"WARNING: {w}")
-        except Exception as e:
-            details.append(f"Compatibility check error: {e}")
 
     return {"status": status, "details": details}
 

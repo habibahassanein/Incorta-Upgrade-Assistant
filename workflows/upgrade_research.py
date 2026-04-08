@@ -153,13 +153,6 @@ def _build_context_queries(
             batch = connector_names_list[i:i + 5]
             batch_str = " ".join(batch)
             queries.append(("connectors", f"{batch_str} connector upgrade Incorta {to_v}", 3))
-        # Add JDK-specific query when crossing JDK boundary
-        try:
-            from tools.connector_compatibility import is_jdk_upgrade
-            if from_v and is_jdk_upgrade(from_v, to_v):
-                queries.append(("connectors", f"connector JDK 17 compatibility Incorta {to_v}", 3))
-        except Exception:
-            pass
 
     # --- Platform / Deployment ---
     deploy = cluster_metadata.get("deployment_type", {})
