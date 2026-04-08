@@ -20,8 +20,10 @@ import logging
 import os
 import secrets
 import sys
+import tempfile
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, Dict, Literal
 
 import jwt as pyjwt
@@ -30,7 +32,7 @@ import uvicorn
 from dotenv import load_dotenv
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, Response
+from starlette.responses import FileResponse, HTMLResponse, Response
 from starlette.routing import Mount, Route
 from starlette.types import Receive, Scope, Send
 
@@ -69,7 +71,7 @@ from clients.cloud_portal_client import (
     load_token,
 )
 
-# from workflows.checklist_workflow import run_write_checklist_excel
+from workflows.checklist_workflow import run_write_checklist_excel
 from workflows.readiness_report import run_readiness_report
 
 logger = logging.getLogger("incorta-upgrade-agent")
@@ -78,6 +80,11 @@ logging.basicConfig(level=logging.INFO)
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
 MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PUBLIC_URL = os.getenv("MCP_PUBLIC_URL", "").rstrip("/")
+
+# Temp directory for generated Excel files (served via /download/<token>)
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/tmp/upgrade-assistant-downloads"))
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_TTL = int(os.getenv("DOWNLOAD_TTL", "3600"))  # 1 hour
 
 _DEFAULT_TEMPLATE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -208,16 +215,35 @@ async def list_tools() -> list[types.Tool]:
                 "  2. Ask the user for customer_name — must be a real COMPANY name from Jira.\n"
                 "     Examples: 'Apple', 'Starbucks', 'Keysight', 'Toast', 'Broadcom'.\n"
                 "     REJECT person names ('Anas', 'John') or generic words ('test', 'demo').\n\n"
-                "GENERATING THE EXCEL CHECKLIST:\n"
-                "  The report includes a <checklist_data> JSON block at the end with pre-mapped cell values.\n"
-                "  To generate the Excel file, use Python with openpyxl in your sandbox:\n"
-                "    1. Extract the JSON from the <checklist_data> block.\n"
-                "    2. Load the template at: /Users/anasahmed/WorkProjects/Upgrade_agent_v2/Incorta-Upgrade-Assistant/templates/pre_upgrade_checklist.xlsx\n"
-                "    3. Write values to the 'Pre-Upgrade Checklist' sheet only (column B = value, column C = status).\n"
-                "    4. Color-code column C: green (#C6EFCE) for 'Done'/'PASS', red (#FFC7CE) for 'Failed'/'FAIL',\n"
-                "       yellow (#FFEB9C) for 'Review'/'WARNING'/'Action Required', gray (#D9D9D9) for 'N/A',\n"
-                "       blue (#D9E1F2) for 'Pending'.\n"
-                "    5. Save to a new file and present it to the user.\n\n"
+                "GENERATING THE EXCEL CHECKLIST (MANDATORY AFTER REPORT):\n"
+                "  The report includes a <checklist_data> JSON block. Use it to fill the official template:\n"
+                "  1. Copy the template to Claude's sandbox:\n"
+                "     Use Filesystem:copy_file_user_to_claude with path:\n"
+                "     /Users/anasahmed/WorkProjects/Upgrade_agent_v2/Incorta-Upgrade-Assistant/templates/pre_upgrade_checklist.xlsx\n"
+                "  2. Use bash_tool to fill it with openpyxl:\n"
+                "     python3 << 'PYEOF'\n"
+                "     import json; from openpyxl import load_workbook; from openpyxl.styles import PatternFill, Alignment\n"
+                "     wb = load_workbook('/mnt/user-data/uploads/pre_upgrade_checklist.xlsx')\n"
+                "     ws = wb['Pre-Upgrade Checklist']\n"
+                "     fills = {\n"
+                "       'Done': PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid'),\n"
+                "       'PASS': PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid'),\n"
+                "       'Failed': PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid'),\n"
+                "       'FAIL': PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid'),\n"
+                "       'Review': PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid'),\n"
+                "       'WARNING': PatternFill(start_color='FFEB9C', end_color='FFEB9C', fill_type='solid'),\n"
+                "       'Pending': PatternFill(start_color='D9E1F2', end_color='D9E1F2', fill_type='solid'),\n"
+                "       'N/A': PatternFill(start_color='D9D9D9', end_color='D9D9D9', fill_type='solid'),\n"
+                "     }\n"
+                "     data = json.loads('<checklist_data_json_here>')\n"
+                "     for row, cols in data.items():\n"
+                "       b = ws.cell(row=int(row), column=2); b.value = cols.get('B', ''); b.alignment = Alignment(wrap_text=True, vertical='top')\n"
+                "       c = ws.cell(row=int(row), column=3); c.value = cols.get('C', ''); c.alignment = Alignment(horizontal='center', vertical='center')\n"
+                "       if cols.get('C') in fills: c.fill = fills[cols['C']]\n"
+                "     wb.save('/mnt/user-data/outputs/<filename>.xlsx')\n"
+                "     PYEOF\n"
+                "  3. Call present_files with /mnt/user-data/outputs/<filename>.xlsx\n"
+                "  NOTE: The template has 8 sheets — only Pre-Upgrade Checklist is modified. Column B = value, C = status.\n\n"
                 "Args:\n"
                 "  to_version: Target Incorta version (e.g. '2026.1.0'). Required.\n"
                 "  customer_name: Company name from Jira (e.g. 'Apple', 'Starbucks'). Optional but recommended.\n"
@@ -257,40 +283,38 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
-        # DISABLED: Claude can build the Excel directly from the <checklist_data> JSON
-        # using openpyxl in its sandbox. No need for this server-side tool.
-        # types.Tool(
-        #     name="write_checklist_excel",
-        #     description=(
-        #         "[EXCEL OUTPUT] Write approved checklist values into an Excel template.\n"
-        #         "Call this with the <checklist_data> JSON block from generate_upgrade_readiness_report.\n\n"
-        #         "OUTPUT: The tool returns JSON with a 'base64' field (the Excel file), 'filename', and 'summary'.\n"
-        #         "To give the user a downloadable file, Claude MUST use bash_tool with this exact approach:\n"
-        #         "  1. Write the base64 string to a temp file first (avoids shell argument length limits):\n"
-        #         "     python3 -c \"import json; d=json.load(open('/tmp/xl.json')); open('/tmp/b64.txt','w').write(d['base64'])\"\n"
-        #         "     BUT: the tool result is already in context as a string, so instead do:\n"
-        #         "     python3 << 'EOF'\n"
-        #         "     import base64\n"
-        #         "     b64 = '<paste full base64 here>'\n"
-        #         "     open('/mnt/user-data/outputs/<filename>', 'wb').write(base64.b64decode(b64))\n"
-        #         "     EOF\n"
-        #         "  2. Call present_files with /mnt/user-data/outputs/<filename>.\n"
-        #         "  CRITICAL: Write the base64 as a Python string literal inside the heredoc, NOT as a shell echo argument.\n"
-        #         "  The heredoc approach handles strings of any length without truncation.\n"
-        #         "Show the summary text to the user as well.\n\n"
-        #         "Args:\n"
-        #         "  cell_values_json: JSON string from generate_upgrade_readiness_report.\n"
-        #         "  filename: Suggested filename. Default: 'pre_upgrade_checklist_filled.xlsx'."
-        #     ),
-        #     inputSchema={
-        #         "type": "object",
-        #         "required": ["cell_values_json"],
-        #         "properties": {
-        #             "cell_values_json": {"type": "string"},
-        #             "filename": {"type": "string"},
-        #         },
-        #     },
-        # ),
+        types.Tool(
+            name="write_checklist_excel",
+            description=(
+                "[EXCEL OUTPUT] Fills the official 8-sheet Incorta pre-upgrade checklist template\n"
+                "with the collected data and returns a direct download link for the xlsx file.\n\n"
+                "ALWAYS call this after generate_upgrade_readiness_report.\n"
+                "Pass the entire <checklist_data> JSON block from the report output.\n\n"
+                "OUTPUT: Returns JSON with:\n"
+                "  - 'download_url': A direct HTTPS link to download the filled Excel file.\n"
+                "  - 'filename': The suggested filename.\n"
+                "  - 'summary': A human-readable summary of what was filled.\n"
+                "  - 'expires_in': How long the link is valid (1 hour).\n\n"
+                "HOW TO DELIVER:\n"
+                "  1. Show the summary to the user.\n"
+                "  2. Present the download_url as a clickable markdown link:\n"
+                "     [Download Checklist](download_url)\n"
+                "  3. Tell the user the link expires in 1 hour.\n"
+                "  DO NOT attempt to decode base64 or write files yourself — the server handles everything.\n"
+                "  DO NOT build the Excel yourself with openpyxl — this tool uses the official template.\n\n"
+                "Args:\n"
+                "  cell_values_json: The <checklist_data> JSON from generate_upgrade_readiness_report.\n"
+                "  filename: Output filename. Default: 'pre_upgrade_checklist_filled.xlsx'."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["cell_values_json"],
+                "properties": {
+                    "cell_values_json": {"type": "string"},
+                    "filename": {"type": "string"},
+                },
+            },
+        ),
         types.Tool(
             name="cloud_portal_connect",
             description=(
@@ -499,23 +523,43 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
 
     # -----------------------------------------------------------------------
     # write_checklist_excel
-    # DISABLED: Claude builds the Excel directly from <checklist_data> JSON using openpyxl
-    # elif name == "write_checklist_excel":
-    #     cell_values_json = arguments.get("cell_values_json", "")
-    #     filename = arguments.get("filename", "pre_upgrade_checklist_filled.xlsx")
-    #
-    #     if not os.path.exists(_DEFAULT_TEMPLATE_PATH):
-    #         return _json({"error": f"Template not found at '{_DEFAULT_TEMPLATE_PATH}'."})
-    #
-    #     try:
-    #         result = run_write_checklist_excel(
-    #             cell_values_json=cell_values_json,
-    #             template_path=_DEFAULT_TEMPLATE_PATH,
-    #             filename=filename,
-    #         )
-    #         return _json(result)
-    #     except Exception as e:
-    #         return _json({"error": f"Error writing Excel: {e}"})
+    # -----------------------------------------------------------------------
+    elif name == "write_checklist_excel":
+        cell_values_json = arguments.get("cell_values_json", "")
+        filename = arguments.get("filename", "pre_upgrade_checklist_filled.xlsx")
+        if not filename.endswith(".xlsx"):
+            filename += ".xlsx"
+
+        if not os.path.exists(_DEFAULT_TEMPLATE_PATH):
+            return _json({"error": f"Template not found at '{_DEFAULT_TEMPLATE_PATH}'."})
+
+        try:
+            result = run_write_checklist_excel(
+                cell_values_json=cell_values_json,
+                template_path=_DEFAULT_TEMPLATE_PATH,
+                filename=filename,
+            )
+        except Exception as e:
+            return _json({"error": f"Error writing Excel: {e}"})
+
+        # Save to DOWNLOAD_DIR and return a URL — no base64 in tool result
+        token = secrets.token_hex(16) + ".xlsx"
+        dest = DOWNLOAD_DIR / token
+        try:
+            import base64 as _b64
+            dest.write_bytes(_b64.b64decode(result["base64"]))
+        except Exception as e:
+            return _json({"error": f"Error saving file to disk: {e}"})
+
+        public_base = MCP_PUBLIC_URL or f"http://localhost:{MCP_PORT}"
+        download_url = f"{public_base}/download/{token}?filename={filename}"
+
+        return _json({
+            "download_url": download_url,
+            "filename": filename,
+            "summary": result.get("summary", ""),
+            "expires_in": "1 hour",
+        })
 
     # -----------------------------------------------------------------------
     # cloud_portal_connect
@@ -949,6 +993,33 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
 # ===========================================================================
 
 
+async def serve_download(request: Request) -> Response:
+    """Serve a generated Excel file by token. Files auto-expire after DOWNLOAD_TTL seconds."""
+    token = request.path_params.get("token", "")
+    if not token or "/" in token or ".." in token:
+        return Response("Not found", status_code=404)
+
+    # Opportunistic cleanup of expired files
+    now = time.time()
+    for f in DOWNLOAD_DIR.glob("*.xlsx"):
+        try:
+            if now - f.stat().st_mtime > DOWNLOAD_TTL:
+                f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    file_path = DOWNLOAD_DIR / token
+    if not file_path.exists() or not file_path.is_file():
+        return Response("File not found or expired (files expire after 1 hour)", status_code=404)
+
+    filename = request.query_params.get("filename", token)
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
 async def debug_token(request: Request) -> HTMLResponse:
     """
     Debug endpoint: shows the current cached token claims for an email.
@@ -1194,6 +1265,7 @@ starlette_app = Starlette(
     routes=[
         Route("/callback", endpoint=oauth_callback, methods=["GET"]),
         Route("/debug-token", endpoint=debug_token, methods=["GET"]),
+        Route("/download/{token}", endpoint=serve_download, methods=["GET"]),
         Mount("/mcp", app=handle_streamable_http),
     ],
     lifespan=lifespan,
