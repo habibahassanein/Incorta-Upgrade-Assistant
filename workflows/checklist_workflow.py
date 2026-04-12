@@ -389,10 +389,11 @@ def run_write_checklist_excel(
             - "summary": human-readable summary string
     """
     from openpyxl import load_workbook
-    from openpyxl.styles import PatternFill, Alignment
+    from openpyxl.styles import Alignment, Font, PatternFill
 
-    # Parse cell values
+    # Parse cell values and extract optional assessment summary
     raw = json.loads(cell_values_json)
+    assessment = raw.pop("_summary", None)
     cell_values = {int(k): v for k, v in raw.items()}
 
     # Write into a temp file so we never need a caller-supplied output path
@@ -403,6 +404,16 @@ def run_write_checklist_excel(
         shutil.copy2(template_path, tmp_path)
 
         wb = load_workbook(tmp_path)
+
+        # ------------------------------------------------------------------
+        # Summary sheet (created from assessment data when available)
+        # ------------------------------------------------------------------
+        if assessment:
+            _write_summary_sheet(wb, assessment, cell_values)
+
+        # ------------------------------------------------------------------
+        # Pre-Upgrade Checklist sheet
+        # ------------------------------------------------------------------
         ws = wb["Pre-Upgrade Checklist"]
 
         status_fills = {
@@ -450,7 +461,7 @@ def run_write_checklist_excel(
         f"# Checklist Generation Complete\n\n"
         f"- **Rows filled:** {filled_count}\n"
         f"- **Not Implemented rows:** {not_impl_count}\n"
-        f"- **Sheet modified:** Pre-Upgrade Checklist\n"
+        f"- **Sheets modified:** Summary, Pre-Upgrade Checklist\n"
         f"- **Other sheets:** Untouched (7 sheets preserved as-is)\n"
         f"- **File:** {filename} (ready for download)\n"
     )
@@ -461,3 +472,136 @@ def run_write_checklist_excel(
         "base64": encoded,
         "summary": summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Summary sheet builder
+# ---------------------------------------------------------------------------
+
+def _write_summary_sheet(wb, assessment: dict, cell_values: dict):
+    """Create a Summary sheet as the first tab with a readiness overview."""
+    from collections import Counter
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    ss = wb.create_sheet("Summary", 0)
+    ss.column_dimensions["A"].width = 60
+    ss.column_dimensions["B"].width = 15
+
+    bold = Font(bold=True)
+    header_font = Font(bold=True, size=14)
+    wrap = Alignment(wrap_text=True, vertical="top")
+
+    rating = assessment.get("rating", "UNKNOWN")
+    risk = assessment.get("risk_level", "UNKNOWN")
+    rating_fills = {
+        "READY": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+        "READY WITH CAVEATS": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+        "NOT READY": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+    }
+    status_fills = {
+        "Done": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+        "PASS": PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),
+        "Review": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+        "WARNING": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+        "Action Required": PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+        "Pending": PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid"),
+        "N/A": PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid"),
+        "Failed": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+        "FAIL": PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+    }
+
+    row = 1
+
+    # --- Header ---
+    ss.cell(row=row, column=1, value="Upgrade Readiness Summary").font = header_font
+    row += 1
+    from_v = assessment.get("from_version", "?")
+    to_v = assessment.get("to_version", "?")
+    ss.cell(row=row, column=1, value=f"Upgrade: {from_v} \u2192 {to_v}").font = bold
+    row += 1
+    verdict_cell = ss.cell(row=row, column=1, value=f"Verdict: {rating} ({risk} RISK)")
+    verdict_cell.font = Font(bold=True, size=12)
+    verdict_cell.fill = rating_fills.get(rating, PatternFill())
+    row += 1
+    detail = assessment.get("rating_detail", "")
+    if detail:
+        ss.cell(row=row, column=1, value=detail).alignment = wrap
+    row += 2
+
+    # --- Status counts ---
+    ss.cell(row=row, column=1, value="Status").font = bold
+    ss.cell(row=row, column=2, value="Count").font = bold
+    row += 1
+    statuses = [v.get("C", "") for v in cell_values.values()]
+    counts = Counter(statuses)
+    for label in ["Done", "PASS", "Review", "WARNING", "Action Required", "Pending", "N/A", "Failed", "FAIL"]:
+        if counts.get(label, 0) > 0:
+            c_a = ss.cell(row=row, column=1, value=label)
+            c_b = ss.cell(row=row, column=2, value=counts[label])
+            fill = status_fills.get(label)
+            if fill:
+                c_a.fill = fill
+            row += 1
+    row += 1
+
+    # --- Blockers ---
+    blockers = assessment.get("blockers", [])
+    ss.cell(row=row, column=1, value="Blockers").font = bold
+    ss.cell(row=row, column=2, value=len(blockers)).font = bold
+    if blockers:
+        ss.cell(row=row, column=2).fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    row += 1
+    for b in blockers:
+        ss.cell(row=row, column=1, value=f"- {b}").alignment = wrap
+        row += 1
+    row += 1
+
+    # --- Warnings ---
+    warnings = assessment.get("warnings", [])
+    ss.cell(row=row, column=1, value="Warnings").font = bold
+    ss.cell(row=row, column=2, value=len(warnings)).font = bold
+    if warnings:
+        ss.cell(row=row, column=2).fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    row += 1
+    for w in warnings:
+        ss.cell(row=row, column=1, value=f"- {w}").alignment = wrap
+        row += 1
+    row += 1
+
+    # --- Disclaimers (auto-generated from data gaps + known limitations) ---
+    ss.cell(row=row, column=1, value="Disclaimers").font = bold
+    row += 1
+    data_gaps = assessment.get("data_gaps", [])
+    for gap in data_gaps:
+        ss.cell(row=row, column=1, value=f"- {gap}").alignment = wrap
+        row += 1
+    # Cloud-specific disclaimers
+    env = assessment.get("environment_summary", {})
+    if env.get("deployment", "").lower() == "cloud":
+        ss.cell(row=row, column=1, value="- Memory values are allocated sizes, not actual machine memory").alignment = wrap
+        row += 1
+        ss.cell(row=row, column=1, value="- Per-pod disk utilization not available (API limited)").alignment = wrap
+        row += 1
+    if not data_gaps and not (env.get("deployment", "").lower() == "cloud"):
+        ss.cell(row=row, column=1, value="- None").alignment = wrap
+        row += 1
+    row += 1
+
+    # --- Need to Plan (placeholders) ---
+    ss.cell(row=row, column=1, value="Need to Plan").font = bold
+    row += 1
+    for placeholder in [
+        "- Access to machine",
+        "- DB admin availability",
+        "- Confirm existing Jar(s) with CSM/Release Management team",
+    ]:
+        ss.cell(row=row, column=1, value=placeholder).alignment = wrap
+        row += 1
+    row += 1
+
+    # --- Down time / Approvals (placeholders) ---
+    ss.cell(row=row, column=1, value="Down Time").font = bold
+    row += 2
+    ss.cell(row=row, column=1, value="Manager's Approval").font = bold
+    row += 2
+    ss.cell(row=row, column=1, value="Customer's Approval").font = bold

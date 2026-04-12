@@ -907,6 +907,19 @@ def generate_report(state: ReadinessState) -> ReadinessState:
     # --- Checklist Data (always included) ---
     if checklist:
         serializable = {str(k): v for k, v in checklist.items()}
+        # Embed assessment summary so write_checklist_excel can build a Summary sheet
+        serializable["_summary"] = {
+            "rating": assessment.get("rating"),
+            "rating_detail": assessment.get("rating_detail"),
+            "risk_level": assessment.get("risk_level"),
+            "blockers": assessment.get("blockers", []),
+            "warnings": assessment.get("warnings", []),
+            "data_gaps": assessment.get("data_gaps", []),
+            "checks_summary": assessment.get("checks_summary", {}),
+            "environment_summary": assessment.get("environment_summary", {}),
+            "from_version": assessment.get("from_version"),
+            "to_version": assessment.get("to_version"),
+        }
         lines.append("---")
         lines.append("")
         lines.append("## Pre-Upgrade Checklist Data")
