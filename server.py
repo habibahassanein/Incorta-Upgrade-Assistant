@@ -44,7 +44,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 load_dotenv()
 
 from context.user_context import user_context
-from workflows.pre_upgrade_validation import run_validation
 from tools.qdrant_tool import search_knowledge_base
 from tools.incorta_tools import (
     query_zendesk,
@@ -267,23 +266,6 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
-            name="run_pre_upgrade_validation",
-            description=(
-                "[HEALTH CHECK] Validates Incorta cluster health before upgrade.\n"
-                "Performs comprehensive pre-upgrade health checks: service status, memory, "
-                "topology, Spark/Zookeeper/DB, connectors, tenants, email config, DB migration.\n\n"
-                "CREDENTIALS: CMC credentials are automatically injected from MCP headers. Do not ask the user.\n\n"
-                "Args:\n"
-                "  cluster_name: CMC cluster name. Defaults to cmc-cluster-name header."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "cluster_name": {"type": "string"},
-                },
-            },
-        ),
-        types.Tool(
             name="write_checklist_excel",
             description=(
                 "[EXCEL OUTPUT] Fills the official 8-sheet Incorta pre-upgrade checklist template\n"
@@ -408,50 +390,32 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
-            name="get_zendesk_schema_tool",
-            description=(
-                "[CUSTOMER TICKETS - SCHEMA] Get Zendesk schema to understand available fields.\n"
-                "CREDENTIALS: DB login is handled automatically. Call directly.\n"
-                "Call BEFORE querying customer tickets."
-            ),
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
             name="query_upgrade_tickets",
             description=(
-                "[CUSTOMER TICKETS - QUERY] Query Zendesk for customer-reported support tickets.\n"
-                "Schema name: ZendeskTickets\n\n"
-                "CREDENTIALS: DB login is handled automatically using internal server environment. Call directly.\n\n"
+                "[CUSTOMER TICKETS] Query Zendesk for customer-reported support tickets.\n"
+                "Schema (ZendeskTickets) is always included in the response.\n\n"
+                "CREDENTIALS: DB login is handled automatically. Call directly.\n\n"
                 "Args:\n"
-                "  spark_sql: Spark SQL query against ZendeskTickets schema."
+                "  spark_sql: (Optional) Spark SQL query against ZendeskTickets schema.\n"
+                "             If omitted, returns schema only."
             ),
             inputSchema={
                 "type": "object",
-                "required": ["spark_sql"],
                 "properties": {"spark_sql": {"type": "string"}},
             },
         ),
         types.Tool(
-            name="get_jira_schema_tool",
-            description=(
-                "[BUG TRACKING - SCHEMA] Get Jira schema to understand available fields.\n"
-                "CREDENTIALS: DB login is handled automatically. Call directly.\n"
-                "Call BEFORE querying bugs/features."
-            ),
-            inputSchema={"type": "object", "properties": {}},
-        ),
-        types.Tool(
             name="query_upgrade_issues",
             description=(
-                "[BUG TRACKING - QUERY] Query Jira for engineering bugs, features, and fixes.\n"
-                "Schema name: Jira_F\n\n"
-                "CREDENTIALS: DB login is handled automatically using internal server environment. Call directly.\n\n"
+                "[BUG TRACKING] Query Jira for engineering bugs, features, and fixes.\n"
+                "Schema (Jira_F) is always included in the response.\n\n"
+                "CREDENTIALS: DB login is handled automatically. Call directly.\n\n"
                 "Args:\n"
-                "  spark_sql: Spark SQL query against Jira_F schema."
+                "  spark_sql: (Optional) Spark SQL query against Jira_F schema.\n"
+                "             If omitted, returns schema only."
             ),
             inputSchema={
                 "type": "object",
-                "required": ["spark_sql"],
                 "properties": {"spark_sql": {"type": "string"}},
             },
         ),
@@ -505,21 +469,6 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
             return _text(result)
         except Exception as e:
             return _text(f"Error generating readiness report: {e}")
-
-    # -----------------------------------------------------------------------
-    # run_pre_upgrade_validation
-    # -----------------------------------------------------------------------
-    elif name == "run_pre_upgrade_validation":
-        cluster_name = _get_cmc_cluster_name(arguments.get("cluster_name"))
-        if not cluster_name:
-            return _text(
-                "Error: CMC cluster name not available.\n"
-                "Ensure cmc-cluster-name is set in your MCP client headers."
-            )
-        try:
-            return _text(run_validation(cluster_name))
-        except Exception as e:
-            return _text(f"Error running pre-upgrade validation: {e}")
 
     # -----------------------------------------------------------------------
     # write_checklist_excel
@@ -962,34 +911,26 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         return _json(result)
 
     # -----------------------------------------------------------------------
-    # get_zendesk_schema_tool
-    # -----------------------------------------------------------------------
-    elif name == "get_zendesk_schema_tool":
-        result = get_zendesk_schema({"fetch_schema": True})
-        return _json(result)
-
-    # -----------------------------------------------------------------------
-    # query_upgrade_tickets
+    # query_upgrade_tickets (auto-includes Zendesk schema)
     # -----------------------------------------------------------------------
     elif name == "query_upgrade_tickets":
+        schema = get_zendesk_schema({"fetch_schema": True})
         spark_sql = arguments.get("spark_sql", "")
-        result = query_zendesk({"spark_sql": spark_sql})
-        return _json(result)
+        if spark_sql:
+            query_result = query_zendesk({"spark_sql": spark_sql})
+            return _json({"schema": schema, "query_result": query_result})
+        return _json({"schema": schema})
 
     # -----------------------------------------------------------------------
-    # get_jira_schema_tool
-    # -----------------------------------------------------------------------
-    elif name == "get_jira_schema_tool":
-        result = get_jira_schema({"fetch_schema": True})
-        return _json(result)
-
-    # -----------------------------------------------------------------------
-    # query_upgrade_issues
+    # query_upgrade_issues (auto-includes Jira schema)
     # -----------------------------------------------------------------------
     elif name == "query_upgrade_issues":
+        schema = get_jira_schema({"fetch_schema": True})
         spark_sql = arguments.get("spark_sql", "")
-        result = query_jira({"spark_sql": spark_sql})
-        return _json(result)
+        if spark_sql:
+            query_result = query_jira({"spark_sql": spark_sql})
+            return _json({"schema": schema, "query_result": query_result})
+        return _json({"schema": schema})
 
     else:
         return _text(f"Unknown tool: {name}")

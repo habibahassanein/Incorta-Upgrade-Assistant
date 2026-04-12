@@ -58,10 +58,6 @@
     },
     "tools": [
         {
-            "name": "run_pre_upgrade_validation",
-            "description": "Validate Incorta cluster health before upgrade: services, memory, topology, infrastructure, connectors, tenants, email, and datasource connectivity."
-        },
-        {
             "name": "extract_cluster_metadata_tool",
             "description": "Extract upgrade-relevant metadata from CMC: deployment type, DB type, topology, features, and infrastructure."
         },
@@ -90,20 +86,12 @@
             "description": "Search Incorta documentation and community articles for upgrade guidance."
         },
         {
-            "name": "get_zendesk_schema_tool",
-            "description": "Get the Zendesk support ticket schema available in Incorta for upgrade ticket analysis."
-        },
-        {
             "name": "query_upgrade_tickets",
-            "description": "Query Zendesk customer support tickets using Spark SQL for upgrade-related issue analysis."
-        },
-        {
-            "name": "get_jira_schema_tool",
-            "description": "Get the Jira engineering schema available in Incorta for bug and fix analysis."
+            "description": "Query Zendesk customer support tickets using Spark SQL. Auto-includes schema. If no SQL provided, returns schema only."
         },
         {
             "name": "query_upgrade_issues",
-            "description": "Query Jira engineering bugs and fixes using Spark SQL for upgrade impact analysis."
+            "description": "Query Jira engineering bugs and fixes using Spark SQL. Auto-includes schema. If no SQL provided, returns schema only."
         }
     ],
     "tools_generated": false,
