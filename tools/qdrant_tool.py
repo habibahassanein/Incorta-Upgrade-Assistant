@@ -1,4 +1,5 @@
 
+import asyncio
 import os
 import re
 from typing import Dict, Any
@@ -37,7 +38,7 @@ def get_qdrant_client():
     return _qdrant_client
 
 
-def search_knowledge_base(arguments: Dict[str, Any]) -> dict:
+async def search_knowledge_base(arguments: Dict[str, Any]) -> dict:
     """
     Search the knowledge base using vector similarity.
 
@@ -60,10 +61,14 @@ def search_knowledge_base(arguments: Dict[str, Any]) -> dict:
     embedding_model = get_embedding_model()
     qdrant_client = get_qdrant_client()
 
-    # Encode query (bge models need instruction prefix for retrieval queries)
-    query_vector = embedding_model.encode(
-        ["Represent this sentence for searching relevant passages: " + query]
-    )[0]
+    # Encode query (bge models need instruction prefix for retrieval queries).
+    # encode() is CPU-bound and synchronous; run it in a worker thread so it
+    # cannot block the asyncio event loop (and starve MCP initialize calls
+    # from other clients).
+    query_vector = (await asyncio.to_thread(
+        embedding_model.encode,
+        ["Represent this sentence for searching relevant passages: " + query],
+    ))[0]
 
     # Extract version-like patterns (e.g., "2026", "2026.1.0") for filtered search
     version_patterns = re.findall(r'\b(20\d{2})\b', query)

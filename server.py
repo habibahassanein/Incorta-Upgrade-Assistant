@@ -14,6 +14,7 @@ Headers read from every MCP request:
   cloud-portal-email
 """
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -44,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 load_dotenv()
 
 from context.user_context import user_context
-from tools.qdrant_tool import search_knowledge_base
+from tools.qdrant_tool import get_embedding_model, search_knowledge_base
 from tools.incorta_tools import (
     query_zendesk,
     query_jira,
@@ -907,7 +908,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
     elif name == "search_upgrade_knowledge":
         query = arguments.get("query", "")
         limit = arguments.get("limit", 10)
-        result = search_knowledge_base({"query": query, "limit": limit})
+        result = await search_knowledge_base({"query": query, "limit": limit})
         return _json(result)
 
     # -----------------------------------------------------------------------
@@ -1196,6 +1197,12 @@ async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> 
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: Starlette) -> AsyncIterator[None]:
+    # Preload the embedding model before accepting traffic so the first
+    # search_upgrade_knowledge call cannot stall the event loop downloading
+    # ~440MB from HuggingFace inside a request handler.
+    logger.info("Preloading embedding model (BAAI/bge-base-en-v1.5)...")
+    await asyncio.to_thread(get_embedding_model)
+    logger.info("Embedding model ready.")
     async with session_manager.run():
         logger.info(f"Incorta Upgrade Assistant MCP server started")
         logger.info(f"  StreamableHTTP: http://{MCP_HOST}:{MCP_PORT}/mcp")
