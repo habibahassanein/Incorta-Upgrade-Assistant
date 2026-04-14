@@ -79,7 +79,7 @@
         },
         {
             "name": "write_checklist_excel",
-            "description": "Write the readiness report checklist data into a downloadable Excel template."
+            "description": "Fill the 2-sheet Incorta pre-upgrade checklist template (Summary + Pre-Upgrade Checklist) with the readiness report data and return a downloadable Excel file."
         },
         {
             "name": "search_upgrade_knowledge",
