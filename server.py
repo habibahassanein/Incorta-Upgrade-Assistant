@@ -269,14 +269,23 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="write_checklist_excel",
             description=(
-                "[EXCEL OUTPUT] Fills the official 8-sheet Incorta pre-upgrade checklist template\n"
-                "with the collected data and returns a direct download link for the xlsx file.\n\n"
-                "ALWAYS call this after generate_upgrade_readiness_report.\n"
-                "Pass the entire <checklist_data> JSON block from the report output.\n\n"
+                "[EXCEL OUTPUT] Fills the 2-sheet Incorta pre-upgrade checklist template\n"
+                "(Summary + Pre-Upgrade Checklist) and returns a direct download link.\n\n"
+                "ALWAYS call this after generate_upgrade_readiness_report.\n\n"
+                "NORMAL USAGE (strongly preferred):\n"
+                "  Pass only `cmc_cluster_name` — the full checklist payload was cached\n"
+                "  server-side by the readiness report and will be loaded byte-for-byte.\n"
+                "  This avoids any truncation/paraphrasing of the JSON by the model.\n\n"
+                "  The readiness report output contains a `<checklist_ref cluster=\"…\" />`\n"
+                "  marker; use that cluster name here.\n\n"
+                "LEGACY USAGE (only if no cache exists):\n"
+                "  Pass `cell_values_json` with the full <checklist_data> JSON block.\n"
+                "  The LLM MUST NOT edit, shorten, or paraphrase this JSON.\n\n"
                 "OUTPUT: Returns JSON with:\n"
                 "  - 'download_url': A direct HTTPS link to download the filled Excel file.\n"
                 "  - 'filename': The suggested filename.\n"
                 "  - 'summary': A human-readable summary of what was filled.\n"
+                "  - 'source': 'cache' or 'inline_json' (how the payload was resolved).\n"
                 "  - 'expires_in': How long the link is valid (1 hour).\n\n"
                 "HOW TO DELIVER:\n"
                 "  1. Show the summary to the user.\n"
@@ -286,13 +295,14 @@ async def list_tools() -> list[types.Tool]:
                 "  DO NOT attempt to decode base64 or write files yourself — the server handles everything.\n"
                 "  DO NOT build the Excel yourself with openpyxl — this tool uses the official template.\n\n"
                 "Args:\n"
-                "  cell_values_json: The <checklist_data> JSON from generate_upgrade_readiness_report.\n"
+                "  cmc_cluster_name: Preferred — the cluster whose readiness report was just run.\n"
+                "  cell_values_json: Fallback JSON (only needed if no cache hit for cmc_cluster_name).\n"
                 "  filename: Output filename. Default: 'pre_upgrade_checklist_filled.xlsx'."
             ),
             inputSchema={
                 "type": "object",
-                "required": ["cell_values_json"],
                 "properties": {
+                    "cmc_cluster_name": {"type": "string"},
                     "cell_values_json": {"type": "string"},
                     "filename": {"type": "string"},
                 },
@@ -476,6 +486,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
     # -----------------------------------------------------------------------
     elif name == "write_checklist_excel":
         cell_values_json = arguments.get("cell_values_json", "")
+        cmc_cluster_name = arguments.get("cmc_cluster_name") or _get_cmc_cluster_name(None) or ""
         filename = arguments.get("filename", "pre_upgrade_checklist_filled.xlsx")
         if not filename.endswith(".xlsx"):
             filename += ".xlsx"
@@ -488,6 +499,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
                 cell_values_json=cell_values_json,
                 template_path=_DEFAULT_TEMPLATE_PATH,
                 filename=filename,
+                cmc_cluster_name=cmc_cluster_name,
             )
         except Exception as e:
             return _json({"error": f"Error writing Excel: {e}"})

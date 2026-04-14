@@ -4,7 +4,13 @@ Pre-Upgrade Checklist Workflow
 Workflow for filling the Pre-Upgrade Checklist Excel template.
 Writes approved cell values (from generate_upgrade_readiness_report) into an Excel template copy.
 
-Only the "Pre-Upgrade Checklist" sheet is modified. All other sheets are untouched.
+Produces two sheets: Summary (built dynamically) and Pre-Upgrade Checklist.
+
+The readiness report caches the full cell_values payload on disk keyed by the
+CMC cluster name. write_checklist_excel prefers the cached blob over the
+cell_values_json argument so the LLM does not need to ferry the (often large)
+JSON between tool calls — any truncation / paraphrasing by the model is
+bypassed entirely.
 """
 
 import base64
@@ -13,9 +19,64 @@ import os
 import shutil
 import sys
 import tempfile
-from typing import TypedDict
+import time
+from pathlib import Path
+from typing import Optional, TypedDict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+# ---------------------------------------------------------------------------
+# Server-side cache for checklist data (keyed by CMC cluster name)
+# ---------------------------------------------------------------------------
+# The cache lives under /app/data/checklist_cache/ inside the container,
+# alongside /app/data/tokens/ (Cloud Portal JWTs). Entries expire after 24h
+# so a stale report can't silently overwrite a fresh run.
+
+CACHE_DIR = Path(os.getenv("CHECKLIST_CACHE_DIR", "/app/data/checklist_cache"))
+CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+
+
+def _safe_cluster_key(cmc_cluster_name: str) -> str:
+    """Sanitize a cluster name for use as a filename (keep it simple)."""
+    import re
+    return re.sub(r"[^A-Za-z0-9._-]", "_", (cmc_cluster_name or "").strip())[:128] or "default"
+
+
+def save_checklist_cache(cmc_cluster_name: str, payload: dict) -> Optional[Path]:
+    """Persist the full checklist payload so write_checklist_excel can read it later.
+
+    `payload` is the same dict that would otherwise be JSON-serialised into
+    the <checklist_data> block of the readiness report. Keeps `_summary` and
+    all per-row details intact.
+
+    Returns the path written (or None on write failure — cache is best-effort).
+    """
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        key = _safe_cluster_key(cmc_cluster_name)
+        path = CACHE_DIR / f"{key}.json"
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(path)
+        return path
+    except OSError:
+        return None
+
+
+def load_checklist_cache(cmc_cluster_name: str) -> Optional[dict]:
+    """Load a previously cached payload. Returns None if missing or stale."""
+    try:
+        key = _safe_cluster_key(cmc_cluster_name)
+        path = CACHE_DIR / f"{key}.json"
+        if not path.exists():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if age > CACHE_TTL_SECONDS:
+            return None
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -634,20 +695,29 @@ def map_data_to_cells(state: ChecklistState) -> ChecklistState:
 # ---------------------------------------------------------------------------
 
 def run_write_checklist_excel(
-    cell_values_json: str,
-    template_path: str,
+    cell_values_json: str = "",
+    template_path: str = "",
     filename: str = "pre_upgrade_checklist_filled.xlsx",
+    cmc_cluster_name: str = "",
 ) -> dict:
     """Write approved cell values into a copy of the Excel template.
 
-    Only modifies the 'Pre-Upgrade Checklist' sheet. All other sheets untouched.
-    Writes to a temporary file, encodes as base64, and returns the encoded bytes
-    so the caller can offer it as a download — no output path needed.
+    Produces two sheets: Summary (built dynamically) and Pre-Upgrade Checklist.
+
+    Data-source resolution, in priority order:
+      1. If `cmc_cluster_name` is provided and a cache file exists for it,
+         use the cached payload. This is the normal path — avoids having
+         the LLM ferry a large JSON blob between tool calls (which caused
+         truncation / paraphrasing in earlier runs).
+      2. Otherwise, parse `cell_values_json` (legacy / manual-override path).
 
     Args:
-        cell_values_json: JSON string of {row_num: {"B": value, "C": status}}
-        template_path: Path to the Excel template file
-        filename: Suggested filename for the download
+        cell_values_json: Fallback JSON string of {row_num: {"B": value, "C": status}}
+            when no cached payload is available for the cluster.
+        template_path: Path to the Excel template file.
+        filename: Suggested filename for the download.
+        cmc_cluster_name: Preferred — cluster key used to look up the cached
+            payload written by generate_upgrade_readiness_report.
 
     Returns:
         dict with keys:
@@ -655,12 +725,31 @@ def run_write_checklist_excel(
             - "filename": suggested download filename
             - "base64": base64-encoded .xlsx bytes
             - "summary": human-readable summary string
+            - "source": "cache" or "inline_json" (where the payload came from)
     """
     from openpyxl import load_workbook
     from openpyxl.styles import Alignment, Font, PatternFill
 
-    # Parse cell values and extract optional assessment summary
-    raw = json.loads(cell_values_json)
+    # --- Resolve the checklist payload ---
+    raw = None
+    source = "inline_json"
+    if cmc_cluster_name:
+        cached = load_checklist_cache(cmc_cluster_name)
+        if cached is not None:
+            raw = cached
+            source = "cache"
+
+    if raw is None:
+        if not cell_values_json:
+            raise ValueError(
+                "No checklist payload available: pass cmc_cluster_name to use "
+                "the server-side cache from generate_upgrade_readiness_report, "
+                "or pass cell_values_json explicitly."
+            )
+        raw = json.loads(cell_values_json)
+
+    # Don't mutate the cached dict for future reads
+    raw = dict(raw)
     assessment = raw.pop("_summary", None)
     cell_values = {int(k): v for k, v in raw.items()}
 
@@ -756,6 +845,7 @@ def run_write_checklist_excel(
         "filename": filename,
         "base64": encoded,
         "summary": summary,
+        "source": source,
     }
 
 

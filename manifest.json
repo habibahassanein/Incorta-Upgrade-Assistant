@@ -79,7 +79,7 @@
         },
         {
             "name": "write_checklist_excel",
-            "description": "Fill the 2-sheet Incorta pre-upgrade checklist template (Summary + Pre-Upgrade Checklist) with the readiness report data and return a downloadable Excel file."
+            "description": "Fill the 2-sheet Incorta pre-upgrade checklist template (Summary + Pre-Upgrade Checklist) and return a downloadable Excel file. Normal usage: pass only cmc_cluster_name — the readiness report caches the full payload server-side. Fallback: pass cell_values_json verbatim from the <checklist_data> block (must not be edited)."
         },
         {
             "name": "search_upgrade_knowledge",

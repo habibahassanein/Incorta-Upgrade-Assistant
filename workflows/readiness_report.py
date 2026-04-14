@@ -904,7 +904,7 @@ def generate_report(state: ReadinessState) -> ReadinessState:
             lines.append(f"- {gap}")
         lines.append("")
 
-    # --- Checklist Data (always included) ---
+    # --- Checklist Data (cached server-side; LLM just references by cluster) ---
     if checklist:
         serializable = {str(k): v for k, v in checklist.items()}
         # Embed assessment summary so write_checklist_excel can build a Summary sheet
@@ -920,15 +920,40 @@ def generate_report(state: ReadinessState) -> ReadinessState:
             "from_version": assessment.get("from_version"),
             "to_version": assessment.get("to_version"),
         }
+
+        # Cache the full payload on disk so write_checklist_excel can read it
+        # back byte-for-byte. The LLM would otherwise need to ferry a large
+        # JSON between tool calls and has been observed to truncate or
+        # paraphrase it (dropping _summary, [Source: …] trailers, etc.).
+        cmc_cluster_name = state.get("cmc_cluster_name", "")
+        try:
+            from workflows.checklist_workflow import save_checklist_cache
+            save_checklist_cache(cmc_cluster_name, serializable)
+            cached = True
+        except Exception:
+            cached = False
+
         lines.append("---")
         lines.append("")
-        lines.append("## Pre-Upgrade Checklist Data")
-        lines.append(
-            "_Pass the JSON below to `write_checklist_excel` to generate the Excel report._"
-        )
-        lines.append(
-            f"\n<checklist_data>\n{json.dumps(serializable, indent=2)}\n</checklist_data>"
-        )
+        lines.append("## Pre-Upgrade Checklist — Next Step")
+        if cached and cmc_cluster_name:
+            lines.append(
+                f"_The full checklist data is cached server-side under cluster "
+                f"`{cmc_cluster_name}`. To generate the Excel file, call "
+                f"`write_checklist_excel` with `cmc_cluster_name=\"{cmc_cluster_name}\"` "
+                f"— no need to pass the JSON blob, which would be truncated._"
+            )
+            lines.append(
+                f"\n<checklist_ref cluster=\"{cmc_cluster_name}\" />"
+            )
+        else:
+            # Fallback: inline the JSON if caching failed or cluster name is missing
+            lines.append(
+                "_Pass the JSON below to `write_checklist_excel` to generate the Excel report._"
+            )
+            lines.append(
+                f"\n<checklist_data>\n{json.dumps(serializable, indent=2)}\n</checklist_data>"
+            )
 
     return {**state, "report": "\n".join(lines)}
 
