@@ -250,9 +250,11 @@ async def list_tools() -> list[types.Tool]:
                 "     If provided, the report includes bugs specifically fixed for that customer.\n"
                 "     If omitted or unknown, pass 'Unknown' and the report runs without customer bug data.\n"
                 "     MUST be a company name, not a person name ('Anas', 'John' are invalid).\n"
-                "  cmc_cluster_name: CMC cluster name. Defaults to cmc-cluster-name header.\n"
+                "  cmc_cluster_name: CMC cluster name. LEAVE EMPTY — auto-read from cmc-cluster-name header.\n"
+                "    DO NOT pass this. Do not derive it from the URL subdomain.\n"
                 "  from_version: Current version. Leave empty — auto-detected from cluster.\n"
-                "  cloud_cluster_name: Cloud Portal cluster name. Leave empty — auto-detected from Analytics URL."
+                "  cloud_cluster_name: Cloud Portal cluster name. LEAVE EMPTY — auto-detected from Analytics URL.\n"
+                "    DO NOT pass this. Do not derive it from the URL subdomain."
             ),
             inputSchema={
                 "type": "object",
@@ -274,7 +276,8 @@ async def list_tools() -> list[types.Tool]:
                 "topology, Spark/Zookeeper/DB, connectors, tenants, email config, DB migration.\n\n"
                 "CREDENTIALS: CMC credentials are automatically injected from MCP headers. Do not ask the user.\n\n"
                 "Args:\n"
-                "  cluster_name: CMC cluster name. Defaults to cmc-cluster-name header."
+                "  cluster_name: CMC cluster name. LEAVE EMPTY — the server reads it from the user's\n"
+                "    cmc-cluster-name connection config. DO NOT derive this from the URL subdomain."
             ),
             inputSchema={
                 "type": "object",
@@ -369,7 +372,8 @@ async def list_tools() -> list[types.Tool]:
                 "Auto-detects deployment type, DB type, topology, features, infrastructure.\n\n"
                 "CREDENTIALS: CMC credentials are automatically injected from MCP headers. Do not ask the user.\n\n"
                 "Args:\n"
-                "  cluster_name: CMC cluster name. Defaults to cmc-cluster-name header.\n"
+                "  cluster_name: CMC cluster name. LEAVE EMPTY — the server reads it from the user's\n"
+                "    cmc-cluster-name connection config. DO NOT guess it from the URL hostname/subdomain.\n"
                 "  format: 'json', 'markdown', or 'both' (default)."
             ),
             inputSchema={

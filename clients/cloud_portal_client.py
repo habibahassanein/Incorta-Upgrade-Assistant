@@ -42,9 +42,8 @@ ENVIRONMENTS = {
     "production": {
         "portal_url": "https://cloud.incorta.com",
         "auth0_domain": "auth.incorta.com",
-        # TODO: confirm production Cloud Admin client ID with cloud team
         "auth0_client_id": "NoUnC0eTxnqwc4I7hwFMp7PANP8Uju1Y",
-        "cmc_domain": "cloud2.incorta.com",
+        "cmc_domain": "cloud2.incorta.com",  # also matches cloud4.incorta.com
     },
 }
 
@@ -64,8 +63,12 @@ TOKENS_DIR = Path(os.getenv("TOKENS_DIR", "data/tokens"))
 
 
 def _detect_environment_from_cmc_url(cmc_url: str) -> str:
-    """Detect staging vs production from CMC URL."""
-    if "cloud2.incorta.com" in cmc_url:
+    """Detect staging vs production from CMC URL.
+
+    Production domains: cloud2.incorta.com, cloud4.incorta.com (and any future cloud*.incorta.com)
+    Staging domain:     cloudstaging.incortalabs.com
+    """
+    if "cloud2.incorta.com" in cmc_url or "cloud4.incorta.com" in cmc_url:
         return "production"
     if "cloudstaging.incortalabs.com" in cmc_url:
         return "staging"
