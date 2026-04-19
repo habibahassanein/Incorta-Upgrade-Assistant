@@ -63,7 +63,7 @@
         },
         {
             "name": "test_datasource_connections",
-            "description": "Test all datasource connections on the Incorta Analytics instance and report pass/fail per datasource."
+            "description": "Test datasource connections on the Incorta Analytics instance. Supports list_only to preview the list first, datasource_ids to test a specific subset, and page/page_size for batched testing."
         },
         {
             "name": "cloud_portal_connect",

@@ -57,9 +57,8 @@ from tools.extract_cluster_metadata import (
     format_metadata_report,
 )
 from tools.test_connection import (
-    derive_incorta_url_from_cmc,
-    login_to_incorta_analytics,
-    test_all_connections,
+    list_datasources,
+    test_connections,
 )
 from clients.cloud_portal_client import (
     CloudPortalClient,
@@ -372,14 +371,46 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="test_datasource_connections",
             description=(
-                "[CONNECTIVITY CHECK] Test all datasource connections on the Incorta Analytics instance.\n"
-                "Fetches all datasources and tests each connection, reporting success/failure.\n\n"
+                "[CONNECTIVITY CHECK] Test datasource connections on the Incorta Analytics instance.\n\n"
+                "RECOMMENDED WORKFLOW when a cluster has many datasources:\n"
+                "  1. Call with list_only=true to get the list of datasources.\n"
+                "  2. Enumerate every datasource (name, id, type, category) for the user\n"
+                "     — do NOT summarize by count or type. Then ask which ones to test.\n"
+                "  3. Call again with datasource_ids=[...] to test the chosen subset.\n\n"
+                "For large clusters where the user wants to test everything in batches (like\n"
+                "paging through the UI), use page_size (e.g. 10) and iterate page=1, 2, … until\n"
+                "pagination.has_more is false. Each page returns intermediate results.\n\n"
+                "If the user just says 'test all' and the list is small, calling with no args tests everything.\n\n"
+                "Args (all optional):\n"
+                "  list_only:      If true, return the list of datasources without testing them.\n"
+                "  datasource_ids: Array of datasource ids. Only these are tested.\n"
+                "  page:           1-based page number for batching (default 1 if page_size set).\n"
+                "  page_size:      Batch size. When set, only this many datasources are tested\n"
+                "                  per call; use pagination.next_page from the result to continue.\n\n"
                 "CREDENTIALS: ALL Analytics credentials (tenant, user, password, URL) are AUTOMATICALLY injected "
                 "from MCP headers. The LLM MUST call this tool directly WITHOUT asking the user for passwords."
             ),
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "list_only": {
+                        "type": "boolean",
+                        "description": "If true, list datasources without testing them.",
+                    },
+                    "datasource_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "If set, only these datasource ids are tested.",
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "1-based page number for batching. Ignored unless page_size is set.",
+                    },
+                    "page_size": {
+                        "type": "integer",
+                        "description": "Batch size. When set, only this page of datasources is tested per call.",
+                    },
+                },
             },
         ),
         types.Tool(
@@ -899,18 +930,34 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
                 f"Add these headers to your MCP client config."
             )
 
-        incorta_url = derive_incorta_url_from_cmc(cmc_url)
+        list_only = bool(arguments.get("list_only", False))
+        datasource_ids = arguments.get("datasource_ids") or None
+        page = arguments.get("page")
+        page_size = arguments.get("page_size")
 
         try:
-            session = login_to_incorta_analytics(
-                incorta_url, tenant, username, password
-            )
+            if list_only:
+                result = list_datasources(
+                    cmc_url,
+                    tenant,
+                    username,
+                    password,
+                    page=page,
+                    page_size=page_size,
+                )
+            else:
+                result = test_connections(
+                    cmc_url,
+                    tenant,
+                    username,
+                    password,
+                    datasource_ids=datasource_ids,
+                    page=page,
+                    page_size=page_size,
+                )
+            return _json(result)
         except RuntimeError as e:
             return _text(f"Error: Analytics login failed: {e}")
-
-        try:
-            result = test_all_connections(session)
-            return _json(result)
         except Exception as e:
             return _json({"error": f"Failed to test connections: {e}"})
 
