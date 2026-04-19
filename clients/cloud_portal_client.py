@@ -54,11 +54,10 @@ AUTH0_SCOPES = (
     "offline_access"
 )
 
-# Resolved at runtime from env or CMC URL
-CLOUD_PORTAL_URL = os.getenv("CLOUD_PORTAL_URL", "https://cloudstaging.incortalabs.com")
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "auth-staging.incortalabs.com")
-AUTH0_CLIENT_ID = os.getenv("AUTH0_CLIENT_ID", "0jXCrcpFe6PDm6sIMxDi7hunFCWeRLpt")  # Cloud Admin client ID
-AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "https://cloud.server/api/")
+# Auth0 / Cloud Portal config is resolved dynamically per request
+# based on the CMC URL (staging vs production). See get_auth0_config().
+# Override with AUTH0_DOMAIN, AUTH0_CLIENT_ID, CLOUD_PORTAL_URL env vars only
+# if you need to force a specific environment.
 
 # Directory for per-user token files
 TOKENS_DIR = Path(os.getenv("TOKENS_DIR", "data/tokens"))
@@ -74,14 +73,20 @@ def _detect_environment_from_cmc_url(cmc_url: str) -> str:
 
 
 def get_auth0_config(cmc_url: str = "") -> dict:
-    """Get Auth0 config based on detected environment."""
+    """Get Auth0 config based on detected environment.
+
+    Priority: explicit env var override > auto-detected preset from CMC URL.
+    The old code used os.getenv("AUTH0_DOMAIN", "auth-staging...") which always
+    returned the staging default, overriding the production preset even for
+    cloud2.incorta.com URLs. Now we only override if the env var is explicitly set.
+    """
     env = _detect_environment_from_cmc_url(cmc_url)
     preset = ENVIRONMENTS.get(env, ENVIRONMENTS["staging"])
     return {
-        "domain": os.getenv("AUTH0_DOMAIN") or preset["auth0_domain"],
-        "client_id": os.getenv("AUTH0_CLIENT_ID") or preset["auth0_client_id"],
-        "audience": os.getenv("AUTH0_AUDIENCE", "https://cloud.server/api/"),
-        "portal_url": os.getenv("CLOUD_PORTAL_URL") or preset["portal_url"],
+        "domain": os.environ.get("AUTH0_DOMAIN") or preset["auth0_domain"],
+        "client_id": os.environ.get("AUTH0_CLIENT_ID") or preset["auth0_client_id"],
+        "audience": os.environ.get("AUTH0_AUDIENCE") or "https://cloud.server/api/",
+        "portal_url": os.environ.get("CLOUD_PORTAL_URL") or preset["portal_url"],
     }
 
 
