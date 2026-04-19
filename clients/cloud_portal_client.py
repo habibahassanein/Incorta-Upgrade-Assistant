@@ -109,34 +109,40 @@ def infer_cloud_cluster_name(cmc_url: str) -> str:
 # Per-user token storage helpers
 # ---------------------------------------------------------------------------
 
-def _token_path(email: str) -> Path:
-    """Return the path for a user's token file."""
-    # Sanitize email for use as filename
+def _token_path(email: str, cmc_url: str = "") -> Path:
+    """Return the path for a user's token file, scoped to environment.
+
+    Files are named {email}_{env}.json so that switching between staging and
+    production never reuses a token issued by the wrong Auth0 tenant.
+    """
+    env = _detect_environment_from_cmc_url(cmc_url)  # 'staging' or 'production'
     safe_email = email.lower().replace("/", "_").replace("\\", "_")
     TOKENS_DIR.mkdir(parents=True, exist_ok=True)
-    return TOKENS_DIR / f"{safe_email}.json"
+    return TOKENS_DIR / f"{safe_email}_{env}.json"
 
 
-def save_token(email: str, access_token: str, refresh_token: str = None, claims: dict = None):
-    """Save a JWT and refresh token for a specific user."""
+def save_token(email: str, cmc_url: str, access_token: str, refresh_token: str = None, claims: dict = None):
+    """Save a JWT and refresh token for a specific user + environment."""
     claims = claims or {}
     exp = claims.get("exp")
     user_id = claims.get("https://namespace/uuid") or claims.get("sub")
+    env = _detect_environment_from_cmc_url(cmc_url)
 
     data = {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "email": email,
+        "environment": env,
         "user_id": user_id,
         "exp": exp,
         "cached_at": int(time.time()),
     }
-    _token_path(email).write_text(json.dumps(data, indent=2))
+    _token_path(email, cmc_url).write_text(json.dumps(data, indent=2))
 
 
-def load_token(email: str) -> dict | None:
-    """Load cached token data for a user. Returns None if missing or unreadable."""
-    path = _token_path(email)
+def load_token(email: str, cmc_url: str = "") -> dict | None:
+    """Load cached token data for a user + environment. Returns None if missing or unreadable."""
+    path = _token_path(email, cmc_url)
     if not path.exists():
         return None
     try:
@@ -145,9 +151,9 @@ def load_token(email: str) -> dict | None:
         return None
 
 
-def delete_token(email: str):
-    """Delete cached token for a user."""
-    path = _token_path(email)
+def delete_token(email: str, cmc_url: str = ""):
+    """Delete cached token for a user + environment."""
+    path = _token_path(email, cmc_url)
     if path.exists():
         path.unlink()
 
@@ -194,8 +200,8 @@ def refresh_access_token(email: str, cmc_url: str = "") -> str | None:
         )
 
         if response.status_code != 200:
-            # Refresh token expired or revoked — clear stored token
-            delete_token(email)
+            # Refresh token expired or revoked — clear stored token for this env
+            delete_token(email, cmc_url)
             return None
 
         resp_data = response.json()
@@ -210,7 +216,7 @@ def refresh_access_token(email: str, cmc_url: str = "") -> str | None:
         except jwt.DecodeError:
             new_claims = {}
 
-        save_token(email, new_access, new_refresh, new_claims)
+        save_token(email, cmc_url, new_access, new_refresh, new_claims)
         return new_access
 
     except Exception:
@@ -219,13 +225,13 @@ def refresh_access_token(email: str, cmc_url: str = "") -> str | None:
 
 def get_valid_token(email: str, cmc_url: str = "") -> str | None:
     """
-    Get a valid access token for a user.
+    Get a valid access token for a user, scoped to the environment in cmc_url.
 
-    1. Check cached token — return if still valid.
-    2. Try silent refresh if expired.
+    1. Check cached token for this email+environment — return if still valid.
+    2. Try silent refresh using the correct Auth0 tenant for this environment.
     3. Return None if full re-auth is needed.
     """
-    data = load_token(email)
+    data = load_token(email, cmc_url)
     if not data:
         return None
 
@@ -236,7 +242,7 @@ def get_valid_token(email: str, cmc_url: str = "") -> str | None:
     if not is_token_expired(access_token):
         return access_token
 
-    # Try silent refresh
+    # Try silent refresh against the correct Auth0 tenant
     return refresh_access_token(email, cmc_url)
 
 

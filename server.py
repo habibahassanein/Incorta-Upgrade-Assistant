@@ -1148,8 +1148,8 @@ async def oauth_callback(request: Request) -> HTMLResponse:
         completed_logins[email] = {"success": False, "error": msg}
         return _html(400, "Email Mismatch", msg)
 
-    # Save token per-user
-    save_token(email, access_token, refresh_token, claims)
+    # Save token scoped to this user + environment
+    save_token(email, cmc_url, access_token, refresh_token, claims)
     completed_logins[email] = {"success": True}
 
     exp = claims.get("exp")
