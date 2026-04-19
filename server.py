@@ -321,14 +321,14 @@ async def list_tools() -> list[types.Tool]:
                 "[CLOUD AUTH] Connect your Cloud Portal account.\n\n"
                 "CREDENTIALS: The user's email is automatically injected from MCP headers.\n\n"
                 "TWO-STEP PROCESS:\n"
-                "  Step 1: Call this tool. The response will contain a login URL.\n"
-                "    MANDATORY: Extract the URL from the response and show it to the user formatted EXACTLY like this:\n"
-                "      👉 **[Click here to log in to Cloud Portal](<the_url>)**\n"
-                "    Then say: 'After logging in, let me know and I will confirm your connection.'\n"
-                "    NEVER just quote the raw URL as text. NEVER say 'see below' or 'the URL is in the response'.\n"
-                "    The URL must be a working clickable hyperlink the user can click immediately.\n"
-                "  Step 2: When the user says they logged in, call this tool again to confirm.\n"
-                "    On confirmation, say: 'Cloud Portal connected ✅ — proceeding with the report.'\n\n"
+                "  Step 1: Call this tool. If a login is required, the tool response contains a URL.\n"
+                "    CRITICAL — you MUST extract that URL and display it to the user as a clickable markdown link:\n"
+                "      'Please open this link to log in to Cloud Portal: [Login to Cloud Portal](<url>)'\n"
+                "    DO NOT say 'see below', 'see the response', or 'refer to the output' — copy the exact URL.\n"
+                "    Tell the user to open it in their browser and complete login (Google SSO or email/password).\n"
+                "    Then wait for the user to confirm they have logged in before proceeding.\n"
+                "  Step 2: Call this tool again to confirm login and cache the token.\n\n"
+                "If the response says 'Already connected' or 'Token refreshed', no login needed — proceed directly.\n\n"
                 "Args:\n"
                 "  force: If True, clears the existing token and forces re-authentication."
             ),
@@ -644,13 +644,12 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
             "expires_at": time.time() + 600,
         }
 
-        authorize_url = login_info['authorize_url']
         return _text(
-            f"## Cloud Portal Login Required\n\n"
-            f"Please open the link below to log in with `{email}`:\n\n"
-            f"👉 **[Click here to log in to Cloud Portal]({authorize_url})**\n\n"
+            f"## Cloud Portal Connect\n\n"
+            f"**Open this URL in your browser to connect `{email}`:**\n\n"
+            f"{login_info['authorize_url']}\n\n"
             f"Log in with your Incorta account (Google SSO or email/password).\n"
-            f"After completing login, **call this tool again** to confirm your connection."
+            f"After completing login, **call this tool again** to confirm."
         )
 
     # -----------------------------------------------------------------------
